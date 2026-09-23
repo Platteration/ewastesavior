@@ -30,6 +30,9 @@ type Limits struct {
 // DefaultLimits matches proto.MaxMediaSide/MaxMediaPixels/MaxMediaBytes.
 var DefaultLimits = Limits{MaxSide: 8192, MaxPixels: 16 << 20, MaxBytes: 64 << 20}
 
+// maxPeek bounds how much of the stream is buffered to read the header.
+const maxPeek = 1 << 20
+
 // ErrTooLarge is returned (wrapped) when an image exceeds the limits.
 var ErrTooLarge = errors.New("image too large")
 
@@ -39,13 +42,25 @@ func DecodeLimited(r io.Reader, lim Limits) (image.Image, string, error) {
 	if lim.MaxBytes <= 0 {
 		lim = DefaultLimits
 	}
-	br := bufio.NewReaderSize(io.LimitReader(r, lim.MaxBytes+1), 64<<10)
-	// Peek enough for DecodeConfig of every supported format.
-	head, err := br.Peek(64 << 10)
-	if err != nil && err != io.EOF && err != bufio.ErrBufferFull {
-		return nil, "", err
+	// Peek enough for DecodeConfig of every supported format. Camera JPEGs
+	// can carry large EXIF/ICC blocks before the frame header, so retry
+	// with a bigger window before giving up.
+	br := bufio.NewReaderSize(io.LimitReader(r, lim.MaxBytes+1), maxPeek)
+	var (
+		cfg    image.Config
+		format string
+		err    error
+	)
+	for _, n := range []int{64 << 10, maxPeek} {
+		head, perr := br.Peek(n)
+		if perr != nil && perr != io.EOF && perr != bufio.ErrBufferFull {
+			return nil, "", perr
+		}
+		cfg, format, err = image.DecodeConfig(bytesReader(head))
+		if err == nil || len(head) < n {
+			break
+		}
 	}
-	cfg, format, err := image.DecodeConfig(bytesReader(head))
 	if err != nil {
 		return nil, "", fmt.Errorf("unrecognized image: %w", err)
 	}

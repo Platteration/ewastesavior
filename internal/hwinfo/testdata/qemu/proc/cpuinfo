@@ -1,0 +1,27 @@
+processor	: 0
+vendor_id	: AuthenticAMD
+cpu family	: 15
+model	: 107
+model name	: QEMU Virtual CPU version 2.5+
+stepping	: 1
+cpu MHz	: 2394.454
+cache size	: 512 KB
+physical id	: 0
+siblings	: 1
+core id	: 0
+cpu cores	: 1
+flags	: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm rep_good nopl xtopology cpuid tsc_known_freq pni cx16 x2apic hypervisor lahf_lm svm 3dnowprefetch vmmcall
+
+processor	: 1
+vendor_id	: AuthenticAMD
+cpu family	: 15
+model	: 107
+model name	: QEMU Virtual CPU version 2.5+
+stepping	: 1
+cpu MHz	: 2394.454
+cache size	: 512 KB
+physical id	: 1
+siblings	: 1
+core id	: 0
+cpu cores	: 1
+flags	: fpu de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx lm rep_good nopl xtopology cpuid tsc_known_freq pni cx16 x2apic hypervisor lahf_lm svm 3dnowprefetch vmmcall

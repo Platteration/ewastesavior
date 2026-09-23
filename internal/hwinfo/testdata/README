@@ -1,0 +1,57 @@
+hwinfo fixture trees
+====================
+
+Each directory is a minimal root (proc, sys, etc) of one class of real
+machine. The hwinfo tests pass it as the root argument instead of reading
+the running system, and other packages' tests can do the same to fake
+hardware.
+
+  thinkpad-t60   Core Duo T2400 (i686 kernel), coretemp, BAT0 charging on AC
+                 (no capacity file: percent from energy_now/energy_full), lid
+                 open, i915 LVDS-1 with EDID + disconnected VGA-1, e1000e
+                 wired + iwl3945 wireless, LENOVO DMI (product in
+                 product_version), throttle counters.
+  p4-desktop     Pentium 4 HT, no coretemp: two acpitz zones, one a bogus
+                 127 C; radeon VGA-1 monitor with EDID; 8139too behind a PCI
+                 bridge; no battery, no PSI file; placeholder DMI UUID
+                 (03000200-...-000700080009) and "To Be Filled By O.E.M."
+                 system strings and serials (vendor/product come from the
+                 board).
+  atom-netbook   Atom N270, battery Discharging with no Mains supply (so on
+                 battery), lid closed, ath5k wireless at a LOWER PCI address
+                 than the r8169 wired NIC (wired must still win), i915 LVDS,
+                 SSD + USB stick + SD card, DMI chassis type "Other" (laptop
+                 only because of the battery).
+  amd-desktop    Athlon II X2 (x86_64), k10temp with temp1_max 70 and a
+                 drivetemp hwmon at 45 C that must be ignored, forcedeth with
+                 a random MAC (addr_assign_type 1: identity falls to the DMI
+                 UUID), asix USB NIC, a wireless mouse battery (scope Device,
+                 must not count), headless.
+  qemu           virtio-net 52:54:00:12:34:56 (a locally administered MAC),
+                 bochs-drm Virtual-1 (EDID with size only in cm), hypervisor
+                 flag, all-zero DMI UUID, empty serial: the identity is random.
+
+Conventions
+-----------
+
+* Files hold exactly what the kernel prints, including the trailing newline.
+* Links are real relative symlinks, as in sysfs: sys/class/net/X/device,
+  sys/class/drm/cardN/device, sys/block/X, and each device's driver and
+  subsystem links. Only the last element of driver and subsystem links is
+  read, so those dangle (sys/bus is not included). Device links must resolve
+  inside the tree (sys/devices/...), because hwinfo walks up from a device
+  to find its PCI or USB parent (virtio-net sits below its PCI function).
+  The class directories themselves (sys/class/net/X, sys/class/drm/...) are
+  plain directories, which the code handles like the kernel's symlinks.
+* ':' is not allowed in Go module file paths or in Windows file names, so
+  every ':' of a real sysfs path is written as '_' here (0000:00:19.0 ->
+  0000_00_19.0, target0:0:0 -> target0_0_0). hwinfo treats these names as
+  opaque strings (sort keys, basenames), so nothing else changes. File
+  contents keep their colons (MAC addresses).
+* EDID files are binary 128-byte base blocks: the first detailed timing
+  descriptor carries the size in mm (bytes 66-68), the base block in cm
+  (bytes 21-22). makeEDID in display_test.go builds the same layout.
+* proc/sys/kernel/{osrelease,arch} stand in for uname(2), which is used only
+  for the live system.
+* Only the attributes hwinfo reads are present; add more when the code
+  starts reading them.
