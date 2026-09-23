@@ -19,29 +19,49 @@ rt73usb rt2800pci rt2800usb rtl8180 rtl8187 rtl8192ce rtl8192cu rtl8192se rtl819
 rtl8xxxu r8712u zd1211rw p54pci p54usb mwl8k orinoco_usb at76c50x_usb"
 
 # reprobe_wifi: after firmware_class.path changed, retry Wi-Fi devices that
-# have no network interface yet: reload the module of a bound driver, or ask
-# the PCI core to probe an unbound wireless controller (class 0x0280).
+# have no network interface yet. A device bound to a driver in WIFI_MODULES
+# without a netdev gets its module reloaded; b43 and b43legacy stay bound
+# without firmware, to the core on the SSB/BCMA bus (the PCI function belongs
+# to ssb/bcma), so those buses are walked too. An unbound PCI wireless
+# controller (class 0x0280) or vendor-specific USB interface (ar5523,
+# at76c50x_usb and p54usb fail or release it without firmware) is probed
+# again.
 reprobe_wifi() {
 	reload=""
-	for dev in /sys/bus/pci/devices/* /sys/bus/usb/devices/*; do
-		[ -e "$dev/modalias" ] || continue
-		if [ -e "$dev/driver" ]; then
-			mod=$(readlink "$dev/driver/module" 2>/dev/null) || continue
-			mod=${mod##*/}
-			case " $(echo "$WIFI_MODULES" | tr '\n' ' ') " in
-			*" $mod "*) ;;
-			*) continue ;;
-			esac
-			[ -d "$dev/net" ] && continue
-			case " $reload " in *" $mod "*) ;; *) reload="$reload $mod" ;; esac
-		elif [ -e "$dev/class" ]; then
-			case "$(cat "$dev/class")" in
-			0x0280*)
-				log "probing wireless controller ${dev##*/} again"
-				echo "${dev##*/}" >/sys/bus/pci/drivers_probe 2>/dev/null
+	mods=" $(echo "$WIFI_MODULES" | tr '\n' ' ') "
+	for bus in pci usb ssb bcma; do
+		for dev in /sys/bus/"$bus"/devices/*; do
+			# Every device has uevent (BCMA cores have no modalias).
+			[ -e "$dev/uevent" ] || continue
+			if [ -e "$dev/driver" ]; then
+				mod=$(readlink "$dev/driver/module" 2>/dev/null) || continue
+				mod=${mod##*/}
+				case "$mods" in
+				*" $mod "*) ;;
+				*) continue ;;
+				esac
+				[ -d "$dev/net" ] && continue
+				case " $reload " in *" $mod "*) ;; *) reload="$reload $mod" ;; esac
+				continue
+			fi
+			case $bus in
+			pci)
+				case "$(cat "$dev/class" 2>/dev/null)" in
+				0x0280*)
+					log "probing wireless controller ${dev##*/} again"
+					echo "${dev##*/}" >/sys/bus/pci/drivers_probe 2>/dev/null
+					;;
+				esac
+				;;
+			usb)
+				# Only interfaces (1-1:1.0) have bInterfaceClass.
+				if [ "$(cat "$dev/bInterfaceClass" 2>/dev/null)" = ff ]; then
+					log "probing USB interface ${dev##*/} again"
+					echo "${dev##*/}" >/sys/bus/usb/drivers_probe 2>/dev/null
+				fi
 				;;
 			esac
-		fi
+		done
 	done
 	for mod in $reload; do
 		log "reloading $mod to pick up firmware from the stick"

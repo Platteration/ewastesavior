@@ -61,6 +61,7 @@ type node struct {
 	nodeErrs    []time.Time          // node errors (monotonic) on tasks that then succeeded elsewhere, within the quarantine window
 	fastFails   map[string]time.Time // task ID -> failure time, for tasks that ran < 10 s
 	reservedFor string
+	shortCode   string // proto.ShortCode(ID), for node references
 }
 
 // heldTask is an assignment whose resources are charged to a node. It
@@ -77,7 +78,8 @@ type action struct {
 }
 
 func newNode(rec nodeRecord) *node {
-	return &node{nodeRecord: rec, held: map[string]heldTask{}, fastFails: map[string]time.Time{}}
+	return &node{nodeRecord: rec, held: map[string]heldTask{}, fastFails: map[string]time.Time{},
+		shortCode: proto.ShortCode(rec.ID)}
 }
 
 func (n *node) isOnline(now time.Time, offlineAfter time.Duration) bool {

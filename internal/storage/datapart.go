@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -124,8 +125,13 @@ func initData(o initDataOpts, ops sysOps, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	// 5. Write the 16-byte entry (and nothing else).
+	// 5. Mark the space as ours, then write the 16-byte entry (and nothing
+	// else in the table). The marker goes first so that an entry for this
+	// layout without the marker behind it is never taken for ours (step 7).
 	if !plan.Existing {
+		if err := writeDataMarker(disk.Path, mbr, plan, sectorSize); err != nil {
+			return refuse("mark the new partition on %s: %v", disk.Name, err)
+		}
 		if err := writeEntry(disk.Path, mbr, plan); err != nil {
 			return refuse("write partition table of %s: %v", disk.Name, err)
 		}
@@ -158,14 +164,25 @@ func initData(o initDataOpts, ops sysOps, stdout, stderr io.Writer) int {
 		}
 	}
 
-	// 7. Format unless it already carries our filesystem.
+	// 7. Format unless it already carries our filesystem, and only when it
+	// provably is the partition SaviorOS added: it starts with the marker
+	// written in step 5 (now or on an earlier, interrupted boot). Probe knows
+	// only a few filesystems, so "nothing recognized" is not proof: a LUKS,
+	// btrfs, xfs or NTFS partition someone made in the same place is refused.
 	fs, err := ProbeFile(partPath)
 	if err != nil {
 		return refuse("read %s: %v", partPath, err)
 	}
 	if !(fs.IsExt() && fs.Label == DataLabel) {
-		if plan.Existing && fs.Type != "" {
+		if fs.Type != "" {
 			return refuse("%s holds a %s filesystem labelled %q that SaviorOS did not create", partPath, fs.Type, fs.Label)
+		}
+		owned, err := hasDataMarker(partPath, plan)
+		if err != nil {
+			return refuse("read %s: %v", partPath, err)
+		}
+		if !owned {
+			return refuse("%s already holds data SaviorOS did not create (unknown content, no SaviorOS marker)", partPath)
 		}
 		logf("formatting %s (ext4, label %s)", partPath, DataLabel)
 		mkfs := o.mkfs
@@ -175,8 +192,113 @@ func initData(o initDataOpts, ops sysOps, stdout, stderr io.Writer) int {
 		if err := mkfs(partPath, stderr); err != nil {
 			return refuse("format %s: %v", partPath, err)
 		}
+		// e2fsprogs wipes sector 0, BusyBox mke2fs leaves it alone.
+		if err := clearDataMarker(partPath, plan); err != nil {
+			logf("clear the marker on %s: %v", partPath, err)
+		}
 	}
 	return mountData(ops, partPath, o.mountpoint, logf, stdout)
+}
+
+// The ownership marker of a data partition SaviorOS is adding. Before the
+// entry is written, the first MiB of the space the partition will cover is
+// zeroed (which also removes stale filesystem signatures) and the marker is
+// put at its start; mkfs and clearDataMarker remove it again. Its geometry
+// fields tie it to exactly the planned partition.
+const (
+	dataMarkerMagic = "SAVIOR-DATA-PENDING\x00"
+	dataMarkerSize  = 64
+	dataMarkerWipe  = 1 << 20
+)
+
+// dataMarker returns the marker for p: the magic, then StartLBA and Sectors
+// (little endian uint64), then zeros.
+func dataMarker(p DataPlan) []byte {
+	b := make([]byte, dataMarkerSize)
+	n := copy(b, dataMarkerMagic)
+	binary.LittleEndian.PutUint64(b[n:], p.StartLBA)
+	binary.LittleEndian.PutUint64(b[n+8:], p.Sectors)
+	return b
+}
+
+// writeDataMarker zeroes the start of the planned partition on the whole
+// disk and writes the marker there, after checking that the MBR is still
+// exactly what was planned from (so the space is still unallocated). It syncs
+// and verifies.
+func writeDataMarker(disk string, mbr []byte, p DataPlan, sectorSize int) error {
+	f, err := os.OpenFile(disk, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	cur := make([]byte, mbrSize)
+	if _, err := f.ReadAt(cur, 0); err != nil {
+		return err
+	}
+	if !bytes.Equal(cur, mbr[:mbrSize]) {
+		return errors.New("the MBR changed while planning")
+	}
+	n := uint64(dataMarkerWipe)
+	if size := p.Sectors * uint64(sectorSize); size < n {
+		n = size
+	}
+	if n < dataMarkerSize {
+		return fmt.Errorf("partition of %d bytes is too small", n)
+	}
+	buf := make([]byte, n)
+	marker := dataMarker(p)
+	copy(buf, marker)
+	off := int64(p.StartLBA) * int64(sectorSize)
+	if _, err := f.WriteAt(buf, off); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	got := make([]byte, dataMarkerSize)
+	if _, err := f.ReadAt(got, off); err != nil {
+		return err
+	}
+	if !bytes.Equal(got, marker) {
+		return errors.New("verification after write failed")
+	}
+	return nil
+}
+
+// hasDataMarker reports whether the partition at path starts with p's marker.
+func hasDataMarker(path string, p DataPlan) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	got := make([]byte, dataMarkerSize)
+	if _, err := f.ReadAt(got, 0); err != nil {
+		return false, err
+	}
+	return bytes.Equal(got, dataMarker(p)), nil
+}
+
+// clearDataMarker zeroes p's marker at the start of the freshly formatted
+// partition at path, if it is still there. Those bytes are the ext boot
+// block, which the filesystem does not use.
+func clearDataMarker(path string, p DataPlan) error {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	got := make([]byte, dataMarkerSize)
+	if _, err := f.ReadAt(got, 0); err != nil {
+		return err
+	}
+	if !bytes.Equal(got, dataMarker(p)) {
+		return nil
+	}
+	if _, err := f.WriteAt(make([]byte, dataMarkerSize), 0); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // waitFor polls cond every 100 ms until it is true or d has passed.

@@ -118,7 +118,7 @@ func displaySummary(n proto.NodeView) string {
 }
 
 func cmdNode(a *app, ctx context.Context, args []string) int {
-	f := a.flagSet("node", "<ref>", "Show everything the hive knows about a node (ref = node ID or name).")
+	f := a.flagSet("node", "<ref>", "Show everything the hive knows about a node (ref = node ID, name or the short code its screen shows).")
 	pos, code, ok := a.parse(f, args, 1, 1)
 	if !ok {
 		return code

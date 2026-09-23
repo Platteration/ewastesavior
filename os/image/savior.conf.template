@@ -7,7 +7,7 @@
 # savior.<key>=<value> (see README.txt).
 #
 # The hive can write a ready-made copy of this file for you:
-#     savior ctl node-config > savior.conf
+#     savior ctl node-config -o savior.conf
 
 # ---------------------------------------------------------------------------
 # The settings most swarms need

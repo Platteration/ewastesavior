@@ -131,7 +131,7 @@ func printBanner(w io.Writer, s *Server) {
 		fmt.Fprintln(w, "Admin token: from the configuration (admin_token)")
 	}
 	fmt.Fprintf(w, "Data directory: %s\n", info.DataDir)
-	fmt.Fprintln(w, "\nNode config: savior ctl node-config > savior.conf, then copy it to each boot stick.")
+	fmt.Fprintln(w, "\nNode config: savior ctl node-config -o savior.conf, then copy it to each boot stick.")
 	if runtime.GOOS == "darwin" || runtime.GOOS == "windows" {
 		fmt.Fprintf(w, "\nFirewall: allow savior to accept TCP %d (HTTPS) and UDP %d (discovery) from the local network.\n",
 			s.listenPort(), proto.DiscoveryPort)

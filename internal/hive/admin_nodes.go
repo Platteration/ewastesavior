@@ -1,6 +1,7 @@
 package hive
 
 import (
+	"errors"
 	"net/http"
 	"sort"
 	"time"
@@ -70,10 +71,10 @@ func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, _ adminCtx)
 
 func (s *Server) handleNodeGet(w http.ResponseWriter, r *http.Request, _ adminCtx) {
 	s.mu.Lock()
-	n := s.resolveNodeRefLocked(r.PathValue("ref"))
-	if n == nil {
+	n, err := s.resolveNodeRefLocked(r.PathValue("ref"))
+	if err != nil {
 		s.mu.Unlock()
-		writeErr(w, http.StatusNotFound, "no such node")
+		writeNodeRefErr(w, err)
 		return
 	}
 	v := s.nodeViewLocked(n, time.Now())
@@ -130,10 +131,10 @@ func (s *Server) handleNodePatch(w http.ResponseWriter, r *http.Request, _ admin
 	}
 
 	s.mu.Lock()
-	n := s.resolveNodeRefLocked(r.PathValue("ref"))
-	if n == nil {
+	n, err := s.resolveNodeRefLocked(r.PathValue("ref"))
+	if err != nil {
 		s.mu.Unlock()
-		writeErr(w, http.StatusNotFound, "no such node")
+		writeNodeRefErr(w, err)
 		return
 	}
 	var newName string
@@ -208,10 +209,10 @@ func (s *Server) handleNodePatch(w http.ResponseWriter, r *http.Request, _ admin
 
 func (s *Server) handleNodeDelete(w http.ResponseWriter, r *http.Request, _ adminCtx) {
 	s.mu.Lock()
-	n := s.resolveNodeRefLocked(r.PathValue("ref"))
-	if n == nil {
+	n, err := s.resolveNodeRefLocked(r.PathValue("ref"))
+	if err != nil {
 		s.mu.Unlock()
-		writeErr(w, http.StatusNotFound, "no such node")
+		writeNodeRefErr(w, err)
 		return
 	}
 	if n.isOnline(time.Now(), s.cfg.OfflineAfter) {
@@ -267,10 +268,10 @@ func (s *Server) handleNodeAction(w http.ResponseWriter, r *http.Request, _ admi
 		return
 	}
 	s.mu.Lock()
-	n := s.resolveNodeRefLocked(r.PathValue("ref"))
-	if n == nil {
+	n, err := s.resolveNodeRefLocked(r.PathValue("ref"))
+	if err != nil {
 		s.mu.Unlock()
-		writeErr(w, http.StatusNotFound, "no such node")
+		writeNodeRefErr(w, err)
 		return
 	}
 	s.addActionLocked(n, a)
@@ -303,10 +304,14 @@ func (s *Server) handleIdentify(w http.ResponseWriter, r *http.Request, _ adminC
 		}
 	} else {
 		for _, ref := range req.Nodes {
-			n := s.resolveNodeRefLocked(ref)
-			if n == nil {
+			n, err := s.resolveNodeRefLocked(ref)
+			if errors.Is(err, errNoSuchNode) {
 				s.mu.Unlock()
 				writeErr(w, http.StatusNotFound, "no such node %q", proto.Sanitize(ref, 64, false))
+				return
+			} else if err != nil {
+				s.mu.Unlock()
+				writeNodeRefErr(w, err)
 				return
 			}
 			targets = append(targets, n)

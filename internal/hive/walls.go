@@ -1,8 +1,10 @@
 package hive
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 
 	"github.com/platteration/ewastesavior/internal/auth"
@@ -112,18 +114,68 @@ func (s *Server) cellSizeLocked(c proto.WallCell) (int, int) {
 	return wmm, hmm
 }
 
-// resolveNodeRefLocked finds a node by ID, else by name.
-func (s *Server) resolveNodeRefLocked(ref string) *node {
+// errNoSuchNode: a node reference matches no node.
+var errNoSuchNode = errors.New("no such node")
+
+// shortCodeLen is the length of proto.ShortCode.
+const shortCodeLen = 3
+
+// ambiguousCodeError: a short code shown by more than one node.
+type ambiguousCodeError struct {
+	code  string
+	names []string // sorted
+}
+
+func (e *ambiguousCodeError) Error() string {
+	return fmt.Sprintf("ambiguous short code %s: nodes %s all show it; use the node's name or ID",
+		e.code, strings.Join(e.names, ", "))
+}
+
+// resolveNodeRefLocked finds a node by ID, else by name, else by the
+// 3-character short code its screen shows (identify), in any case. Short
+// codes are 15 bits, so several nodes can share one: a code that matches
+// more than one node is an *ambiguousCodeError, never a guess.
+func (s *Server) resolveNodeRefLocked(ref string) (*node, error) {
 	if n := s.nodes[ref]; n != nil {
-		return n
+		return n, nil
 	}
-	ref = strings.ToLower(ref)
+	lower := strings.ToLower(ref)
 	for _, n := range s.nodes {
-		if n.Name == ref {
-			return n
+		if n.Name == lower {
+			return n, nil
 		}
 	}
-	return nil
+	if len(ref) != shortCodeLen {
+		return nil, errNoSuchNode
+	}
+	code := strings.ToUpper(ref)
+	var names []string
+	var match *node
+	for _, n := range s.nodes {
+		if n.shortCode == code {
+			match = n
+			names = append(names, n.Name)
+		}
+	}
+	switch len(names) {
+	case 0:
+		return nil, errNoSuchNode
+	case 1:
+		return match, nil
+	}
+	sort.Strings(names)
+	return nil, &ambiguousCodeError{code: code, names: names}
+}
+
+// writeNodeRefErr answers a failed resolveNodeRefLocked: 404 for no match,
+// 409 for an ambiguous short code.
+func writeNodeRefErr(w http.ResponseWriter, err error) {
+	var amb *ambiguousCodeError
+	if errors.As(err, &amb) {
+		writeErr(w, http.StatusConflict, "%s", amb.Error())
+		return
+	}
+	writeErr(w, http.StatusNotFound, "no such node")
 }
 
 // prepareWallLocked validates a wall for saving (DESIGN 9 "Walls"): node
@@ -135,9 +187,11 @@ func (s *Server) prepareWallLocked(in proto.WallSpec, id string) (*proto.WallSpe
 	w.Name = proto.Sanitize(w.Name, 64, false)
 	w.Cells = append([]proto.WallCell(nil), in.Cells...)
 	for i := range w.Cells {
-		n := s.resolveNodeRefLocked(w.Cells[i].Node)
-		if n == nil {
+		n, err := s.resolveNodeRefLocked(w.Cells[i].Node)
+		if errors.Is(err, errNoSuchNode) {
 			return nil, fmt.Errorf("unknown node %q", proto.Sanitize(w.Cells[i].Node, 64, false))
+		} else if err != nil {
+			return nil, err
 		}
 		if !n.hasRole(proto.RoleDisplay) {
 			return nil, fmt.Errorf("node %s does not have the display role", n.Name)

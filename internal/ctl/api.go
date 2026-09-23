@@ -97,7 +97,7 @@ func (c *Client) Nodes(ctx context.Context) ([]proto.NodeView, error) {
 	return out, err
 }
 
-// Node returns one node by ID or name.
+// Node returns one node by ID, name or short code (the hive resolves refs).
 func (c *Client) Node(ctx context.Context, ref string) (proto.NodeView, error) {
 	var nv proto.NodeView
 	if err := checkRef("node", ref); err != nil {

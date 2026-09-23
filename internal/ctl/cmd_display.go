@@ -390,9 +390,10 @@ func wallCells(rows, cols int, refs []string) ([]proto.WallCell, error) {
 
 func wallCreate(a *app, ctx context.Context, args []string) int {
 	f := a.flagSet("wall create", "--name N --rows R --cols C --nodes a,b,-,d [flags]",
-		`Create a video wall. --nodes lists node names or IDs row by row (left to
-right, top to bottom); '-' leaves a cell empty. Screen sizes come from the
-monitors' EDID; --gap-x/--gap-y are the bezel gaps in millimeters.`)
+		`Create a video wall. --nodes lists node names, IDs or short codes row by
+row (left to right, top to bottom); '-' leaves a cell empty. Screen sizes
+come from the monitors' EDID; --gap-x/--gap-y are the bezel gaps in
+millimeters.`)
 	name := f.String("name", "", "wall name (required)")
 	rows := f.Int("rows", 0, "rows of screens (1-16)")
 	cols := f.Int("cols", 0, "columns of screens (1-16)")

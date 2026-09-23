@@ -131,7 +131,7 @@ func init() {
 		{name: "genkey", help: "print a new random swarm key", run: cmdGenkey, group: "setup"},
 		{name: "node-config", args: "[--hive-addr ADDR|auto] [-o savior.conf] [--force]", help: "write a savior.conf for nodes (swarm key + fingerprint pin)", run: cmdNodeConfig, group: "setup"},
 		{name: "nodes", args: "[--all]", help: "list nodes", run: cmdNodes, group: "nodes"},
-		{name: "node", args: "<ref>", help: "show one node (ref = ID or name)", run: cmdNode, group: "nodes"},
+		{name: "node", args: "<ref>", help: "show one node (ref = ID, name or short code)", run: cmdNode, group: "nodes"},
 		{name: "rename", args: "<ref> <name>", help: "rename a node", run: cmdRename, group: "nodes"},
 		{name: "label", args: "<ref> k=v|k-... [--clear]", help: "set (k=v) or remove (k-) admin labels", run: cmdLabel, group: "nodes"},
 		{name: "drain", args: "<ref>", help: "stop giving a node new tasks", run: nodePatchCmd("drain"), group: "nodes"},

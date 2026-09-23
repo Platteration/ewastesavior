@@ -302,6 +302,47 @@ func TestFindListsHives(t *testing.T) {
 	}
 }
 
+// The node-config command the savior.conf template on every stick shows must
+// work as written: a shell redirect ("> savior.conf") truncates the target
+// before ctl runs, and ctl then refuses or writes ./savior.conf instead.
+func TestNodeConfigTemplateHint(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "os", "image", "savior.conf.template"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var hints []string
+	for _, line := range strings.Split(string(b), "\n") {
+		if i := strings.Index(line, "savior ctl node-config"); i >= 0 {
+			hints = append(hints, strings.TrimSpace(line[i:]))
+		}
+	}
+	if len(hints) == 0 {
+		t.Fatal("the template shows no savior ctl node-config command")
+	}
+	h := newFakeHive(t)
+	e := loggedIn(t, h)
+	for _, hint := range hints {
+		if strings.ContainsAny(hint, "<>|;&") {
+			t.Fatalf("template hint %q uses the shell", hint)
+		}
+		dir := t.TempDir()
+		t.Chdir(dir)
+		args := strings.Fields(hint)[2:]
+		if code, _, stderr := e.run(args...); code != 0 {
+			t.Fatalf("%s: %d %s", hint, code, stderr)
+		}
+		out := filepath.Join(dir, "savior.conf")
+		if b, err := os.ReadFile(out); err != nil || !strings.Contains(string(b), "hive_fingerprint = "+h.fingerprint()) {
+			t.Fatalf("%s wrote %q (%v)", hint, b, err)
+		}
+		if runtime.GOOS != "windows" {
+			if st, _ := os.Stat(out); st.Mode().Perm() != 0o600 {
+				t.Errorf("%s: mode %v, want 0600", hint, st.Mode().Perm())
+			}
+		}
+	}
+}
+
 func TestNodeConfig(t *testing.T) {
 	h := newFakeHive(t)
 	e := loggedIn(t, h)
@@ -346,6 +387,43 @@ func TestNodeConfig(t *testing.T) {
 	}
 	if _, err := os.Stat(other); !errors.Is(err, os.ErrNotExist) {
 		t.Error("mismatched config written")
+	}
+}
+
+// ctl passes a node's short code to the hive unchanged (the hive resolves
+// it), so "savior ctl identify --all" then "savior ctl rename <code> ..."
+// works as the user guide describes.
+func TestShortCodeRefsPassThrough(t *testing.T) {
+	h := newFakeHive(t)
+	e := loggedIn(t, h)
+	lastPath := func() string {
+		reqs := h.allRequests()
+		return reqs[len(reqs)-1].Method + " " + reqs[len(reqs)-1].Path
+	}
+	if code, stdout, stderr := e.run("rename", "7kq", "lab-shelf-3"); code != 0 || !strings.Contains(stdout, "n0123456789ab is now named lab-shelf-3") {
+		t.Fatalf("rename by code: %d %s %s", code, stdout, stderr)
+	}
+	if got := lastPath(); got != "PATCH /api/v1/admin/nodes/7kq" {
+		t.Errorf("rename sent %s", got)
+	}
+	for _, c := range []struct{ args, want string }{
+		{"node 7KQ", "GET /api/v1/admin/nodes/7KQ"},
+		{"drain 7kq", "PATCH /api/v1/admin/nodes/7kq"},
+		{"reboot 7KQ", "POST /api/v1/admin/nodes/7KQ/action"},
+		{"identify 7kq", "POST /api/v1/admin/identify"},
+	} {
+		if code, _, stderr := e.run(strings.Fields(c.args)...); code != 0 {
+			t.Errorf("%s: %d %s", c.args, code, stderr)
+		}
+		if got := lastPath(); got != c.want {
+			t.Errorf("%s sent %s, want %s", c.args, got, c.want)
+		}
+	}
+	h.mu.Lock()
+	ids := h.identifies[len(h.identifies)-1].Nodes
+	h.mu.Unlock()
+	if len(ids) != 1 || ids[0] != "7kq" {
+		t.Errorf("identify sent %q", ids)
 	}
 }
 

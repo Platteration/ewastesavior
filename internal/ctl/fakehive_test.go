@@ -253,11 +253,22 @@ func (h *fakeHive) handler() http.Handler {
 		h.mu.Unlock()
 		writeJSONResp(w, 200, out)
 	})
+	// findNode resolves refs like the hive: ID, name, then a short code
+	// matching exactly one node (any case).
 	findNode := func(ref string) (proto.NodeView, bool) {
 		for _, n := range h.nodes {
 			if n.ID == ref || n.Name == ref {
 				return n, true
 			}
+		}
+		var match []proto.NodeView
+		for _, n := range h.nodes {
+			if len(ref) == 3 && strings.EqualFold(n.ShortCode, ref) {
+				match = append(match, n)
+			}
+		}
+		if len(match) == 1 {
+			return match[0], true
 		}
 		return proto.NodeView{}, false
 	}

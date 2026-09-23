@@ -320,6 +320,11 @@ func TestPrintBanner(t *testing.T) {
 	if strings.Contains(out, testAdmin) || strings.Contains(out, testKey) {
 		t.Fatal("banner prints a secret")
 	}
+	// ctl writes the file itself (0600, never over an existing one); with
+	// "> savior.conf" the shell truncates the target first.
+	if !strings.Contains(out, "savior ctl node-config -o savior.conf") || strings.Contains(out, "> savior.conf") {
+		t.Fatalf("banner's node-config hint:\n%s", out)
+	}
 }
 
 func TestOtherHiveWarning(t *testing.T) {

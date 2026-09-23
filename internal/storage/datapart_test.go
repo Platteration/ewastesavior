@@ -66,9 +66,11 @@ func newInitEnv(t *testing.T, removable bool, mbr []byte) *initEnv {
 			return errors.New("BLKRRPART: device or resource busy")
 		},
 		addPart: func(disk string, p DataPlan, sectorSize int) error {
-			// The kernel picks up the new partition: sysfs entry + node.
+			// The kernel picks up the new partition: sysfs entry + node,
+			// which shows what the disk holds at the partition start.
 			e.addParts++
-			s.part("sdb", path, p.PartNum, int64(p.StartLBA)*int64(sectorSize)/512, int64(p.Sectors)*int64(sectorSize)/512, make([]byte, 8192))
+			s.part("sdb", path, p.PartNum, int64(p.StartLBA)*int64(sectorSize)/512, int64(p.Sectors)*int64(sectorSize)/512,
+				diskAt(t, e.diskPath, int64(p.StartLBA)*int64(sectorSize), 64<<10))
 			return nil
 		},
 		mknod: func(string, string) error { t.Error("unexpected mknod"); return nil },
@@ -80,6 +82,20 @@ func newInitEnv(t *testing.T, removable bool, mbr []byte) *initEnv {
 			return os.WriteFile(dev, extImage(DataLabel, extCompatHasJournal, extIncompatExtents, 0), 0o600)
 		}}
 	return e
+}
+
+// diskAt returns n bytes of the fake disk at off (zeros beyond its end).
+func diskAt(t *testing.T, disk string, off int64, n int) []byte {
+	f, err := os.Open(disk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	b := make([]byte, n)
+	if _, err := f.ReadAt(b, off); err != nil && !errors.Is(err, io.EOF) {
+		t.Fatal(err)
+	}
+	return b
 }
 
 func TestInitDataCreates(t *testing.T) {
@@ -189,13 +205,29 @@ func TestInitDataRefusals(t *testing.T) {
 	}
 }
 
+// dataDiskSectors is the size of newInitEnv's stick; ownEntry and ownPlan
+// are the data partition init-data plans on it (201 MiB to the end).
+const dataDiskSectors = 8 * 1024 * 1024
+
+var (
+	ownEntry = testEntry{slot: 1, typ: 0x83, start: 201 * mib512, length: dataDiskSectors - 201*mib512}
+	ownPlan  = DataPlan{Slot: 1, PartNum: 2, StartLBA: 201 * mib512, Sectors: dataDiskSectors - 201*mib512}
+)
+
+// at returns a size-byte image holding each chunk at its offset.
+func at(size int, chunks map[int]string) []byte {
+	b := make([]byte, size)
+	for off, c := range chunks {
+		copy(b[off:], c)
+	}
+	return b
+}
+
 func TestInitDataRecoversInterruptedRun(t *testing.T) {
-	// The entry was written on an earlier boot but mkfs never ran; the
-	// kernel knows the partition and it holds no filesystem.
-	const diskSectors = 8 * 1024 * 1024
-	own := testEntry{slot: 1, typ: 0x83, start: 201 * mib512, length: diskSectors - 201*mib512}
-	e := newInitEnv(t, true, makeMBR(savior(200*mib512), own))
-	e.s.part("sdb", usbPath, 2, 201*mib512, diskSectors-201*mib512, make([]byte, 8192))
+	// The marker and the entry were written on an earlier boot but mkfs
+	// never ran; the kernel knows the partition and it holds no filesystem.
+	e := newInitEnv(t, true, makeMBR(savior(200*mib512), ownEntry))
+	e.s.part("sdb", usbPath, 2, 201*mib512, dataDiskSectors-201*mib512, append(dataMarker(ownPlan), make([]byte, 8192)...))
 	var out, errb bytes.Buffer
 	if rc := initData(e.opts, e.ops, &out, &errb); rc != 0 {
 		t.Fatalf("rc %d: %s", rc, errb.String())
@@ -203,12 +235,176 @@ func TestInitDataRecoversInterruptedRun(t *testing.T) {
 	if e.rereads+e.addParts != 0 || e.mkfsDev == "" || len(e.mounts) != 1 {
 		t.Errorf("rereads %d mkfs %q mounts %v", e.rereads, e.mkfsDev, e.mounts)
 	}
+}
 
-	// Same layout, but the partition holds someone else's filesystem.
-	e = newInitEnv(t, true, makeMBR(savior(200*mib512), own))
-	e.s.part("sdb", usbPath, 2, 201*mib512, diskSectors-201*mib512, extImage("photos", 0, 0x2, 0))
-	if rc := initData(e.opts, e.ops, &out, &errb); rc != 1 || e.mkfsDev != "" {
-		t.Fatalf("foreign fs: rc %d mkfs %q", rc, e.mkfsDev)
+// INIT-1: a partition in exactly the place init-data would put its own is
+// formatted only when it carries SaviorOS's marker. Filesystems Probe does
+// not recognize (LUKS, btrfs, xfs, NTFS, exFAT ...) used to be formatted.
+func TestInitDataRefusesForeignPartition(t *testing.T) {
+	marker := string(dataMarker(ownPlan))
+	other := ownPlan
+	other.Sectors--
+	cases := []struct {
+		name  string
+		image []byte
+	}{
+		{"ext", extImage("photos", 0, 0x2, 0)},
+		{"luks", at(64<<10, map[int]string{0: "LUKS\xba\xbe\x00\x01"})},
+		{"luks2", at(64<<10, map[int]string{0: "LUKS\xba\xbe\x00\x02", 0x4000: "SKUL\xba\xbe\x00\x02"})},
+		{"btrfs", at(128<<10, map[int]string{64<<10 + 0x40: "_BHRfS_M"})},
+		{"xfs", at(64<<10, map[int]string{0: "XFSB"})},
+		{"f2fs", at(64<<10, map[int]string{1024: "\x10\x20\xf5\xf2"})},
+		{"ntfs", at(64<<10, map[int]string{0: "\xeb\x52\x90NTFS    ", 510: "\x55\xaa"})},
+		{"exfat", at(64<<10, map[int]string{0: "\xeb\x76\x90EXFAT   ", 510: "\x55\xaa"})},
+		{"lvm", at(64<<10, map[int]string{512: "LABELONE", 536: "LVM2 001"})},
+		{"blank", make([]byte, 64<<10)},
+		{"marker for other geometry", at(64<<10, map[int]string{0: string(dataMarker(other))})},
+		{"marker under a filesystem", func() []byte {
+			img := extImage("photos", 0, 0x2, 0)
+			copy(img, marker)
+			return img
+		}()},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newInitEnv(t, true, makeMBR(savior(200*mib512), ownEntry))
+			e.s.part("sdb", usbPath, 2, 201*mib512, dataDiskSectors-201*mib512, tc.image)
+			part := filepath.Join(e.s.root, "dev", "sdb2")
+			diskBefore, _ := os.ReadFile(e.diskPath)
+			var out, errb bytes.Buffer
+			if rc := initData(e.opts, e.ops, &out, &errb); rc != 1 {
+				t.Fatalf("rc %d, want 1: %s", rc, errb.String())
+			}
+			if e.mkfsDev != "" || len(e.mounts) != 0 {
+				t.Fatalf("DATA LOSS: mkfs %q mounts %v", e.mkfsDev, e.mounts)
+			}
+			if !strings.Contains(errb.String(), "SaviorOS did not create") {
+				t.Errorf("stderr %q", errb.String())
+			}
+			if got, _ := os.ReadFile(part); !bytes.Equal(got, tc.image) {
+				t.Error("partition changed")
+			}
+			if got, _ := os.ReadFile(e.diskPath); !bytes.Equal(got, diskBefore) {
+				t.Error("disk changed")
+			}
+		})
+	}
+}
+
+func TestInitDataMarksBeforeTheEntry(t *testing.T) {
+	// A reused stick: the space after the FAT partition holds stale LUKS
+	// and btrfs signatures from its previous life.
+	e := newInitEnv(t, true, stickMBR(200))
+	const off = 201 << 20
+	f, _ := os.OpenFile(e.diskPath, os.O_RDWR, 0)
+	f.WriteAt([]byte("last FAT sector"), off-512)
+	f.WriteAt([]byte("LUKS\xba\xbe\x00\x01"), off)
+	f.WriteAt([]byte("_BHRfS_M"), off+64<<10+0x40)
+	f.WriteAt([]byte("beyond the wiped MiB"), off+dataMarkerWipe)
+	f.Close()
+	var out, errb bytes.Buffer
+	if rc := initData(e.opts, e.ops, &out, &errb); rc != 0 {
+		t.Fatalf("rc %d: %s", rc, errb.String())
+	}
+	if e.mkfsDev == "" || len(e.mounts) != 1 {
+		t.Fatalf("mkfs %q mounts %v", e.mkfsDev, e.mounts)
+	}
+	// The marker (written before the entry, so it survives an interruption
+	// right after the entry) replaced the old signatures in the first MiB
+	// and nothing outside it changed.
+	if got := diskAt(t, e.diskPath, off, dataMarkerWipe); !bytes.Equal(got[:dataMarkerSize], dataMarker(ownPlan)) ||
+		!bytes.Equal(got[dataMarkerSize:], make([]byte, dataMarkerWipe-dataMarkerSize)) {
+		t.Errorf("start of the partition % x", got[:80])
+	}
+	if got := diskAt(t, e.diskPath, off-512, 15); string(got) != "last FAT sector" {
+		t.Errorf("boot partition changed: %q", got)
+	}
+	if got := diskAt(t, e.diskPath, off+dataMarkerWipe, 20); string(got) != "beyond the wiped MiB" {
+		t.Errorf("beyond the first MiB: %q", got)
+	}
+}
+
+func TestInitDataClearsMarkerAfterMkfs(t *testing.T) {
+	// BusyBox mke2fs leaves the 1 KiB boot block alone, so the marker would
+	// outlive the format.
+	e := newInitEnv(t, true, stickMBR(200))
+	e.opts.mkfs = func(dev string, _ io.Writer) error {
+		e.mkfsDev = dev
+		f, err := os.OpenFile(dev, os.O_RDWR, 0)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = f.WriteAt(extImage(DataLabel, 0, 0, 0)[1024:], 1024)
+		return err
+	}
+	var out, errb bytes.Buffer
+	if rc := initData(e.opts, e.ops, &out, &errb); rc != 0 {
+		t.Fatalf("rc %d: %s", rc, errb.String())
+	}
+	part := filepath.Join(e.s.root, "dev", "sdb2")
+	got, _ := os.ReadFile(part)
+	if !bytes.Equal(got[:dataMarkerSize], make([]byte, dataMarkerSize)) {
+		t.Errorf("marker still there: % x", got[:dataMarkerSize])
+	}
+	if fs, err := ProbeFile(part); err != nil || !fs.IsExt() || fs.Label != DataLabel {
+		t.Errorf("filesystem after clearing: %+v %v", fs, err)
+	}
+	// Clearing only ever touches the marker itself.
+	if err := clearDataMarker(part, ownPlan); err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := os.ReadFile(part); !bytes.Equal(again, got) {
+		t.Error("second clear changed the partition")
+	}
+}
+
+func TestWriteDataMarker(t *testing.T) {
+	dir := t.TempDir()
+	disk := filepath.Join(dir, "disk")
+	mbr := stickMBR(200)
+	os.WriteFile(disk, mbr, 0o600)
+	plan, err := PlanDataPartition(mbr, Geometry{Sectors: dataDiskSectors, SectorSize: 512}, 2048, 0)
+	if err != nil || plan.StartLBA != ownPlan.StartLBA || plan.Sectors != ownPlan.Sectors {
+		t.Fatalf("plan %+v %v", plan, err)
+	}
+	// The MBR changed since it was planned from: nothing is written.
+	changed := append([]byte(nil), mbr...)
+	changed[440]++
+	if err := writeDataMarker(disk, changed, plan, 512); err == nil {
+		t.Error("stale MBR accepted")
+	}
+	if st, _ := os.Stat(disk); st.Size() != 512 {
+		t.Errorf("wrote after a refusal: size %d", st.Size())
+	}
+	if err := writeDataMarker(disk, mbr, plan, 512); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(disk); st.Size() != 202<<20 {
+		t.Errorf("size %d, want the first MiB of the partition", st.Size())
+	}
+	part := filepath.Join(dir, "part")
+	os.WriteFile(part, diskAt(t, disk, 201<<20, 4096), 0o600)
+	if ok, err := hasDataMarker(part, plan); !ok || err != nil {
+		t.Errorf("marker not found: %v", err)
+	}
+	other := plan
+	other.StartLBA += 2048
+	if ok, _ := hasDataMarker(part, other); ok {
+		t.Error("marker matches another geometry")
+	}
+	// 4 KiB sectors: the marker records sectors, the offset is in bytes.
+	os.WriteFile(disk, mbr, 0o600)
+	p4k := DataPlan{StartLBA: 256, Sectors: 1000}
+	if err := writeDataMarker(disk, mbr, p4k, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if got := diskAt(t, disk, 256*4096, dataMarkerSize); !bytes.Equal(got, dataMarker(p4k)) {
+		t.Errorf("4K marker % x", got)
+	}
+	// A partition too small for the marker is refused.
+	if err := writeDataMarker(disk, mbr, DataPlan{StartLBA: 4096, Sectors: 0}, 512); err == nil {
+		t.Error("empty partition accepted")
 	}
 }
 
