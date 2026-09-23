@@ -58,7 +58,7 @@ type node struct {
 	claimTasks  []proto.TaskRef
 	claims      int
 	actions     []*action
-	nodeErrs    []time.Time          // node errors (monotonic) within the quarantine window
+	nodeErrs    []time.Time          // node errors (monotonic) on tasks that then succeeded elsewhere, within the quarantine window
 	fastFails   map[string]time.Time // task ID -> failure time, for tasks that ran < 10 s
 	reservedFor string
 }
@@ -152,6 +152,9 @@ type jobRecord struct {
 	FinishedAt *time.Time    `json:"finished_at,omitempty"`
 	NextIndex  int           `json:"next_index"`
 	Canceled   bool          `json:"canceled,omitempty"`
+	// DoneSeq is assigned from a persisted counter when the job finishes or
+	// is canceled; retention deletes the jobs that finished first.
+	DoneSeq uint64 `json:"done_seq,omitempty"`
 }
 
 // job is a job with its lazily created task records.
@@ -269,8 +272,16 @@ type task struct {
 	xferMono     time.Time
 	uploaded     int64                // bytes charged against leaseUploadCap this lease
 	fastFailedOn map[string]time.Time // node ID -> when this task failed there within 10 s
+	nodeErrOn    map[string]nodeErr   // node ID -> the node error this task had there
 	log          *logRing
 	tail         []byte // last log tail, until written to disk
+}
+
+// nodeErr is a node error a task had on some node, kept as possible
+// evidence against that node until the task succeeds elsewhere.
+type nodeErr struct {
+	at        time.Time // monotonic
+	kind, msg string
 }
 
 func (t *task) active() bool { return t.State == proto.TaskAssigned || t.State == proto.TaskRunning }
@@ -332,14 +343,16 @@ type otherHive struct {
 
 // snapshot is the persisted state (state.json).
 type snapshot struct {
-	Format  int              `json:"format"`
-	HiveID  string           `json:"hive_id"`
-	SavedAt time.Time        `json:"saved_at"`
-	NextSeq uint64           `json:"next_seq"`
-	Nodes   []nodeRecord     `json:"nodes"`
-	Jobs    []jobSnapshot    `json:"jobs"`
-	Walls   []proto.WallSpec `json:"walls"`
-	Blobs   []blobRecord     `json:"blobs"`
+	Format  int       `json:"format"`
+	HiveID  string    `json:"hive_id"`
+	SavedAt time.Time `json:"saved_at"`
+	NextSeq uint64    `json:"next_seq"`
+	// NextDoneSeq is the next jobRecord.DoneSeq.
+	NextDoneSeq uint64           `json:"next_done_seq,omitempty"`
+	Nodes       []nodeRecord     `json:"nodes"`
+	Jobs        []jobSnapshot    `json:"jobs"`
+	Walls       []proto.WallSpec `json:"walls"`
+	Blobs       []blobRecord     `json:"blobs"`
 }
 
 type jobSnapshot struct {
@@ -351,7 +364,7 @@ const snapshotFormat = 1
 
 // snapshotLocked copies the state for serialization outside the lock.
 func (s *Server) snapshotLocked() *snapshot {
-	snap := &snapshot{Format: snapshotFormat, HiveID: s.hiveID, SavedAt: s.now(), NextSeq: s.nextSeq}
+	snap := &snapshot{Format: snapshotFormat, HiveID: s.hiveID, SavedAt: s.now(), NextSeq: s.nextSeq, NextDoneSeq: s.nextDoneSeq}
 	snap.Nodes = make([]nodeRecord, 0, len(s.nodes))
 	for _, n := range s.nodes {
 		snap.Nodes = append(snap.Nodes, n.nodeRecord)

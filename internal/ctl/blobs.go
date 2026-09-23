@@ -133,12 +133,15 @@ func (c *Client) FetchBlob(ctx context.Context, sha string, w io.Writer) (int64,
 	return c.download(ctx, escapePath("/api/v1/blobs", sha), w, proto.MaxBlobBytes, sha)
 }
 
-// download streams a GET response body to w. max < 0 means no limit
-// beyond the blob maximum; wantSHA, if set, is verified.
+// noLimit makes download accept a body of any size. Only streams that
+// combine many blobs (the outputs zip) use it; a single blob or output
+// file is capped at proto.MaxBlobBytes.
+const noLimit = -1
+
+// download streams a GET response body to w. At most max bytes are
+// accepted; max < 0 (noLimit) means no size limit, and the transfer then
+// ends only on EOF, an error or a stall. wantSHA, if set, is verified.
 func (c *Client) download(ctx context.Context, p string, w io.Writer, max int64, wantSHA string) (int64, error) {
-	if max < 0 {
-		max = proto.MaxBlobBytes
-	}
 	if err := c.ensureSession(ctx); err != nil {
 		return 0, err
 	}
@@ -154,7 +157,11 @@ func (c *Client) download(ctx context.Context, p string, w io.Writer, max int64,
 	if wantSHA != "" {
 		dst = io.MultiWriter(w, h)
 	}
-	n, err := io.Copy(dst, &capReader{r: &kickReader{r: resp.Body, kick: kick}, left: max})
+	var src io.Reader = &kickReader{r: resp.Body, kick: kick}
+	if max >= 0 {
+		src = &capReader{r: src, left: max}
+	}
+	n, err := io.Copy(dst, src)
 	if err != nil {
 		return n, stallErr(ctx, err)
 	}

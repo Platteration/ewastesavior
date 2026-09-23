@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/platteration/ewastesavior/internal/auth"
@@ -53,6 +54,15 @@ type Options struct {
 	MinHeartbeat time.Duration
 }
 
+// taskRunner is the part of *runner.Runner the agent uses after setup
+// (tests substitute a fake).
+type taskRunner interface {
+	FreeSlots() int
+	Run(ctx context.Context, t proto.Task, logs io.Writer, progress func(proto.RunningTask)) proto.TaskReport
+	Freeze(lease string, frozen bool) error
+	Preempt(lease string) error
+}
+
 // Agent is a running node.
 type Agent struct {
 	opt    Options
@@ -62,11 +72,16 @@ type Agent struct {
 	bootID string
 	secret auth.Secret
 
-	sampler  *hwinfo.Sampler
-	sampleMu sync.Mutex
-	runner   *runner.Runner
-	disp     *display.Controller
-	urlf     *display.URLFetcher
+	sampler     *hwinfo.Sampler
+	sampleMu    sync.Mutex
+	runner      taskRunner // nil without the compute role
+	runnerSlots int        // the runner's concurrency (uid slots)
+	disp        *display.Controller
+	urlf        *display.URLFetcher
+
+	// shuttingDown is set once shutdownTasks starts: finishing tasks then
+	// skip the immediate report flush so the agent can stop promptly.
+	shuttingDown atomic.Bool
 
 	mu           sync.Mutex
 	inv          proto.Inventory
@@ -211,7 +226,7 @@ func (a *Agent) setupRunner() error {
 	if err != nil {
 		return err
 	}
-	a.runner = r
+	a.runner, a.runnerSlots = r, slots
 	mode, caps, _ := r.Caps()
 	a.sandboxMode, a.sandboxCaps = mode, caps
 	if err := r.SetCPULimit(a.total.Cores); err != nil {

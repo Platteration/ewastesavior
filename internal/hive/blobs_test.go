@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -339,5 +340,49 @@ func TestRenderEndpoint(t *testing.T) {
 	if st := h.admin("PATCH", "nodes/"+n.req.NodeID, proto.NodePatch{Display: &proto.DisplaySpec{Mode: proto.DisplayImage,
 		Image: &proto.Media{Blob: sha([]byte("nope"))}}}, nil); st != http.StatusBadRequest {
 		t.Fatalf("unknown media blob: %d", st)
+	}
+}
+
+// outputs.zip never passes off an incomplete archive as a success: a
+// missing blob is a 500 before anything is sent, and a blob that fails
+// while streaming aborts the connection.
+func TestOutputsZipIncomplete(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	n := h.newNode(nil)
+	n.register()
+	d := h.submit(scriptJob(2, func(s *proto.JobSpec) { s.Outputs = []string{"*.txt"} }))
+	var blobs [][]byte
+	for i, tk := range n.claim(2) {
+		data := []byte(strings.Repeat("output ", 100) + strconv.Itoa(i))
+		if code, _ := n.api("PUT", "blobs/"+sha(data), data, nil); code != 200 {
+			t.Fatalf("upload: %d", code)
+		}
+		outs := []proto.Output{{Name: "out.txt", Blob: sha(data), Size: int64(len(data))}}
+		if code := n.report(tk, proto.TaskReport{State: proto.TaskSucceeded, Outputs: outs}); code != 200 {
+			t.Fatalf("report: %d", code)
+		}
+		blobs = append(blobs, data)
+	}
+	if resp, err := adminGet(h, "jobs/"+d.ID+"/outputs.zip"); err != nil || resp.code != 200 {
+		t.Fatalf("complete zip: %v %d", err, resp.code)
+	}
+	p := h.s.blobs.path(sha(blobs[1]))
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := adminGet(h, "jobs/"+d.ID+"/outputs.zip")
+	if err != nil || resp.code != http.StatusInternalServerError || !strings.Contains(string(resp.body), "output blob missing") {
+		t.Fatalf("missing blob: %v %d %q", err, resp.code, resp.body)
+	}
+	// Present but short: found only while streaming, after the 200.
+	if err := os.WriteFile(p, blobs[1][:10], 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = adminGet(h, "jobs/"+d.ID+"/outputs.zip")
+	if err == nil {
+		if _, zerr := zip.NewReader(bytes.NewReader(resp.body), int64(len(resp.body))); zerr == nil {
+			t.Fatalf("a short blob was served as a complete zip (%d)", resp.code)
+		}
 	}
 }

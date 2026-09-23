@@ -100,6 +100,10 @@ func (s *Server) Run(ctx context.Context) error {
 	case runErr = <-errc:
 	}
 	cancel()
+	// Stop dispatching and end the claim and log long-polls first: they
+	// would hold the server's shutdown for its whole timeout and could
+	// still assign tasks after the final save.
+	s.beginShutdown()
 	sctx, scancel := context.WithTimeout(context.Background(), 5*time.Second)
 	_ = srv.Shutdown(sctx)
 	if nb != nil {

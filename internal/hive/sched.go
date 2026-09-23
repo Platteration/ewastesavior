@@ -67,6 +67,12 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, tok string)
 		case <-wake:
 		case <-timer.C:
 		case <-ctx.Done():
+		case <-s.shutdown:
+			// The hive is stopping and dispatches nothing more; answer now
+			// so the HTTP server's shutdown doesn't wait for the poll.
+			timer.Stop()
+			writeJSON(w, http.StatusOK, proto.ClaimResponse{Tasks: []proto.Task{}})
+			return
 		}
 		timer.Stop()
 	}
@@ -169,10 +175,21 @@ func freeLocked(n *node, reported proto.Resources) proto.Resources {
 	return nonNegative(reported.Min(n.Total.Sub(n.allocated())))
 }
 
+// fitsFree reports whether need fits a node's free resources. Fits treats
+// zero disk as "not limited", which is right for a Total but not for free
+// space: a node with a disk quota whose disk is fully allocated has none
+// left, not an unlimited amount.
+func fitsFree(n *node, free, need proto.Resources) bool {
+	return free.Fits(need, n.ScratchInRAM) && (n.ScratchInRAM || n.Total.DiskMB <= 0 || need.DiskMB <= free.DiskMB)
+}
+
 // dispatchLocked assigns up to max fitting tasks to n, walking jobs in
-// queue order (priority desc, Seq asc). It costs O(jobs).
+// queue order (priority desc, Seq asc). It costs O(jobs). A task is never
+// given to a node that still holds an earlier lease of it (a hive deadline
+// requeues with the resources kept charged): held and listed tasks are
+// keyed by task ID. Nothing is dispatched once the hive is shutting down.
 func (s *Server) dispatchLocked(n *node, reqFree proto.Resources, max int, now time.Time) []proto.Task {
-	if !s.claimEligibleLocked(n, now) {
+	if s.closing || !s.claimEligibleLocked(n, now) {
 		return nil
 	}
 	free := freeLocked(n, reqFree)
@@ -189,8 +206,9 @@ func (s *Server) dispatchLocked(n *node, reqFree proto.Resources, max int, now t
 		if t == nil || t.State != proto.TaskPending || t.job.Canceled {
 			s.clearReservationLocked()
 		} else {
-			// A reserved node receives only its task, once it fits.
-			if s.matchesLocked(n, &t.job.Spec) && free.Fits(t.job.Spec.Resources, n.ScratchInRAM) {
+			// A reserved node receives only its task, once it fits and
+			// the node has let go of any earlier lease of it.
+			if _, old := n.held[t.ID]; !old && s.matchesLocked(n, &t.job.Spec) && fitsFree(n, free, t.job.Spec.Resources) {
 				s.removeRequeuedLocked(t)
 				take(t)
 			}
@@ -207,20 +225,22 @@ func (s *Server) dispatchLocked(n *node, reqFree proto.Resources, max int, now t
 		}
 		need := j.Spec.Resources
 		for i := 0; i < len(j.requeued) && len(out) < max; {
-			if !free.Fits(need, n.ScratchInRAM) {
+			if !fitsFree(n, free, need) {
 				break
 			}
 			// A task reserved on another node may still run here if it fits;
-			// dispatching it clears the reservation.
+			// dispatching it clears the reservation. Skip it while n still
+			// holds an earlier lease of it, and (anti-affinity) on a node it
+			// failed on while another node could run it.
 			t := j.requeued[i]
-			if containsStr(t.FailedNodes, n.ID) && s.otherNodeForLocked(t, n, now) {
+			if _, old := n.held[t.ID]; old || containsStr(t.FailedNodes, n.ID) && s.otherNodeForLocked(t, n, now) {
 				i++
 				continue
 			}
 			j.requeued = append(j.requeued[:i:i], j.requeued[i+1:]...)
 			take(t)
 		}
-		for j.NextIndex < j.Spec.Count && len(out) < max && free.Fits(need, n.ScratchInRAM) {
+		for j.NextIndex < j.Spec.Count && len(out) < max && fitsFree(n, free, need) {
 			take(s.newTaskLocked(j))
 		}
 	}
@@ -388,7 +408,9 @@ func (s *Server) waitReasonLocked(t *task, now time.Time) string {
 		return "no eligible node"
 	case bestFree.Cores+1e-9 < need.Cores:
 		return fmt.Sprintf("waiting for %g cores", need.Cores)
-	case !bestFree.Fits(need, best.ScratchInRAM):
+	case !best.ScratchInRAM && need.MemMB <= bestFree.MemMB && !fitsFree(best, bestFree, need):
+		return fmt.Sprintf("waiting for %d MB disk", need.DiskMB)
+	case !fitsFree(best, bestFree, need):
 		return fmt.Sprintf("waiting for %d MB memory", need.MemMB)
 	}
 	return "waiting for a node to claim it"
@@ -439,7 +461,7 @@ func (s *Server) updateReservationLocked(now time.Time) {
 	}
 	need := j.Spec.Resources
 	for _, n := range cands {
-		if freeLocked(n, n.status.Free).Fits(need, n.ScratchInRAM) {
+		if fitsFree(n, freeLocked(n, n.status.Free), need) {
 			s.headKey = "" // it fits somewhere now; the next claim takes it
 			return
 		}

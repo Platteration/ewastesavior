@@ -276,7 +276,9 @@ func (s *Server) handleJobOutputs(w http.ResponseWriter, r *http.Request, _ admi
 }
 
 // handleJobOutputsZip streams every output as task-<index>/<name>, stored
-// uncompressed (DESIGN 7.2).
+// uncompressed (DESIGN 7.2). A missing blob is a 500 before anything is
+// sent; a failure after the 200 aborts the connection, so a client never
+// takes an incomplete archive for a complete one.
 func (s *Server) handleJobOutputsZip(w http.ResponseWriter, r *http.Request, _ adminCtx) {
 	s.mu.Lock()
 	j := s.jobs[r.PathValue("id")]
@@ -296,6 +298,11 @@ func (s *Server) handleJobOutputsZip(w http.ResponseWriter, r *http.Request, _ a
 	s.mu.Unlock()
 	var total int64
 	for _, e := range entries {
+		if _, err := os.Stat(s.blobs.path(e.Blob)); err != nil {
+			s.log.Warn("outputs.zip: blob missing", "job", jobID, "blob", e.Blob, "err", err)
+			writeErr(w, http.StatusInternalServerError, "output blob missing: task %d %s (%s)", e.Index, e.Name, e.Blob)
+			return
+		}
 		total += e.Size
 	}
 	setDeadlines(w, blobDeadline(total))
@@ -308,8 +315,10 @@ func (s *Server) handleJobOutputsZip(w http.ResponseWriter, r *http.Request, _ a
 	for _, e := range entries {
 		f, err := os.Open(s.blobs.path(e.Blob))
 		if err != nil {
-			s.log.Warn("outputs.zip: blob missing", "job", jobID, "blob", e.Blob)
-			break // the status is already sent; a truncated zip is detectable
+			s.log.Warn("outputs.zip: blob vanished while streaming", "job", jobID, "blob", e.Blob, "err", err)
+			// The 200 is already sent and closing the zip would make a
+			// valid archive without this entry: abort the connection.
+			panic(http.ErrAbortHandler)
 		}
 		fw, err := zw.CreateHeader(&zip.FileHeader{
 			Name:     path.Join(fmt.Sprintf("task-%d", e.Index), e.Name),
@@ -317,14 +326,16 @@ func (s *Server) handleJobOutputsZip(w http.ResponseWriter, r *http.Request, _ a
 			Modified: now,
 		})
 		if err == nil {
-			_, err = io.Copy(fw, f)
+			_, err = io.CopyN(fw, f, e.Size) // a short blob is an error too
 		}
 		f.Close()
 		if err != nil {
-			return
+			panic(http.ErrAbortHandler)
 		}
 	}
-	_ = zw.Close()
+	if err := zw.Close(); err != nil {
+		panic(http.ErrAbortHandler)
+	}
 }
 
 func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request, _ adminCtx) {

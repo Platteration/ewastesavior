@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -18,12 +19,23 @@ import (
 
 // sysState holds Linux-only runner state.
 type sysState struct {
-	workRoot *os.Root // WorkRoot opened once, used for all task dirs
-	workPath string   // absolute WorkRoot path (for mounts)
-	tasksCg  string   // <CgroupRoot>/tasks (cgroup v2), "" when unavailable
-	machine  string   // uname -m
-	shimArch string   // runtime.GOARCH of this binary
+	workRoot    *os.Root // WorkRoot opened once, used for all task dirs
+	workPath    string   // absolute WorkRoot path (for mounts)
+	sandboxRoot string   // <WorkRoot>/.sandbox-root: the shims' root mountpoint
+	tasksCg     string   // <CgroupRoot>/tasks (cgroup v2), "" when unavailable
+	machine     string   // uname -m
+	shimArch    string   // runtime.GOARCH of this binary
 }
+
+// sandboxRootName is the directory in WorkRoot on which every sandbox shim
+// mounts its private root tmpfs, inside its own mount namespace. Task
+// directory names start with a letter or digit (taskIDRE), so they never
+// collide with it.
+const sandboxRootName = ".sandbox-root"
+
+// leftoverKillWait bounds how long New waits for a previous agent's task
+// processes to die.
+const leftoverKillWait = 5 * time.Second
 
 // init probes capabilities and prepares WorkRoot, CacheDir and the cgroup
 // parent, cleaning up whatever a previous agent left behind (DESIGN 10.5).
@@ -49,6 +61,7 @@ func (r *Runner) init() error {
 		return err
 	}
 	r.prepareCgroup() // best effort; sets the cgroup2 capability
+	r.killLeftoverProcs()
 
 	r.probeCaps()
 	if os.Geteuid() == 0 && (r.mode == ModeNone || !r.caps[CapMountNS]) {
@@ -84,7 +97,40 @@ func (r *Runner) prepareWorkRoot() error {
 		return fmt.Errorf("runner: open work root: %w", err)
 	}
 	r.sys.workRoot = root
+	// The shims' root mountpoint: empty and reachable by root only. Task
+	// cleanup (removeAllIn by task dir name) and output collection (an
+	// os.Root on the task dir) never reach it.
+	if err := root.Mkdir(sandboxRootName, 0o700); err != nil {
+		return fmt.Errorf("runner: sandbox root mountpoint: %w", err)
+	}
+	if f, err := root.OpenFile(sandboxRootName, os.O_RDONLY|oNoFollow, 0); err == nil {
+		own := owner{uid: -1, gid: -1}
+		if os.Geteuid() == 0 {
+			own = owner{uid: 0, gid: 0}
+		}
+		finishFile(f, own, 0o700)
+		f.Close()
+	}
+	r.sys.sandboxRoot = filepath.Join(abs, sandboxRootName)
 	return nil
+}
+
+// killLeftoverProcs kills processes a previous agent's tasks left behind
+// under the slot uids (DESIGN 10.5). Tasks without a cgroup and pid
+// namespace can outlive the agent: their parent-death signal only reaches
+// the task's first process.
+func (r *Runner) killLeftoverProcs() {
+	if os.Geteuid() != 0 {
+		return // tasks run as the agent's own uid; nothing to tell apart
+	}
+	lo, hi := r.cfg.UIDBase, r.cfg.UIDBase+r.cfg.Slots-1
+	n, ok := killUIDProcs(lo, hi, leftoverKillWait)
+	switch {
+	case !ok:
+		r.log.Warn("leftover task processes survived SIGKILL", "uids", fmt.Sprintf("%d-%d", lo, hi))
+	case n > 0:
+		r.log.Info("killed leftover task processes", "count", n)
+	}
 }
 
 func (r *Runner) prepareCache() error {

@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"sync"
 	"time"
 
@@ -61,13 +62,31 @@ type taskState struct {
 	preempted bool
 	proc      procControl   // non-nil while processes may exist
 	wake      chan struct{} // poked on freeze/preempt changes
+	preemptCh chan struct{} // closed by the first preempt
 }
 
 func newTaskState(id, lease string, progress func(proto.RunningTask)) *taskState {
 	if progress == nil {
 		progress = func(proto.RunningTask) {}
 	}
-	return &taskState{id: id, lease: lease, progress: progress, phase: proto.PhaseFetching, wake: make(chan struct{}, 1)}
+	return &taskState{
+		id: id, lease: lease, progress: progress, phase: proto.PhaseFetching,
+		wake: make(chan struct{}, 1), preemptCh: make(chan struct{}),
+	}
+}
+
+// preemptible returns a context derived from ctx that is also canceled
+// when the task is preempted, for the waits before the process starts.
+func (t *taskState) preemptible(ctx context.Context) (context.Context, context.CancelFunc) {
+	c, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-t.preemptCh:
+			cancel()
+		case <-c.Done():
+		}
+	}()
+	return c, cancel
 }
 
 func (t *taskState) poke() {
@@ -183,9 +202,15 @@ func (t *taskState) setFrozen(frozen bool) error {
 	return err
 }
 
+// preempt marks the task preempted and kills its processes if they
+// exist; a process that is not started yet is killed by the runner as soon
+// as it is (or never started at all).
 func (t *taskState) preempt() {
 	t.mu.Lock()
-	t.preempted = true
+	if !t.preempted {
+		t.preempted = true
+		close(t.preemptCh)
+	}
 	pc := t.proc
 	t.mu.Unlock()
 	if pc != nil {

@@ -259,6 +259,7 @@ type Server struct {
 	walls         map[string]*proto.WallSpec
 	blobMeta      map[string]*blob
 	nextSeq       uint64
+	nextDoneSeq   uint64 // next jobRecord.DoneSeq
 	taskRecords   int
 	sessions      map[string]*session // SHA-256(session) -> session
 	pairCodes     []*pairCode
@@ -281,17 +282,20 @@ type Server struct {
 	lastBlobGC    time.Time
 	lastNTPCheck  time.Time
 	lastStatus    string
+	closing       bool // shutting down: nothing is dispatched any more
 
 	persistMu    sync.Mutex
 	lastWrite    time.Time // monotonic
 	lastWriteDur time.Duration
 	persistErr   error
 
-	listenAddr atomic.Value // net.Addr
-	stop       context.CancelFunc
-	bgDone     chan struct{}
-	closeOnce  sync.Once
-	closeErr   error
+	listenAddr   atomic.Value // net.Addr
+	stop         context.CancelFunc
+	bgDone       chan struct{}
+	shutdown     chan struct{} // closed by beginShutdown; ends long-polls
+	shutdownOnce sync.Once
+	closeOnce    sync.Once
+	closeErr     error
 }
 
 // New creates a hive: it resolves the data directory, loads the TLS
@@ -314,25 +318,27 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	s := &Server{
-		cfg:        cfg,
-		log:        cfg.Log,
-		data:       dd,
-		startMono:  time.Now(),
-		nodes:      map[string]*node{},
-		tokens:     map[string]string{},
-		jobs:       map[string]*job{},
-		tasks:      map[string]*task{},
-		walls:      map[string]*proto.WallSpec{},
-		blobMeta:   map[string]*blob{},
-		nextSeq:    1,
-		sessions:   map[string]*session{},
-		usedNonces: map[string]time.Time{},
-		wake:       make(chan struct{}),
-		warnings:   map[string]string{},
-		otherHives: map[string]otherHive{},
-		limits:     newLimiter(),
-		io:         newIOQueue(),
-		nonces:     auth.NewNonceIssuer(),
+		cfg:         cfg,
+		log:         cfg.Log,
+		data:        dd,
+		startMono:   time.Now(),
+		nodes:       map[string]*node{},
+		tokens:      map[string]string{},
+		jobs:        map[string]*job{},
+		tasks:       map[string]*task{},
+		walls:       map[string]*proto.WallSpec{},
+		blobMeta:    map[string]*blob{},
+		nextSeq:     1,
+		nextDoneSeq: 1,
+		sessions:    map[string]*session{},
+		usedNonces:  map[string]time.Time{},
+		wake:        make(chan struct{}),
+		warnings:    map[string]string{},
+		otherHives:  map[string]otherHive{},
+		limits:      newLimiter(),
+		io:          newIOQueue(),
+		nonces:      auth.NewNonceIssuer(),
+		shutdown:    make(chan struct{}),
 	}
 	s.startedAt = s.now()
 	if dd.warning != "" {
@@ -456,10 +462,11 @@ func (s *Server) Addr() net.Addr {
 	return a
 }
 
-// Close stops background work, waits for pending file writes and saves the
-// state. It is safe to call more than once.
+// Close stops dispatching and background work, waits for pending file
+// writes and saves the state. It is safe to call more than once.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
+		s.beginShutdown()
 		s.stop()
 		<-s.bgDone
 		s.io.close()
@@ -469,6 +476,18 @@ func (s *Server) Close() error {
 		s.closeErr = s.persist(true)
 	})
 	return s.closeErr
+}
+
+// beginShutdown stops dispatching and ends claim and log long-polls, so
+// that an HTTP server shutdown doesn't wait for them and no task is
+// assigned after the final save. It is safe to call more than once.
+func (s *Server) beginShutdown() {
+	s.shutdownOnce.Do(func() {
+		s.mu.Lock()
+		s.closing = true
+		s.mu.Unlock()
+		close(s.shutdown)
+	})
 }
 
 // now returns the hive's wall clock.

@@ -59,7 +59,8 @@ func (c *Client) Info(ctx context.Context) (proto.HiveInfo, error) {
 
 // NodeConfig returns a savior.conf for nodes (swarm key, fingerprint pin
 // and hive address). hiveAddr is the address nodes should use; "" lets the
-// hive use the address this client connected to.
+// hive use the address this client connected to, and "auto" makes nodes
+// find the hive on the LAN.
 func (c *Client) NodeConfig(ctx context.Context, hiveAddr string) (string, error) {
 	if err := c.ensureSession(ctx); err != nil {
 		return "", err
@@ -293,12 +294,14 @@ func (c *Client) Outputs(ctx context.Context, jobID string) ([]proto.OutputEntry
 }
 
 // OutputsZip streams a zip of all of a job's outputs (entries
-// task-<index>/<name>) to w.
+// task-<index>/<name>) to w. The zip has no size limit (a job's outputs
+// together can exceed the largest single blob); the transfer fails only
+// when no data moves for the client timeout.
 func (c *Client) OutputsZip(ctx context.Context, jobID string, w io.Writer) (int64, error) {
 	if err := checkRef("job", jobID); err != nil {
 		return 0, err
 	}
-	return c.download(ctx, adminPath("jobs", jobID, "outputs.zip"), w, -1, "")
+	return c.download(ctx, adminPath("jobs", jobID, "outputs.zip"), w, noLimit, "")
 }
 
 // TaskOutput streams one output file of a task to w.
@@ -313,7 +316,7 @@ func (c *Client) TaskOutput(ctx context.Context, taskID, name string, w io.Write
 	for _, seg := range strings.Split(name, "/") {
 		p += "/" + url.PathEscape(seg)
 	}
-	return c.download(ctx, p, w, -1, "")
+	return c.download(ctx, p, w, proto.MaxBlobBytes, "")
 }
 
 // Walls lists the video walls.

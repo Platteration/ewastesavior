@@ -84,6 +84,10 @@ func openFramebuffer(path string, rotate int, opt fbOpts) (*fbDevice, error) {
 		f.Close()
 		return nil, fmt.Errorf("%s (%s): %w", path, fixID(&fi), err)
 	}
+	// Like the backlight above: a previous agent may have died while the
+	// screen was powered down with FBIOBLANK. vt-reset unblanks only the
+	// device the config names, so turn this one back on before using it.
+	_ = ioctlVal(fd, fbioBlank, fbBlankUnblank)
 	var warns []string
 	if fi.Visual == fbVisualDirectColor {
 		if err := putIdentityCmap(fd, &vi); err != nil {

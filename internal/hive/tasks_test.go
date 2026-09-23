@@ -1,6 +1,7 @@
 package hive
 
 import (
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -236,26 +237,43 @@ func TestErrorKindsAndQuarantine(t *testing.T) {
 		t.Fatalf("job: %s", j.State)
 	}
 
-	// Node errors never consume attempts; three of them quarantine the node.
+	// Node errors never consume attempts. Three of them, on tasks that then
+	// succeed on another node, quarantine the node.
 	h.submit(scriptJob(3, func(s *proto.JobSpec) { s.Retries = ptr(0) }))
+	got := n.claim(3)
+	if len(got) != 3 {
+		t.Fatalf("node errors: %d tasks", len(got))
+	}
 	for i, kind := range []string{proto.ErrInput, proto.ErrOutput, ""} {
-		got := n.claim(1)
-		if len(got) != 1 {
-			t.Fatalf("node error %d: no task", i)
-		}
-		n.report(got[0], proto.TaskReport{State: proto.TaskFailed, ErrorKind: kind, Error: "broken disk"})
-		v := h.task(got[0].ID)
-		if v.State != proto.TaskPending || v.Failures != 0 || v.NodeErrors < 1 {
+		n.report(got[i], proto.TaskReport{State: proto.TaskFailed, ErrorKind: kind, Error: "broken disk"})
+		v := h.task(got[i].ID)
+		if v.State != proto.TaskPending || v.Failures != 0 || v.NodeErrors != 1 {
 			t.Fatalf("node error %d: %+v", i, v)
 		}
 		if kind == "" && v.ErrorKind != proto.ErrInternal {
 			t.Fatalf("unknown kind should be internal: %q", v.ErrorKind)
 		}
 	}
+	if q := h.nodeView(n.req.NodeID).Quarantine; q != "" {
+		t.Fatalf("quarantined before the tasks succeeded elsewhere: %q", q)
+	}
+	good := h.newNode(nil)
+	good.register()
+	for i, tk := range good.claim(3) {
+		good.succeed(tk)
+		if q := h.nodeView(n.req.NodeID).Quarantine; (q != "") != (i == 2) {
+			t.Fatalf("after %d successes elsewhere: quarantine %q", i+1, q)
+		}
+	}
 	nv := h.nodeView(n.req.NodeID)
-	if !strings.Contains(nv.Quarantine, "node errors") {
+	if !strings.Contains(nv.Quarantine, "node errors") || !strings.Contains(nv.Quarantine, "succeeded on other nodes") {
 		t.Fatalf("not quarantined: %+v", nv.Quarantine)
 	}
+	if q := h.nodeView(good.req.NodeID).Quarantine; q != "" {
+		t.Fatalf("good node quarantined: %q", q)
+	}
+	h.mustAdmin("PATCH", "nodes/"+good.req.NodeID, proto.NodePatch{Drain: ptr(true)}, nil)
+	h.submit(scriptJob(1, nil))
 	if got := n.claim(1); len(got) != 0 {
 		t.Fatal("quarantined node got a task")
 	}
@@ -265,13 +283,79 @@ func TestErrorKindsAndQuarantine(t *testing.T) {
 	}
 }
 
+// A job whose input URL fails on every node (or whose outputs the hive
+// rejects everywhere) says nothing about the nodes: none is quarantined.
+func TestJobCausedNodeErrorsDoNotQuarantine(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	var nodes []*testNode
+	for i := 0; i < 3; i++ {
+		n := h.newNode(nil)
+		n.register()
+		nodes = append(nodes, n)
+	}
+	d := h.submit(scriptJob(4, func(s *proto.JobSpec) {
+		s.Inputs = []proto.Input{{Name: "data", URL: "https://example.invalid/data", SHA256: sha([]byte("data")), Size: 4}}
+	}))
+	for i := 0; i < 200; i++ {
+		n := nodes[i%len(nodes)]
+		got := n.claim(1)
+		if len(got) == 0 {
+			if h.job(d.ID).State.Terminal() {
+				break
+			}
+			continue
+		}
+		kind, msg := proto.ErrInput, "fetch data: no such host"
+		if i%2 == 1 {
+			// Reported as a success with outputs the hive rejects.
+			if code := n.report(got[0], proto.TaskReport{State: proto.TaskSucceeded,
+				Outputs: []proto.Output{{Name: "out", Blob: sha([]byte("never uploaded")), Size: 14}}}); code != http.StatusBadRequest {
+				t.Fatalf("rejected outputs: %d", code)
+			}
+			continue
+		}
+		if code := n.report(got[0], proto.TaskReport{State: proto.TaskFailed, ErrorKind: kind, Error: msg}); code != 200 {
+			t.Fatalf("report: %d", code)
+		}
+	}
+	j := h.job(d.ID)
+	if j.State != proto.JobFailed || j.Counts.Failed != 4 {
+		t.Fatalf("job: %s %+v", j.State, j.Counts)
+	}
+	for _, n := range nodes {
+		if q := h.nodeView(n.req.NodeID).Quarantine; q != "" {
+			t.Fatalf("a broken input quarantined %s: %q", n.req.NodeID, q)
+		}
+	}
+	// A node error on the node where the task then succeeds is no
+	// evidence either.
+	h.submit(scriptJob(3, nil))
+	a := nodes[0]
+	for _, other := range nodes[1:] {
+		h.mustAdmin("PATCH", "nodes/"+other.req.NodeID, proto.NodePatch{Drain: ptr(true)}, nil)
+	}
+	for i := 0; i < 3; i++ {
+		tk := a.claim(1)[0]
+		a.report(tk, proto.TaskReport{State: proto.TaskFailed, ErrorKind: proto.ErrInput, Error: "flaky"})
+		retry := a.claim(1) // the only eligible node: anti-affinity yields
+		if len(retry) != 1 || retry[0].ID != tk.ID {
+			t.Fatalf("retry on the same node: %+v", retry)
+		}
+		a.succeed(retry[0])
+	}
+	if q := h.nodeView(a.req.NodeID).Quarantine; q != "" {
+		t.Fatalf("quarantined by tasks that succeeded on the same node: %q", q)
+	}
+}
+
 func TestFastFailureQuarantine(t *testing.T) {
 	t.Parallel()
 	h := newHive(t, nil)
 	bad := h.newNode(nil)
 	bad.register()
 	h.submit(scriptJob(5, func(s *proto.JobSpec) { s.Retries = ptr(1); s.Resources.Cores = 0.5 }))
-	failed := bad.claimWith(proto.ClaimRequest{ClaimID: "c1", Free: proto.Resources{Cores: 8, MemMB: 4096}, Max: 5})
+	failed := bad.claimWith(proto.ClaimRequest{ClaimID: "c1", Free: proto.Resources{Cores: 8, MemMB: 4096, DiskMB: 10000}, Max: 5})
 	if len(failed) != 5 {
 		t.Fatalf("claimed %d tasks", len(failed))
 	}
@@ -368,5 +452,87 @@ func TestOutputsValidatedOnReport(t *testing.T) {
 			t.Fatalf("bad outputs: %+v", v)
 		}
 		tk = n.claim(1)[0]
+	}
+}
+
+// Node-reported usage is bounded: huge but finite cpu_seconds used to sum
+// to +Inf, which broke /api/v1/stats (JSON can't encode it).
+func TestReportUsageBounded(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	n := h.newNode(nil) // 4 inventory cores
+	n.register()
+	h.submit(scriptJob(3, func(s *proto.JobSpec) { s.TimeoutS = 100 }))
+	tasks := n.claim(3)
+	if len(tasks) != 3 {
+		t.Fatalf("claimed %d tasks", len(tasks))
+	}
+	n.report(tasks[0], proto.TaskReport{State: proto.TaskSucceeded, RunS: 1e308, CPUSeconds: 1.7e308})
+	n.report(tasks[1], proto.TaskReport{State: proto.TaskSucceeded, RunS: 10, CPUSeconds: 1.7e308})
+	n.report(tasks[2], proto.TaskReport{State: proto.TaskFailed, ErrorKind: proto.ErrExit, RunS: -5, CPUSeconds: -1})
+	maxRun := 100.0*10 + 3600 // 10x timeout_s plus an hour
+	want := [][2]float64{{maxRun, maxRun*4*1.1 + 1}, {10, 10*4*1.1 + 1}, {0, 0}}
+	for i, w := range want {
+		if v := h.task(tasks[i].ID); v.RunS != w[0] || v.CPUSeconds != w[1] {
+			t.Fatalf("task %d: run_s %g cpu_seconds %g, want %v", i, v.RunS, v.CPUSeconds, w)
+		}
+	}
+	var st proto.SwarmStats
+	code, raw := do(t, h.hc, "GET", h.url+"/api/v1/stats", testAdmin, nil, &st)
+	if code != http.StatusOK || math.IsInf(st.CPUSecondsTotal, 0) || st.CPUSecondsTotal != want[0][1]+want[1][1] {
+		t.Fatalf("stats: %d %s", code, raw)
+	}
+}
+
+// A task the hive requeued while its node still runs the old lease (a
+// hive deadline keeps the resources charged) isn't given back to that node
+// until the node lets go of it: held and listed tasks are keyed by task ID,
+// so the two leases would collapse and the new one be requeued as lost.
+func TestRequeuedTaskWaitsForOldLease(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, func(c *Config) { c.MissingAfter = 50 * time.Millisecond })
+	n := h.newNode(nil)
+	n.register()
+	h.submit(scriptJob(1, func(s *proto.JobSpec) { s.TimeoutS = 10 })) // retries 1
+	tk := n.claim(1)[0]
+	old := proto.RunningTask{ID: tk.ID, Lease: tk.Lease, Phase: proto.PhaseRunning, RunS: 71}
+	if hb := n.heartbeat(old); len(hb.Directives.CancelTasks) != 1 {
+		t.Fatalf("deadline not enforced: %v", hb.Directives.CancelTasks)
+	}
+	if v := h.task(tk.ID); v.State != proto.TaskPending || v.Failures != 1 {
+		t.Fatalf("after the hive deadline: %+v", v)
+	}
+	// The node is still killing the old lease: nothing for it yet.
+	for i := 0; i < 2; i++ {
+		if got := n.claim(1); len(got) != 0 {
+			t.Fatalf("redispatched to the node that still holds the old lease: %+v", got)
+		}
+		if v := h.nodeView(n.req.NodeID); v.Allocated.Cores != 1 {
+			t.Fatalf("old lease no longer charged: %+v", v.Allocated)
+		}
+		if hb := n.heartbeat(old); len(hb.Directives.CancelTasks) != 1 {
+			t.Fatalf("old lease not canceled: %v", hb.Directives.CancelTasks)
+		}
+	}
+	// Once the old copy is gone the task comes back with a new lease, which
+	// the next heartbeats keep.
+	n.heartbeat()
+	got := n.claim(1)
+	if len(got) != 1 || got[0].ID != tk.ID || got[0].Lease == tk.Lease || got[0].Attempt != 2 {
+		t.Fatalf("redispatch after release: %+v", got)
+	}
+	cur := proto.RunningTask{ID: tk.ID, Lease: got[0].Lease, Phase: proto.PhaseRunning, RunS: 1}
+	time.Sleep(60 * time.Millisecond) // past MissingAfter
+	for i := 0; i < 2; i++ {
+		if hb := n.heartbeat(cur); len(hb.Directives.CancelTasks) != 0 {
+			t.Fatalf("new lease canceled: %v", hb.Directives.CancelTasks)
+		}
+	}
+	n.succeed(got[0])
+	if v := h.task(tk.ID); v.State != proto.TaskSucceeded || v.Attempt != 2 {
+		t.Fatalf("final: %+v", v)
+	}
+	if v := h.nodeView(n.req.NodeID); v.Allocated.Cores != 0 {
+		t.Fatalf("still allocated: %+v", v.Allocated)
 	}
 }

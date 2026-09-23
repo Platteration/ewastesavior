@@ -41,6 +41,9 @@ func LinkHint(link proto.HiveLink, hiveAddr, hiveErr string) string {
 	case proto.LinkRateLimited:
 		return "The hive is refusing this node for a minute after failed attempts. It will retry automatically."
 	case proto.LinkRejected:
+		if strings.Contains(hiveErr, "node_id") {
+			return "The hive" + at + " refused this node's ID. Fix node_id in savior.conf (lowercase letters, digits and dashes), or remove it."
+		}
 		return "The hive rejected this node. Check swarm_key in savior.conf, or approve the node on the hive."
 	case proto.LinkPending:
 		return "Waiting for approval. Approve this node in the hive dashboard."

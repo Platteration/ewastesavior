@@ -198,6 +198,7 @@ func TestLinkHint(t *testing.T) {
 		{proto.LinkVersionMismatch, "", "", "version"},
 		{proto.LinkRateLimited, "", "", "retry"},
 		{proto.LinkRejected, "", "", "swarm_key"},
+		{proto.LinkRejected, "10.0.0.3:7700", "the hive refused this node's registration: invalid node_id", "Fix node_id in savior.conf"},
 		{proto.LinkPending, "", "", "Approve"},
 		{proto.LinkDuplicate, "", "", "node_id"},
 		{"weird_state", "", "boom\x07", "boom"},

@@ -68,12 +68,19 @@ func (r *Runner) run(ctx context.Context, t proto.Task, logs io.Writer, progress
 	defer r.unregister(ts)
 	ts.report()
 
-	slot, err := r.slots.acquire(ctx)
+	// Waiting for a slot and fetching inputs also end on a preempt.
+	pctx, pcancel := ts.preemptible(ctx)
+	defer pcancel()
+
+	slot, err := r.slots.acquire(pctx)
 	if err != nil {
-		return ctxFail(t, ctx, err)
+		return abortReport(t, ctx, ts, err)
 	}
 	retire := false
 	defer func() { r.slots.release(slot, retire) }()
+	if ts.isPreempted() {
+		return abortReport(t, ctx, ts, nil)
+	}
 
 	uid, gid := os.Geteuid(), os.Getegid()
 	if plan.dropPriv {
@@ -115,9 +122,9 @@ func (r *Runner) run(ctx context.Context, t proto.Task, logs io.Writer, progress
 	env := buildEnv(t, home, tmp)
 
 	ts.setPhase(proto.PhaseFetching)
-	if err := r.writeInputs(ctx, tk.wd, t, own, ts); err != nil {
-		if ctx.Err() != nil {
-			return ctxFail(t, ctx, ctx.Err())
+	if err := r.writeInputs(pctx, tk.wd, t, own, ts); err != nil {
+		if pctx.Err() != nil {
+			return abortReport(t, ctx, ts, pctx.Err())
 		}
 		var ie inputError
 		if errors.As(err, &ie) {
@@ -141,8 +148,16 @@ func (r *Runner) run(ctx context.Context, t proto.Task, logs io.Writer, progress
 
 	argv := taskArgv(t, scriptPath)
 
+	// A preempt or cancel during the setup: never start the process.
+	if ts.isPreempted() || ctx.Err() != nil {
+		return abortReport(t, ctx, ts, ctx.Err())
+	}
+
 	rep := r.execute(ctx, tk, ts, env, argv, logs)
 	rep.Lease = t.Lease
+	if tk.leaked {
+		retire = true
+	}
 	if rep.State == proto.TaskFailed && (rep.ErrorKind == proto.ErrSandbox || rep.ErrorKind == proto.ErrInternal) {
 		// The uid may still own live processes we could not account for.
 		if tk.cg == nil && plan.dropPriv {
@@ -174,7 +189,12 @@ func (r *Runner) execute(ctx context.Context, tk *taskDir, ts *taskState, env, a
 	var werr error
 loop:
 	for {
-		if killReason != "" || ts.isPreempted() {
+		// A preempt that came before ts.started had no process to kill.
+		if killReason == "" && ts.isPreempted() {
+			killReason = "preempted"
+			proc.kill()
+		}
+		if killReason != "" {
 			werr = <-lc.waitCh
 			break
 		}
@@ -222,7 +242,21 @@ loop:
 		unix.Kill(-proc.pgid, unix.SIGKILL)
 		reapGroup(proc.pgid, killWait)
 	}
-	lc.finish()
+	// Without a cgroup or pid namespace, a process that left the process
+	// group (setsid) survives the kill and can hold the output pipe open.
+	// Don't wait for it forever: close the pipes, then kill it by the slot
+	// uid (the task's alone); if that fails the slot is retired.
+	if !lc.drain(ctx, drainGrace) {
+		r.log.Warn("task output pipes still open after the kill; closed them", "task", t.ID)
+		if tk.cg == nil && tk.plan.dropPriv {
+			if n, ok := killUIDProcs(tk.uid, tk.uid, killWait); !ok {
+				r.log.Warn("task processes survived SIGKILL; retiring the slot", "task", t.ID, "uid", tk.uid)
+				tk.leaked = true
+			} else {
+				r.log.Info("killed task processes outside the process group", "task", t.ID, "count", n)
+			}
+		}
+	}
 
 	shimReason := lc.statusReason()
 	rep := r.classify(t, ts, werr, killReason, shimReason)
@@ -233,28 +267,41 @@ loop:
 		rep.CPUSeconds, rep.MaxMemMB = tk.cg.stats()
 	}
 
-	// Collect outputs unless the task never really ran.
-	if rep.ErrorKind != proto.ErrSandbox && rep.ErrorKind != proto.ErrInternal && rep.ErrorKind != proto.ErrInput {
+	// Collect outputs only from a task that ran to its end: not after a
+	// setup failure, a cancel or a preempt.
+	switch {
+	case rep.State == proto.TaskCanceled || rep.State == proto.TaskPreempted:
+	case rep.ErrorKind == proto.ErrSandbox || rep.ErrorKind == proto.ErrInternal || rep.ErrorKind == proto.ErrInput:
+	default:
 		outs, oerr := r.collectOutputs(ctx, tk, ts, logs)
-		if oerr != nil {
-			if rep.State != proto.TaskFailed {
-				rep.State = proto.TaskFailed
-				rep.ErrorKind = proto.ErrOutput
-				rep.Error = oerr.Error()
-			} else {
-				fmt.Fprintf(logs, "savior: collecting outputs: %v\n", oerr)
-			}
-		} else {
+		switch {
+		case oerr == nil:
 			rep.Outputs = outs
+		case ctx.Err() != nil:
+			// Canceled while uploading: that is the outcome, not a node
+			// error. The run statistics stay.
+			c := ctxFail(t, ctx, ctx.Err())
+			rep.State, rep.ErrorKind, rep.Error, rep.ExitCode = c.State, c.ErrorKind, c.Error, 0
+		case rep.State != proto.TaskFailed:
+			rep.State = proto.TaskFailed
+			rep.ErrorKind = proto.ErrOutput
+			rep.Error = oerr.Error()
+		default:
+			fmt.Fprintf(logs, "savior: collecting outputs: %v\n", oerr)
 		}
 	}
 	return rep
 }
 
 // classify turns the wait result and kill reason into a TaskReport state.
+// A status reason counts only together with the shim's own exit code.
 func (r *Runner) classify(t proto.Task, ts *taskState, werr error, killReason, shimReason string) proto.TaskReport {
+	code, signal, ok := exitInfo(werr)
 	if shimReason != "" {
-		return failReport(t, proto.ErrSandbox, "sandbox: "+shimReason)
+		if ok && signal == 0 && code == shimFailCode {
+			return failReport(t, proto.ErrSandbox, "sandbox: "+shimReason)
+		}
+		r.log.Warn("ignoring a sandbox status without the shim's exit code", "task", t.ID)
 	}
 	if ts.isPreempted() {
 		return proto.TaskReport{State: proto.TaskPreempted, Error: "preempted"}
@@ -265,9 +312,8 @@ func (r *Runner) classify(t proto.Task, ts *taskState, werr error, killReason, s
 	case proto.ErrTimeout:
 		return failReport(t, proto.ErrTimeout, fmt.Sprintf("killed after the %ds timeout", t.TimeoutS))
 	}
-	code, signal, ok := exitInfo(werr)
 	switch {
-	case ok && code == 0:
+	case ok && code == 0 && signal == 0: // exitInfo reports code 0 for a signal
 		return proto.TaskReport{State: proto.TaskSucceeded, ExitCode: 0}
 	case signal != 0:
 		return withCode(failReport(t, proto.ErrExit, "killed by signal "+signalName(signal)), 128+int(signal))
@@ -280,6 +326,21 @@ func (r *Runner) classify(t proto.Task, ts *taskState, werr error, killReason, s
 func withCode(rep proto.TaskReport, code int) proto.TaskReport {
 	rep.ExitCode = code
 	return rep
+}
+
+// abortReport is the report of a task stopped before its process ran:
+// preempted, else what ctxFail makes of the context error.
+func abortReport(t proto.Task, ctx context.Context, ts *taskState, err error) proto.TaskReport {
+	if ts.isPreempted() {
+		return proto.TaskReport{Lease: t.Lease, State: proto.TaskPreempted, Error: "preempted"}
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil {
+		err = errors.New("task aborted")
+	}
+	return ctxFail(t, ctx, err)
 }
 
 // ctxFail maps a context error to canceled, else internal.

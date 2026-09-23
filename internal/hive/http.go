@@ -120,10 +120,17 @@ func blobDeadline(size int64) time.Duration {
 	return time.Minute + time.Duration(size/blobRateFloor)*time.Second
 }
 
+// writeJSON encodes v before sending the status, so a value JSON can't
+// encode (NaN, ±Inf) becomes a 500 instead of an empty 200.
 func writeJSON(w http.ResponseWriter, status int, v any) {
+	b, err := json.Marshal(v)
+	if err != nil {
+		status = http.StatusInternalServerError
+		b, _ = json.Marshal(proto.ErrorResponse{Error: "could not encode the response: " + err.Error()})
+	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(append(b, '\n'))
 }
 
 func writeErr(w http.ResponseWriter, status int, format string, args ...any) {

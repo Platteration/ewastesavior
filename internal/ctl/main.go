@@ -129,7 +129,7 @@ func init() {
 		{name: "time", help: "compare this computer's clock with the hive's", run: cmdTime, group: "session"},
 		{name: "find", args: "[--seconds N]", help: "list hives announcing themselves on the LAN (no key needed)", run: cmdFind, group: "setup"},
 		{name: "genkey", help: "print a new random swarm key", run: cmdGenkey, group: "setup"},
-		{name: "node-config", args: "[--hive-addr ADDR] [-o savior.conf] [--force]", help: "write a savior.conf for nodes (swarm key + fingerprint pin)", run: cmdNodeConfig, group: "setup"},
+		{name: "node-config", args: "[--hive-addr ADDR|auto] [-o savior.conf] [--force]", help: "write a savior.conf for nodes (swarm key + fingerprint pin)", run: cmdNodeConfig, group: "setup"},
 		{name: "nodes", args: "[--all]", help: "list nodes", run: cmdNodes, group: "nodes"},
 		{name: "node", args: "<ref>", help: "show one node (ref = ID or name)", run: cmdNode, group: "nodes"},
 		{name: "rename", args: "<ref> <name>", help: "rename a node", run: cmdRename, group: "nodes"},

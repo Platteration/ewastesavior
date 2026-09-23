@@ -2,12 +2,16 @@ package ctl
 
 import (
 	"context"
+	"errors"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/platteration/ewastesavior/internal/proto"
 )
@@ -241,5 +245,67 @@ func TestPutBlobSkipsBodyWhenHiveHasIt(t *testing.T) {
 	wrong := strings.Repeat("0", 64)
 	if _, err := c.PutBlob(context.Background(), wrong, 3, strings.NewReader("abc")); err == nil || !strings.Contains(err.Error(), "hash mismatch") {
 		t.Fatalf("mismatched hash: %v", err)
+	}
+}
+
+// zeroBody is a response body of n bytes that costs nothing to produce.
+type zeroBody struct{ left int64 }
+
+func (z *zeroBody) Read(p []byte) (int, error) {
+	if z.left <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > z.left {
+		p = p[:z.left]
+	}
+	z.left -= int64(len(p))
+	return len(p), nil
+}
+
+func (z *zeroBody) Close() error { return nil }
+
+// bigSink counts what it receives, reading with a large buffer so that
+// gigabytes pass through in a few thousand reads.
+type bigSink struct{ n int64 }
+
+func (s *bigSink) Write(p []byte) (int, error) { s.n += int64(len(p)); return len(p), nil }
+
+func (s *bigSink) ReadFrom(r io.Reader) (int64, error) {
+	buf := make([]byte, 16<<20)
+	var total int64
+	for {
+		n, err := r.Read(buf)
+		total += int64(n)
+		s.n += int64(n)
+		if err == io.EOF {
+			return total, nil
+		}
+		if err != nil {
+			return total, err
+		}
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestOutputsZipHasNoSizeCap(t *testing.T) {
+	// The zip of all a job's outputs can be larger than the biggest single
+	// blob; only single files keep the blob cap.
+	c, err := NewClient("127.0.0.1", "sha256:"+strings.Repeat("ab", 32), WithSession(strings.Repeat("s", 32), time.Now().Add(time.Hour)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const size = proto.MaxBlobBytes + 1
+	c.hc = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: &zeroBody{left: size}, ContentLength: -1, Request: r}, nil
+	})}
+	var zip bigSink
+	if n, err := c.OutputsZip(context.Background(), "j1", &zip); err != nil || n != size || zip.n != size {
+		t.Fatalf("OutputsZip = %d (sink %d), %v; want %d bytes", n, zip.n, err, int64(size))
+	}
+	if _, err := c.TaskOutput(context.Background(), "t1", "a.txt", &bigSink{}); !errors.Is(err, errTooLarge) {
+		t.Fatalf("TaskOutput of %d bytes: %v, want %v", int64(size), err, errTooLarge)
 	}
 }

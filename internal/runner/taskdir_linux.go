@@ -26,6 +26,7 @@ type taskDir struct {
 	wd      *os.Root
 	mounted bool
 	cg      *cgroup
+	leaked  bool // task processes may outlive the task: retire the slot
 }
 
 // create makes the working directory, applies ownership and, when

@@ -1,11 +1,13 @@
 package runner
 
 import (
+	"context"
 	"io"
 	"os"
 	"os/exec"
 	"strconv"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -41,14 +43,59 @@ func (p *runProc) kill() {
 
 // launched is a started sandbox.
 type launched struct {
-	cmd      *exec.Cmd
-	waitCh   chan error
-	logDone  chan struct{}
-	statusCh chan string
+	cmd        *exec.Cmd
+	waitCh     chan error
+	logR       *os.File
+	statusR    *os.File
+	logDone    chan struct{} // the log copier returned
+	statusDone chan struct{} // the status reader returned; reason is set
+	reason     string
 }
 
-func (l *launched) finish()              { <-l.logDone }
-func (l *launched) statusReason() string { return <-l.statusCh }
+// Bounds for drain: how long the pipes may stay open after the task's
+// processes were killed, and after the caller's context ended.
+var (
+	drainGrace    = 2 * time.Second
+	drainCtxGrace = 100 * time.Millisecond
+)
+
+// drain waits for the log copier and the status reader to reach EOF, that
+// is for every holder of the pipes' write ends to be gone. A process that
+// escaped the kill (no cgroup and no pid namespace) can hold them open
+// forever: after grace (or shortly after ctx ends) the read ends are closed
+// so both readers return. drain reports whether the pipes reached EOF.
+func (l *launched) drain(ctx context.Context, grace time.Duration) bool {
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+	ctxDone := ctx.Done()
+	drained := true
+	for _, done := range []chan struct{}{l.logDone, l.statusDone} {
+	wait:
+		for drained {
+			select {
+			case <-done:
+				break wait
+			case <-timer.C:
+				drained = false
+			case <-ctxDone:
+				// Still let the readers flush what the task wrote.
+				ctxDone = nil
+				timer.Reset(min(grace, drainCtxGrace))
+			}
+		}
+	}
+	if !drained {
+		// Closing a pollable pipe wakes a blocked Read.
+		l.logR.Close()
+		l.statusR.Close()
+		<-l.logDone
+		<-l.statusDone
+	}
+	return drained
+}
+
+// statusReason is the failure reason the shim wrote; only valid after drain.
+func (l *launched) statusReason() string { return l.reason }
 
 // startSandbox starts `savior sandbox-exec` for the task and wires up the
 // combined-output pipe and the status pipe.
@@ -108,24 +155,28 @@ func (r *Runner) startSandbox(tk *taskDir, env, argv []string, logs io.Writer) (
 		return nil, startErr
 	}
 
-	lc := &launched{
-		cmd:      cmd,
-		waitCh:   make(chan error, 1),
-		logDone:  make(chan struct{}),
-		statusCh: make(chan string, 1),
-	}
+	lc := &launched{cmd: cmd, waitCh: make(chan error, 1)}
+	lc.readPipes(logR, statusR, logs)
+	go func() { lc.waitCh <- cmd.Wait() }()
+	return lc, nil
+}
+
+// readPipes starts the goroutines that copy the task output to logs and
+// read the shim's status reason.
+func (l *launched) readPipes(logR, statusR *os.File, logs io.Writer) {
+	l.logR, l.statusR = logR, statusR
+	l.logDone, l.statusDone = make(chan struct{}), make(chan struct{})
 	go func() {
 		io.Copy(logs, logR)
 		logR.Close()
-		close(lc.logDone)
+		close(l.logDone)
 	}()
 	go func() {
-		b, _ := io.ReadAll(statusR)
+		b, _ := io.ReadAll(io.LimitReader(statusR, 4096))
 		statusR.Close()
-		lc.statusCh <- trimReason(string(b))
+		l.reason = trimReason(string(b))
+		close(l.statusDone)
 	}()
-	go func() { lc.waitCh <- cmd.Wait() }()
-	return lc, nil
 }
 
 // buildCmd assembles the shim command with its SysProcAttr.
@@ -145,9 +196,12 @@ func (r *Runner) buildCmd(tk *taskDir, flags []string, selfJoin bool) *exec.Cmd 
 			cf |= unix.CLONE_NEWNET
 		}
 	}
+	// Setsid: the task gets its own session (no controlling terminal, no
+	// access to the agent's) and process group (pgid == pid, which kill
+	// and SIGSTOP freezing rely on).
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Cloneflags: cf,
-		Setpgid:    true,
+		Setsid:     true,
 		Pdeathsig:  syscall.SIGKILL,
 	}
 	return cmd
@@ -165,9 +219,13 @@ func (r *Runner) shimFlags(tk *taskDir, env, argv []string) []string {
 		"--gid", strconv.Itoa(tk.gid),
 		"--fsize-mb", strconv.Itoa(effectiveDiskMB(tk.task)),
 		"--sandbox", mode,
+		"--strict=" + strconv.FormatBool(r.mode == ModeStrict),
 		"--seccomp=" + strconv.FormatBool(tk.plan.useSeccomp),
 		"--netns=" + strconv.FormatBool(tk.plan.useNetNS),
 		"--network=" + strconv.FormatBool(tk.task.Network),
+	}
+	if tk.plan.useNS {
+		f = append(f, "--root-mnt", r.sys.sandboxRoot)
 	}
 	for _, e := range env {
 		f = append(f, "--env", e)

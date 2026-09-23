@@ -206,3 +206,64 @@ func TestCLI(t *testing.T) {
 		t.Fatalf("sample: %d %q", rc, out.String())
 	}
 }
+
+func TestNodeIDMatchesHive(t *testing.T) {
+	// The hive only accepts proto.ValidNodeID: uppercase is folded, anything
+	// else it would refuse is rejected here (with a warning at load time).
+	for in, want := range map[string]string{"Lab-PC-01": "lab-pc-01", " n0123456789ab ": "n0123456789ab", "": ""} {
+		c := Default()
+		if err := c.Set("node_id", in); err != nil || c.NodeID != want {
+			t.Errorf("node_id %q = %q, %v; want %q", in, c.NodeID, err, want)
+		}
+		if want != "" && !proto.ValidNodeID(c.NodeID) {
+			t.Errorf("node_id %q accepted as %q, which the hive rejects", in, c.NodeID)
+		}
+	}
+	for _, bad := range []string{"-lab", "lab_1", "lab 1", "lab/1", strings.Repeat("a", 64)} {
+		c := Default()
+		if err := c.Set("node_id", bad); err == nil {
+			t.Errorf("node_id %q accepted as %q", bad, c.NodeID)
+		}
+	}
+}
+
+func TestHiveListen(t *testing.T) {
+	for _, good := range []string{":7700", "0.0.0.0:8443", "[::]:7700", "hive.lan:1", ":65535"} {
+		c := Default()
+		if err := c.Set("hive_listen", good); err != nil || c.HiveListen != good {
+			t.Errorf("hive_listen %q: %q, %v", good, c.HiveListen, err)
+		}
+	}
+	for _, bad := range []string{"7700", ":https", ":0", ":65536", ":-1", "host:", "::7700"} {
+		c := Default()
+		if err := c.Set("hive_listen", bad); err == nil {
+			t.Errorf("hive_listen %q accepted", bad)
+		}
+	}
+}
+
+func TestUnreadableFileIsWarning(t *testing.T) {
+	// A directory can't be read as a file, even by root.
+	dir := t.TempDir()
+	broken := filepath.Join(dir, "broken.conf")
+	if err := os.Mkdir(broken, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	good := filepath.Join(dir, "good.conf")
+	os.WriteFile(good, []byte("name = shelf-4\n"), 0o644)
+	c, warnings, err := Load([]string{broken, good}, "savior.log_level=debug")
+	if err != nil {
+		t.Fatalf("one unreadable source stopped the load: %v", err)
+	}
+	if c.Name != "shelf-4" || c.LogLevel != "debug" {
+		t.Errorf("later sources not applied: name=%q log_level=%q", c.Name, c.LogLevel)
+	}
+	if len(warnings) != 1 || !strings.Contains(warnings[0], broken) {
+		t.Errorf("warnings = %q, want one naming %s", warnings, broken)
+	}
+	var out, errb bytes.Buffer
+	if rc := run([]string{"get", "--file", broken, "--file", good, "--cmdline-file", "", "name"}, &out, &errb); rc != 0 ||
+		out.String() != "shelf-4\n" || !strings.Contains(errb.String(), "warning") {
+		t.Errorf("config get: rc=%d out=%q err=%q", rc, out.String(), errb.String())
+	}
+}

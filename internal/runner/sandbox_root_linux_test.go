@@ -3,11 +3,20 @@
 package runner
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"fmt"
+	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/platteration/ewastesavior/internal/proto"
 )
@@ -41,6 +50,9 @@ func TestRealSandboxIsolation(t *testing.T) {
 		"mkdir -p /work/m",
 		"unshare -Un true 2>/dev/null && echo unshare=ok || echo unshare=fail",
 		"mount -t tmpfs none /work/m 2>/dev/null && echo mount=ok || echo mount=fail",
+		"[ -e /dev/tty ] && echo tty=present || echo tty=absent",
+		// Field 5 of mountinfo is the mountpoint, field 6 its options.
+		`for d in sys irq bus; do [ -e /proc/$d ] || { echo proc$d=ro; continue; }; grep -qE "^([^ ]+ ){4}/proc/$d ro," /proc/self/mountinfo && echo proc$d=ro || echo proc$d=rw; done`,
 	}, "\n")
 	task := scriptTask("tiso", script)
 	task.Outputs = []string{"w.txt"}
@@ -54,7 +66,7 @@ func TestRealSandboxIsolation(t *testing.T) {
 	}
 
 	want := map[string]string{
-		"uid":       "10000",
+		"uid":       strconv.Itoa(testUIDBase),
 		"cmdline":   "[]",
 		"media":     "absent",
 		"run":       "absent",
@@ -69,6 +81,10 @@ func TestRealSandboxIsolation(t *testing.T) {
 		"unshare":   "fail",
 		"mount":     "fail",
 		"seccomp":   "2", // SECCOMP_MODE_FILTER: the filter is installed
+		"tty":       "absent",
+		"procsys":   "ro",
+		"procirq":   "ro",
+		"procbus":   "ro",
 	}
 	got := parseKV(out)
 	for k, v := range want {
@@ -121,7 +137,7 @@ func TestRealScratchInRAM(t *testing.T) {
 	self, _ := os.Executable()
 	r, err := New(Config{
 		WorkRoot: base + "/work", CacheDir: base + "/cache", CgroupRoot: base + "/cg",
-		SelfExe: self, Sandbox: ModeNone, ScratchInRAM: true, UIDBase: 10000, Slots: 2,
+		SelfExe: self, Sandbox: ModeNone, ScratchInRAM: true, UIDBase: testUIDBase, Slots: 2,
 	}, newFakeTransfer())
 	if err != nil {
 		t.Fatal(err)
@@ -163,4 +179,208 @@ func parseKV(s string) map[string]string {
 		}
 	}
 	return m
+}
+
+// TestRealSandboxPerThreadStateStress runs many sandboxed tasks
+// concurrently and checks that every one of them starts with an empty
+// capability bounding set, the seccomp filter and no_new_privs. These are
+// per-thread properties: the shim must set them on the thread that execs.
+func TestRealSandboxPerThreadStateStress(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to create namespaces and drop privileges")
+	}
+	r := newTestRunner(t, ModeAuto, nil)
+	if !r.caps[CapMountNS] || !r.caps[CapPidNS] || !r.caps[CapSeccomp] {
+		t.Skip("namespaces or seccomp unavailable")
+	}
+	const n = 100
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	type result struct {
+		rep  proto.TaskReport
+		logs string
+	}
+	results := make(chan result, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			task := scriptTask(fmt.Sprintf("tstress%d", i), "grep -E '^(CapBnd|Seccomp|NoNewPrivs):' /proc/self/status | tr -d '\\t ' | tr : =")
+			var logs bytes.Buffer
+			rep := r.Run(ctx, task, &logs, nil)
+			results <- result{rep, logs.String()}
+		}(i)
+	}
+	wg.Wait()
+	close(results)
+	bad := 0
+	for res := range results {
+		kv := parseKV(res.logs)
+		if res.rep.State != proto.TaskSucceeded || kv["CapBnd"] != "0000000000000000" || kv["Seccomp"] != "2" || kv["NoNewPrivs"] != "1" {
+			bad++
+			if bad <= 5 {
+				t.Errorf("state %s kind %s err %q status %v", res.rep.State, res.rep.ErrorKind, res.rep.Error, kv)
+			}
+		}
+	}
+	if bad > 0 {
+		t.Errorf("%d of %d tasks started without the full per-thread lockdown", bad, n)
+	}
+	if got := r.FreeSlots(); got != r.cfg.Slots {
+		t.Errorf("%d of %d slots free after the run (slots retired?)", got, r.cfg.Slots)
+	}
+}
+
+// TestRealSandboxRootMountpoint checks that the shims build their roots on
+// the runner's fixed mountpoint, inside their own mount namespaces: no
+// directory is left in /tmp per task, and nothing shows on the host.
+func TestRealSandboxRootMountpoint(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to create namespaces")
+	}
+	r := newTestRunner(t, ModeAuto, nil)
+	if !r.caps[CapMountNS] || !r.caps[CapPidNS] {
+		t.Skip("namespaces unavailable")
+	}
+	// The shim runs with an empty environment, so its TMPDIR is /tmp.
+	leftovers := func() map[string]bool {
+		m := map[string]bool{}
+		names, _ := filepath.Glob("/tmp/savior-root-*")
+		for _, n := range names {
+			m[n] = true
+		}
+		return m
+	}
+	before := leftovers()
+	for i := 0; i < 3; i++ {
+		rep, logs := runTask(t, r, scriptTask(fmt.Sprintf("troot%d", i), "echo hi > /work/x"))
+		if rep.State != proto.TaskSucceeded {
+			t.Fatalf("state %s kind %s err %q logs %s", rep.State, rep.ErrorKind, rep.Error, logs)
+		}
+	}
+	for n := range leftovers() {
+		if !before[n] {
+			t.Errorf("task left %s behind on the host", n)
+		}
+	}
+
+	mnt := filepath.Join(r.sys.workPath, sandboxRootName)
+	if r.sys.sandboxRoot != mnt {
+		t.Fatalf("sandbox root %q, want %q", r.sys.sandboxRoot, mnt)
+	}
+	fi, err := os.Lstat(mnt)
+	if err != nil || !fi.IsDir() {
+		t.Fatalf("mountpoint: %v %v", fi, err)
+	}
+	if st := fi.Sys().(*syscall.Stat_t); fi.Mode().Perm() != 0o700 || st.Uid != 0 || st.Gid != 0 {
+		t.Errorf("mountpoint mode %v owner %d:%d, want 0700 root:root", fi.Mode().Perm(), st.Uid, st.Gid)
+	}
+	if ents, _ := os.ReadDir(mnt); len(ents) != 0 {
+		t.Errorf("mountpoint not empty on the host: %v", ents)
+	}
+	if data, _ := os.ReadFile("/proc/self/mountinfo"); strings.Contains(string(data), mnt) {
+		t.Errorf("%s is mounted on the host", mnt)
+	}
+}
+
+// TestRealTaskDiesWithAgent kills an agent that runs a dropped-privilege
+// task and checks that the task dies too: the uid change clears the
+// parent-death signal, so the shim must arm it again.
+func TestRealTaskDiesWithAgent(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to drop privileges")
+	}
+	base, err := os.MkdirTemp("", "savior-agent-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Chmod(base, 0o711)
+	t.Cleanup(func() { os.RemoveAll(base) })
+	self, _ := os.Executable()
+	agent := exec.Command(self, "runner-test-agent", base, "echo pid=$$; exec sleep 300")
+	out, err := agent.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	agent.Stderr = os.Stderr
+	if err := agent.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { agent.Process.Kill(); agent.Wait() })
+
+	pidCh := make(chan int, 1)
+	go func() {
+		sc := bufio.NewScanner(out)
+		for sc.Scan() {
+			if v, ok := strings.CutPrefix(sc.Text(), "pid="); ok {
+				n, _ := strconv.Atoi(v)
+				pidCh <- n
+				break
+			}
+		}
+		io.Copy(io.Discard, out)
+	}()
+	var pid int
+	select {
+	case pid = <-pidCh:
+	case <-time.After(20 * time.Second):
+		t.Fatal("the task never started")
+	}
+	if pid <= 1 {
+		t.Fatalf("bad task pid %d", pid)
+	}
+	t.Cleanup(func() { syscall.Kill(pid, syscall.SIGKILL) })
+
+	agent.Process.Signal(syscall.SIGKILL)
+	agent.Wait()
+	if !waitGone(pid, 5*time.Second) {
+		t.Fatalf("task process %d outlived its agent", pid)
+	}
+}
+
+// TestRealNewKillsLeftoverTaskProcs checks that New kills processes a
+// previous agent's tasks left behind under the slot uids.
+func TestRealNewKillsLeftoverTaskProcs(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to run processes as the task uids")
+	}
+	start := func(uid int) *exec.Cmd {
+		cmd := exec.Command("sleep", "300")
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Credential: &syscall.Credential{Uid: uint32(uid), Gid: uint32(uid), NoSetGroups: true},
+			Setsid:     true, // like a task that left its process group
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { cmd.Process.Kill(); cmd.Wait() })
+		return cmd
+	}
+	leftover := start(testUIDBase + 1)
+	outsider := start(testUIDBase + 4) // not a slot uid of a 4-slot runner
+
+	newTestRunner(t, ModeNone, nil)
+
+	if !waitGone(leftover.Process.Pid, 5*time.Second) {
+		t.Error("New did not kill a leftover process of a slot uid")
+	}
+	if waitGone(outsider.Process.Pid, 100*time.Millisecond) {
+		t.Error("New killed a process of a uid outside the slot range")
+	}
+}
+
+// waitGone waits until pid has exited (it may linger as a zombie).
+func waitGone(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		st, ok := readProcStatus(pid)
+		if !ok || st.state == 'Z' || st.state == 'X' {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }

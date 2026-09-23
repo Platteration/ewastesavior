@@ -202,6 +202,18 @@ func (a *Agent) handshake(ctx context.Context, base string) (*hiveClient, error)
 	if err != nil {
 		hc.close()
 		switch statusOf(err) {
+		case 400:
+			// The hive refuses the registration itself (e.g. a node_id it
+			// can't accept): the hive is reachable, and retrying won't help
+			// until savior.conf changes. display.LinkHint turns the detail
+			// into a fix.
+			msg := "the hive refused this node's registration"
+			var he *HTTPError
+			if errors.As(err, &he) && he.Msg != "" {
+				msg += ": " + he.Msg
+			}
+			a.setLink(proto.LinkRejected, addr, msg)
+			a.ban(base)
 		case 403:
 			a.setLink(proto.LinkRejected, addr, "the hive rejected our swarm key")
 			a.ban(base)

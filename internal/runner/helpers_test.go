@@ -219,8 +219,14 @@ func TestSlotPool(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("waiter not woken")
 	}
+	if p.usable() != 2 {
+		t.Errorf("usable = %d before any retire", p.usable())
+	}
 	// A retired slot is never handed out again.
 	p.release(b, true)
+	if p.usable() != 1 {
+		t.Errorf("usable = %d after a retire, want 1", p.usable())
+	}
 	cctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
 	defer cancel()
 	if _, err := p.acquire(cctx); !errors.Is(err, context.DeadlineExceeded) {

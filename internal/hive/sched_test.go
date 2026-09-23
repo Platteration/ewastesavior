@@ -1,6 +1,7 @@
 package hive
 
 import (
+	"fmt"
 	"net/http"
 	"sync"
 	"testing"
@@ -57,7 +58,7 @@ func TestClaimFitAndClamps(t *testing.T) {
 	}
 	// Memory is a hard limit as well.
 	h.submit(scriptJob(1, func(s *proto.JobSpec) { s.Resources.MemMB = 5000; s.Priority = 10 }))
-	if got := big.claimWith(proto.ClaimRequest{ClaimID: "m", Free: proto.Resources{Cores: 8, MemMB: 4096}, Max: 1}); len(got) == 1 && got[0].Resources.MemMB == 5000 {
+	if got := big.claimWith(proto.ClaimRequest{ClaimID: "m", Free: proto.Resources{Cores: 8, MemMB: 4096, DiskMB: 1000}, Max: 1}); len(got) == 1 && got[0].Resources.MemMB == 5000 {
 		t.Fatal("task exceeding memory dispatched")
 	}
 }
@@ -481,6 +482,7 @@ func TestRetention(t *testing.T) {
 		j := &job{jobRecord: jobRecord{ID: "j" + itoa(s.nextSeq), Seq: s.nextSeq, Spec: proto.JobSpec{Count: 1}}}
 		s.nextSeq++
 		j.FinishedAt = timePtr(time.Now())
+		s.markDoneLocked(j)
 		j.counts.Succeeded = 1
 		for i := 0; i < tasks; i++ {
 			tk := &task{taskRecord: taskRecord{ID: j.ID + "-t" + itoa(uint64(i)), State: proto.TaskSucceeded}, job: j}
@@ -495,17 +497,132 @@ func TestRetention(t *testing.T) {
 	for i := 0; i < maxFinishedJobs+4; i++ {
 		addFinished(1)
 	}
-	s.enforceRetentionLocked()
+	s.enforceRetentionLocked(nil)
 	if len(s.jobs) != maxFinishedJobs || s.jobs[first.ID] != nil || s.taskRecords != maxFinishedJobs {
 		t.Fatalf("finished-job cap: %d jobs, %d records", len(s.jobs), s.taskRecords)
 	}
 	// The task-record cap removes the oldest finished jobs too.
 	big := addFinished(maxTaskRecords)
-	s.enforceRetentionLocked()
+	s.enforceRetentionLocked(nil)
 	if s.taskRecords > maxTaskRecords || s.jobs[big.ID] == nil {
 		t.Fatalf("record cap: %d records, newest kept %v", s.taskRecords, s.jobs[big.ID] != nil)
 	}
 	if len(s.jobs) != 1 {
 		t.Fatalf("expected only the newest big job to remain, have %d", len(s.jobs))
+	}
+	// The job that has just finished is never deleted by its own retention
+	// pass, even when it alone is over the record cap.
+	s.deleteJobLocked(big)
+	earlier := addFinished(1)
+	huge := addFinished(maxTaskRecords + 1)
+	s.enforceRetentionLocked(huge)
+	if s.jobs[huge.ID] == nil || s.jobs[earlier.ID] != nil {
+		t.Fatalf("just-finished job deleted: huge kept %v, earlier kept %v", s.jobs[huge.ID] != nil, s.jobs[earlier.ID] != nil)
+	}
+}
+
+// A job submitted before 501 short ones that finishes after them keeps its
+// results: retention deletes the jobs that finished first, not the oldest
+// submitted, and never the job that has just finished.
+func TestRetentionKeepsLongRunningJob(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	n := h.newNode(nil)
+	n.register()
+	long := h.submit(scriptJob(1, nil))
+	lt := n.claim(1)
+	if len(lt) != 1 {
+		t.Fatal("no task for the long job")
+	}
+	s := h.s
+	var short []*job
+	// Run the short jobs through the scheduler without HTTP (and without a
+	// synchronous save per submit).
+	err := func() error {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		nd := s.nodes[n.req.NodeID]
+		for i := 0; i < maxFinishedJobs+1; i++ {
+			j := &job{jobRecord: jobRecord{ID: fmt.Sprintf("jshort%04d", i), Seq: s.nextSeq, Spec: scriptJob(1, nil), CreatedAt: time.Now()}}
+			proto.ApplyJobDefaults(&j.Spec)
+			s.nextSeq++
+			j.counts.Pending = 1
+			s.jobs[j.ID] = j
+			s.queue = append(s.queue, j)
+			short = append(short, j)
+			got := s.dispatchLocked(nd, n.req.Total, 1, time.Now())
+			if len(got) != 1 || got[0].JobID != j.ID {
+				return fmt.Errorf("short job %d: dispatched %+v", i, got)
+			}
+			if code, msg := s.applyReportLocked(nd, got[0].ID, proto.TaskReport{Lease: got[0].Lease, State: proto.TaskSucceeded}, time.Now()); code != http.StatusOK {
+				return fmt.Errorf("short job %d: report %d %s", i, code, msg)
+			}
+		}
+		if len(s.jobs) != maxFinishedJobs+1 || s.jobs[short[0].ID] != nil || s.jobs[long.ID] == nil {
+			return fmt.Errorf("after the short jobs: %d jobs, first kept %v", len(s.jobs), s.jobs[short[0].ID] != nil)
+		}
+		return nil
+	}()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.succeed(lt[0])
+	if d := h.job(long.ID); d.State != proto.JobSucceeded {
+		t.Fatalf("long job: %s", d.State)
+	}
+	s.mu.Lock()
+	jobs, secondKept, done := len(s.jobs), s.jobs[short[1].ID] != nil, s.jobs[long.ID].DoneSeq
+	s.mu.Unlock()
+	if jobs != maxFinishedJobs || secondKept || done != maxFinishedJobs+2 {
+		t.Fatalf("after the long job: %d jobs, second short job kept %v, done_seq %d", jobs, secondKept, done)
+	}
+	// DoneSeq and its counter survive a restart.
+	h.stop()
+	h2 := startHive(t, h.dir, nil)
+	h2.s.mu.Lock()
+	j, next := h2.s.jobs[long.ID], h2.s.nextDoneSeq
+	h2.s.mu.Unlock()
+	if j == nil || j.DoneSeq != done || next != done+1 {
+		t.Fatalf("after restart: job %v, next done_seq %d", j != nil, next)
+	}
+}
+
+// Free disk of zero on a node with a disk quota means full, not unlimited
+// (Fits treats zero disk as unlimited, which only suits a Total).
+func TestFullDiskIsNotUnlimited(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	n := h.newNode(func(r *proto.RegisterRequest) { r.Total = proto.Resources{Cores: 4, MemMB: 4096, DiskMB: 100} })
+	n.register()
+	n.heartbeat() // reports Free = Total, for the wait reason
+	h.submit(scriptJob(1, func(s *proto.JobSpec) { s.Resources.DiskMB = 100 }))
+	fill := n.claim(16)
+	if len(fill) != 1 {
+		t.Fatalf("fill: %d", len(fill))
+	}
+	h.submit(scriptJob(2, func(s *proto.JobSpec) { s.Resources.DiskMB = 50 }))
+	if got := n.claim(16); len(got) != 0 {
+		t.Fatalf("a node with a fully allocated disk got %d tasks", len(got))
+	}
+	// Give one task a record (dispatched elsewhere and preempted) to see
+	// its wait reason.
+	other := h.newNode(nil)
+	other.register()
+	tk := other.claim(1)
+	if len(tk) != 1 || tk[0].Resources.DiskMB != 50 {
+		t.Fatalf("other node: %+v", tk)
+	}
+	other.report(tk[0], proto.TaskReport{State: proto.TaskPreempted})
+	h.mustAdmin("PATCH", "nodes/"+other.req.NodeID, proto.NodePatch{Drain: ptr(true)}, nil)
+	if v := h.task(tk[0].ID); v.State != proto.TaskPending || v.WaitReason != "waiting for 50 MB disk" {
+		t.Fatalf("wait reason: %s %q", v.State, v.WaitReason)
+	}
+	if got := n.claim(16); len(got) != 0 {
+		t.Fatalf("full disk, second claim: %d tasks", len(got))
+	}
+	// Freeing the disk lets both 50 MB tasks in, and no more.
+	n.succeed(fill[0])
+	if got := n.claim(16); len(got) != 2 {
+		t.Fatalf("after freeing the disk: %d tasks", len(got))
 	}
 }

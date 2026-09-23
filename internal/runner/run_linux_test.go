@@ -20,13 +20,44 @@ import (
 	"github.com/platteration/ewastesavior/internal/proto"
 )
 
+// testUIDBase is the first task uid of this package's runners. It differs
+// from the node agent's 10000: New kills leftover processes of the slot
+// uids, and the node package's tests may run tasks at the same time.
+const testUIDBase = 20000
+
 // TestMain lets the test binary act as the sandbox-exec shim, so a Runner
-// can use os.Args[0] as SelfExe.
+// can use os.Args[0] as SelfExe, and as a throwaway agent (testAgentMain).
 func TestMain(m *testing.M) {
 	if len(os.Args) > 1 && os.Args[1] == "sandbox-exec" {
 		os.Exit(SandboxExecMain(os.Args[2:]))
 	}
+	if len(os.Args) > 3 && os.Args[1] == "runner-test-agent" {
+		os.Exit(testAgentMain(os.Args[2], os.Args[3]))
+	}
 	os.Exit(m.Run())
+}
+
+// testAgentMain runs one script task with sandbox=none in a fresh Runner
+// under base and copies its output to stdout; tests kill it to play a
+// crashing agent.
+func testAgentMain(base, script string) int {
+	self, err := os.Executable()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	r, err := New(Config{
+		WorkRoot: filepath.Join(base, "work"), CacheDir: filepath.Join(base, "cache"),
+		CgroupRoot: filepath.Join(base, "cgroup"), SelfExe: self, Sandbox: ModeNone,
+		UIDBase: testUIDBase, Slots: 1,
+	}, newFakeTransfer())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	rep := r.Run(context.Background(), scriptTask("tagent", script), os.Stdout, nil)
+	fmt.Printf("state=%s\n", rep.State)
+	return 0
 }
 
 // fakeTransfer serves blobs and URLs from memory and records uploads.
@@ -118,7 +149,7 @@ func newTestRunner(t *testing.T, mode string, tr Transfer) *Runner {
 		CgroupRoot: filepath.Join(base, "cgroup"),
 		SelfExe:    self,
 		Sandbox:    mode,
-		UIDBase:    10000,
+		UIDBase:    testUIDBase,
 		Slots:      4,
 		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, tr)
@@ -405,8 +436,8 @@ func TestRunCleanup(t *testing.T) {
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Errorf("workdir %s not removed: %v", dir, err)
 	}
-	if r.FreeSlots() != 4 {
-		t.Errorf("slot not released: %d free", r.FreeSlots())
+	if r.FreeSlots() != 4 || r.UsableSlots() != 4 {
+		t.Errorf("slot not released: %d free, %d usable", r.FreeSlots(), r.UsableSlots())
 	}
 }
 

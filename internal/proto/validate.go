@@ -449,6 +449,14 @@ func ValidateJobSpec(s *JobSpec) error {
 			return fmt.Errorf("input %q needs exactly one of blob or url", in.Name)
 		}
 	}
+	// "a" and "a/b" can't both exist: a file can't also be a directory.
+	for _, in := range s.Inputs {
+		for d := path.Dir(in.Name); d != "." && d != "/"; d = path.Dir(d) {
+			if names[d] {
+				return fmt.Errorf("input %q is inside input %q (a file can't also be a directory)", in.Name, d)
+			}
+		}
+	}
 	if r.DiskMB > 0 && total > int64(r.DiskMB)<<20 {
 		return fmt.Errorf("url inputs (%d bytes) exceed disk_mb", total)
 	}

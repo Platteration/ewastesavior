@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -24,18 +25,29 @@ var procMasks = []string{
 	"timer_list", "sched_debug", "config.gz",
 }
 
-// devNodes are the /dev entries bind-mounted from the host.
-var devNodes = []string{"null", "zero", "full", "random", "urandom", "tty"}
+// devNodes are the /dev entries bind-mounted from the host. /dev/tty is
+// left out: the task runs in its own session without a controlling
+// terminal, and the node must never hand it the agent's.
+var devNodes = []string{"null", "zero", "full", "random", "urandom"}
 
-// buildRoot builds the task's new root on a tmpfs and returns its path
-// (DESIGN 6.5 step 2). The caller pivot_roots into it.
+// procReadOnly are the /proc subtrees made read-only (DESIGN 6.5).
+var procReadOnly = []string{"sys", "irq", "bus"}
+
+// buildRoot builds the task's new root on a tmpfs mounted on a.rootMnt and
+// returns its path (DESIGN 6.5 step 2). The caller pivot_roots into it.
+// a.rootMnt is a fixed, empty, root-only directory the runner owns; the
+// tmpfs lives only in this shim's mount namespace, so nothing is left
+// behind on the host.
 func buildRoot(a shimArgs) (string, error) {
 	// Make all mounts private so nothing propagates back to the host.
 	if err := unix.Mount("", "/", "", msRec|unix.MS_PRIVATE, ""); err != nil {
 		return "", fmt.Errorf("make / private: %w", err)
 	}
-	newroot, err := os.MkdirTemp("", "savior-root-")
-	if err != nil {
+	newroot := a.rootMnt
+	if fi, err := os.Lstat(newroot); err != nil || !fi.IsDir() {
+		if err == nil {
+			err = errors.New("not a directory")
+		}
 		return "", fmt.Errorf("new root dir: %w", err)
 	}
 	if err := unix.Mount("tmpfs", newroot, "tmpfs", msNoSUID, "mode=0755"); err != nil {
@@ -69,7 +81,7 @@ func buildRoot(a shimArgs) (string, error) {
 	if err := mkTmpfs(j("/tmp"), "size=64m", msNoSUID|msNoDev); err != nil {
 		return "", err
 	}
-	if err := buildProc(j("/proc")); err != nil {
+	if err := buildProc(j("/proc"), a.strict); err != nil {
 		return "", err
 	}
 	if err := buildDev(j("/dev")); err != nil {
@@ -110,8 +122,10 @@ func buildEtc(a shimArgs, etc string) error {
 	return unix.Mount("", etc, "", msBind|msRemnt|msRO|msNoSUID|msNoDev, "")
 }
 
-// buildProc mounts a fresh /proc and masks sensitive files.
-func buildProc(proc string) error {
+// buildProc mounts a fresh /proc, masks sensitive files and makes the
+// procReadOnly subtrees read-only. With strict, failing to lock one of
+// those subtrees down is an error.
+func buildProc(proc string, strict bool) error {
 	if err := os.MkdirAll(proc, 0o555); err != nil {
 		return err
 	}
@@ -127,13 +141,26 @@ func buildProc(proc string) error {
 			unix.Mount("/dev/null", p, "", msBind, "") // best effort
 		}
 	}
-	for _, sub := range []string{"sys", "irq", "bus"} {
+	for _, sub := range procReadOnly {
 		p := filepath.Join(proc, sub)
-		if exists(p) {
-			unix.Mount("", p, "", msBind|msRemnt|msRO|msNoSUID|msNoDev, "")
+		if !exists(p) {
+			continue
+		}
+		if err := remountRO(p); err != nil && strict {
+			return fmt.Errorf("read-only /proc/%s: %w", sub, err)
 		}
 	}
 	return nil
+}
+
+// remountRO makes the directory p a read-only, nosuid, nodev, noexec
+// mount. p is bind-mounted onto itself first: a remount only applies to a
+// mountpoint.
+func remountRO(p string) error {
+	if err := unix.Mount(p, p, "", msBind, ""); err != nil {
+		return err
+	}
+	return unix.Mount("", p, "", msBind|msRemnt|msRO|msNoSUID|msNoDev|msNoExec, "")
 }
 
 // buildDev builds a minimal /dev on a tmpfs.

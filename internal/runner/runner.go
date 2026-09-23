@@ -54,7 +54,7 @@ var AllCaps = []string{CapMountNS, CapPidNS, CapNetNS, CapIPCNS, CapUTSNS, CapCg
 
 // Config configures a Runner.
 type Config struct {
-	WorkRoot   string // per-task directories (root:root 0711), wiped at start
+	WorkRoot   string // per-task directories and the sandbox root mountpoint (root:root 0711), wiped at start
 	CacheDir   string // blob cache (root 0700)
 	CgroupRoot string // cgroup2 directory delegated to savior, e.g. /sys/fs/cgroup/savior
 	SelfExe    string // savior binary for the sandbox-exec shim ("" = os.Executable)
@@ -74,9 +74,9 @@ type Config struct {
 	Now func() time.Time
 }
 
-// Exit code of the sandbox shim when it fails before exec. Run does not
-// rely on it (the shim reports failures over a status pipe), but it keeps
-// such failures recognizable in logs.
+// Exit code of the sandbox shim when it fails before exec. The shim also
+// writes the reason to a status pipe; Run reports a sandbox failure only
+// when both are present, so a task can never pass itself off as one.
 const shimFailCode = 125
 
 // Defaults and limits.
@@ -113,7 +113,9 @@ type Runner struct {
 var ErrUnsupported = errors.New("the task runner is only supported on Linux")
 
 // New probes the sandbox capabilities, prepares WorkRoot, CacheDir and the
-// cgroup parent, and cleans up leftovers of a previous agent (DESIGN 10.5).
+// cgroup parent, and cleans up leftovers of a previous agent (DESIGN 10.5):
+// task cgroups, work directories and, when root, processes still running
+// under the slot uids UIDBase..UIDBase+Slots-1.
 func New(cfg Config, tr Transfer) (*Runner, error) {
 	if tr == nil {
 		return nil, errors.New("runner: nil Transfer")
@@ -188,6 +190,11 @@ func (r *Runner) missingCaps() []string {
 // uid slot. The agent should not claim more tasks than this.
 func (r *Runner) FreeSlots() int { return r.slots.free() }
 
+// UsableSlots is the number of slots that are not retired (free or busy).
+// A slot is retired when its uid may still own processes that could not be
+// killed; 0 means the runner can never start another task.
+func (r *Runner) UsableSlots() int { return r.slots.usable() }
+
 // Running lists the tasks currently inside Run, sorted by task ID.
 func (r *Runner) Running() []proto.RunningTask {
 	r.mu.Lock()
@@ -212,8 +219,9 @@ func (r *Runner) Freeze(lease string, frozen bool) error {
 }
 
 // Preempt kills a task; Run then reports it as preempted (the hive requeues
-// it without consuming an attempt). A task whose process has already exited
-// on its own keeps its real result.
+// it without consuming an attempt). A task still waiting for a slot or
+// fetching its inputs stops right away and never starts its process. A
+// task whose process has already exited on its own keeps its real result.
 func (r *Runner) Preempt(lease string) error {
 	t := r.lookup(lease)
 	if t == nil {

@@ -278,7 +278,7 @@ func (a *Agent) sendAckNow() {
 }
 
 // powerLoop evaluates the power/thermal policy every few seconds and
-// freezes, thaws or preempts tasks accordingly.
+// freezes, thaws or preempts tasks accordingly (see enforcePower).
 func (a *Agent) powerLoop(ctx context.Context) {
 	pol := power.Policy{
 		RunOnBattery:      a.cfg.RunOnBattery,
@@ -298,26 +298,39 @@ func (a *Agent) powerLoop(ctx context.Context) {
 		disp := a.disp
 		a.mu.Unlock()
 
-		if d.Accept != prev.Accept || d.Pause != prev.Pause || d.Preempt != prev.Preempt {
-			a.log.Info("power policy", "accept", d.Accept, "pause", d.Pause, "preempt", d.Preempt, "reason", d.Reason)
-		}
-		if d.Pause != prev.Pause {
-			a.freezeAll(d.Pause)
-		}
-		if d.Preempt && !prev.Preempt {
-			a.preemptAll(d.Reason)
-		}
+		a.enforcePower(prev, d)
 		if disp != nil && d.BlankDisplay != prev.BlankDisplay {
 			disp.SetBlank("lid", d.BlankDisplay)
-		}
-		if d.Accept != prev.Accept {
-			a.poke()
 		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
 		}
+	}
+}
+
+// enforcePower applies the task side of a power decision; prev is the
+// previous tick's. Pause and preempt are level-triggered: while they hold,
+// every tick freezes or preempts all active tasks again (both idempotent),
+// so a task that was claimed while the policy changed, or that had not
+// reached the runner yet at the transition, is caught on the next tick.
+// No new work is claimed meanwhile (freeLocked is zero).
+func (a *Agent) enforcePower(prev, d power.Decision) {
+	if d.Accept != prev.Accept || d.Pause != prev.Pause || d.Preempt != prev.Preempt {
+		a.log.Info("power policy", "accept", d.Accept, "pause", d.Pause, "preempt", d.Preempt, "reason", d.Reason)
+	}
+	switch {
+	case d.Pause:
+		a.freezeAll(true)
+	case prev.Pause:
+		a.freezeAll(false)
+	}
+	if d.Preempt {
+		a.preemptAll(d.Reason)
+	}
+	if d.Accept != prev.Accept || d.Pause != prev.Pause {
+		a.poke()
 	}
 }
 

@@ -250,11 +250,13 @@ var defs = []keyDef{
 			}
 			return v, nil
 		}),
-	str("node_id", "", "Override the hardware-derived node ID.", false,
+	str("node_id", "", "Override the hardware-derived node ID (lowercase letters, digits and dashes).", false,
 		func(c *Config) *string { return &c.NodeID },
 		func(v string) (string, error) {
-			if v != "" && !nameRE.MatchString(v) {
-				return "", fmt.Errorf("use letters, digits and dashes (max 63)")
+			// The hive only accepts proto.ValidNodeID; lowercase what we can.
+			v = strings.ToLower(strings.TrimSpace(v))
+			if v != "" && !proto.ValidNodeID(v) {
+				return "", fmt.Errorf("use letters, digits and dashes, starting with a letter or digit (max 63)")
 			}
 			return v, nil
 		}),
@@ -431,10 +433,14 @@ var defs = []keyDef{
 
 	str("hive_listen", ":7700", "Hive HTTPS listen address.", false, func(c *Config) *string { return &c.HiveListen },
 		func(v string) (string, error) {
-			if _, _, err := net.SplitHostPort(v); err != nil {
+			_, port, err := net.SplitHostPort(strings.TrimSpace(v))
+			if err != nil {
 				return "", fmt.Errorf("want host:port or :port")
 			}
-			return v, nil
+			if p, err := strconv.Atoi(port); err != nil || p < 1 || p > 65535 {
+				return "", fmt.Errorf("port must be a number from 1 to 65535")
+			}
+			return strings.TrimSpace(v), nil
 		}),
 	str("hive_data", "auto", "Hive state directory (auto = on the stick when writable).", false, func(c *Config) *string { return &c.HiveData },
 		func(v string) (string, error) {
@@ -720,18 +726,22 @@ func quote(v string) string {
 	return v
 }
 
-// Load builds a Config from defaults, the given files (missing ones are
-// skipped) and a kernel command line. Warnings describe ignored input.
+// Load builds a Config from defaults, the given files and a kernel command
+// line. Missing files are skipped. A file that exists but can't be read
+// (permissions, I/O error, a directory) is skipped with a warning, like
+// any other bad input, so one broken source never stops a service: the
+// node still starts and shows what is missing. Warnings describe ignored
+// input. The error is always nil; it is kept for API compatibility.
 func Load(files []string, cmdline string) (Config, []string, error) {
 	c := Default()
 	var warnings []string
 	for _, f := range files {
 		data, err := os.ReadFile(f)
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
+			if !os.IsNotExist(err) {
+				warnings = append(warnings, fmt.Sprintf("%s: cannot read (%v); ignoring this file", f, err))
 			}
-			return c, warnings, fmt.Errorf("read %s: %w", f, err)
+			continue
 		}
 		warnings = append(warnings, ParseFile(bytes.NewReader(data), f, &c)...)
 	}

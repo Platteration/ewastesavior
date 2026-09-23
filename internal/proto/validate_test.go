@@ -229,8 +229,11 @@ func TestJobDefaultsAndValidation(t *testing.T) {
 		"huge count":   func(j *JobSpec) { j.Count = MaxTaskCount + 1 },
 		"input path":   func(j *JobSpec) { j.Inputs = []Input{{Name: "../x", Blob: blob('a')}} },
 		"input dup":    func(j *JobSpec) { j.Inputs = []Input{{Name: "x", Blob: blob('a')}, {Name: "x", Blob: blob('b')}} },
-		"url no sha":   func(j *JobSpec) { j.Inputs = []Input{{Name: "x", URL: "https://a/b", Size: 10}} },
-		"url no size":  func(j *JobSpec) { j.Inputs = []Input{{Name: "x", URL: "https://a/b", SHA256: blob('a')}} },
+		"input in input": func(j *JobSpec) {
+			j.Inputs = []Input{{Name: "a/b/c", Blob: blob('a')}, {Name: "a", Blob: blob('b')}}
+		},
+		"url no sha":  func(j *JobSpec) { j.Inputs = []Input{{Name: "x", URL: "https://a/b", Size: 10}} },
+		"url no size": func(j *JobSpec) { j.Inputs = []Input{{Name: "x", URL: "https://a/b", SHA256: blob('a')}} },
 		"url too big": func(j *JobSpec) {
 			j.Inputs = []Input{{Name: "x", URL: "https://a/b", SHA256: blob('a'), Size: 1 << 40}}
 		},
@@ -249,6 +252,12 @@ func TestJobDefaultsAndValidation(t *testing.T) {
 		if err := ValidateJobSpec(&j); err == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+	// Siblings, and names that share only a string prefix, are fine.
+	j := base()
+	j.Inputs = []Input{{Name: "a/b", Blob: blob('a')}, {Name: "a/c", Blob: blob('b')}, {Name: "ab", Blob: blob('c')}, {Name: "a.d/e", Blob: blob('d')}}
+	if err := ValidateJobSpec(&j); err != nil {
+		t.Errorf("sibling inputs: %v", err)
 	}
 }
 

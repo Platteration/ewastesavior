@@ -111,7 +111,7 @@ func (s *Server) applySnapshotLocked(snap *snapshot) {
 		}
 	}
 	var orphans []*task
-	maxSeq := uint64(0)
+	maxSeq, maxDoneSeq := uint64(0), uint64(0)
 	for _, js := range snap.Jobs {
 		if js.ID == "" || s.jobs[js.ID] != nil || js.Spec.Count < 1 {
 			continue
@@ -122,6 +122,9 @@ func (s *Server) applySnapshotLocked(snap *snapshot) {
 		}
 		if j.Seq > maxSeq {
 			maxSeq = j.Seq
+		}
+		if j.DoneSeq > maxDoneSeq {
+			maxDoneSeq = j.DoneSeq
 		}
 		sort.Slice(js.Tasks, func(a, b int) bool { return js.Tasks[a].Index < js.Tasks[b].Index })
 		for _, tr := range js.Tasks {
@@ -174,6 +177,9 @@ func (s *Server) applySnapshotLocked(snap *snapshot) {
 	if s.nextSeq <= maxSeq {
 		s.nextSeq = maxSeq + 1
 	}
+	// Jobs saved before DoneSeq existed have 0 and are retained by Seq,
+	// before every job that finished since.
+	s.nextDoneSeq = max(snap.NextDoneSeq, maxDoneSeq+1)
 	for _, t := range orphans {
 		s.requeueLocked(t, requeueOpts{outcome: "lost", err: "node record no longer exists"})
 	}

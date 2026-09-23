@@ -2,12 +2,15 @@ package hive
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/platteration/ewastesavior/internal/proto"
 )
 
 func TestLogRing(t *testing.T) {
@@ -168,4 +171,36 @@ func adminGet(h *testHive, path string) (rawResp, error) {
 	var b bytes.Buffer
 	b.ReadFrom(resp.Body)
 	return rawResp{code: resp.StatusCode, hdr: resp.Header, body: b.Bytes()}, nil
+}
+
+// Deleting a job removes every tail file of its tasks, also one written by
+// an earlier attempt when the last attempt produced no output.
+func TestLogTailRemovedWithJob(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	n := h.newNode(nil)
+	n.register()
+	d := h.submit(scriptJob(1, nil))
+	tk := n.claim(1)[0]
+	if code, _ := n.api("POST", "tasks/"+tk.ID+"/log?lease="+tk.Lease+"&offset=0", "attempt 1\n", nil); code != 200 {
+		t.Fatalf("log: %d", code)
+	}
+	if code := n.report(tk, proto.TaskReport{State: proto.TaskPreempted}); code != 200 {
+		t.Fatalf("preempt: %d", code)
+	}
+	h.s.io.flush()
+	path := h.s.logPath(tk.ID)
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("tail of attempt 1: %v", err)
+	}
+	again := n.claim(1)
+	if len(again) != 1 || again[0].ID != tk.ID {
+		t.Fatalf("attempt 2: %+v", again)
+	}
+	n.succeed(again[0]) // no output this time
+	h.mustAdmin("DELETE", "jobs/"+d.ID, nil, nil)
+	h.s.io.flush()
+	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("tail file left behind by the deleted job: %v", err)
+	}
 }

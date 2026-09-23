@@ -325,6 +325,19 @@ func TestNodeConfig(t *testing.T) {
 	if code, _, stderr := e.run("node-config", "-o", out, "--force"); code != 0 {
 		t.Errorf("--force: %s", stderr)
 	}
+	// auto (any case) is passed through: nodes find the hive on the LAN.
+	for _, auto := range []string{"auto", "Auto"} {
+		autoConf := filepath.Join(t.TempDir(), "auto.conf")
+		if code, _, stderr := e.run("node-config", "--hive-addr", auto, "-o", autoConf); code != 0 {
+			t.Fatalf("node-config --hive-addr %s: %d %s", auto, code, stderr)
+		}
+		if b, _ := os.ReadFile(autoConf); !strings.Contains(string(b), "hive = auto\n") {
+			t.Errorf("--hive-addr %s: savior.conf = %q", auto, b)
+		}
+	}
+	if code, _, stderr := e.run("node-config", "--hive-addr", "https://x/path", "-o", "-"); code != 2 || !strings.Contains(stderr, "invalid --hive-addr") {
+		t.Errorf("bad --hive-addr: %d %s", code, stderr)
+	}
 	// A config pinning some other certificate is refused.
 	h.nodeConf = "swarm_key = ABCDEFGHJKMNPQRSTVWXYZ0123456789\nhive_fingerprint = sha256:" + strings.Repeat("0", 64) + "\n"
 	other := filepath.Join(t.TempDir(), "other.conf")

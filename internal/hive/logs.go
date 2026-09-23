@@ -199,6 +199,10 @@ func (s *Server) handleTaskLog(w http.ResponseWriter, r *http.Request, _ adminCt
 			select {
 			case <-wake:
 			case <-timer.C:
+			case <-s.shutdown:
+				// The hive is stopping: answer with what there is now so
+				// the HTTP server's shutdown doesn't wait for the poll.
+				deadline = time.Now()
 			case <-ctx.Done():
 				timer.Stop()
 				return

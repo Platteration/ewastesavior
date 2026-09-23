@@ -23,6 +23,8 @@ type task struct {
 	report   *proto.TaskReport // final report waiting in the outbox
 	logs     *logStream
 	finished chan struct{}
+
+	preempted bool // preemptAll has asked the runner to stop it
 }
 
 func (t *task) snapshot() proto.RunningTask {
@@ -62,6 +64,28 @@ func (a *Agent) freeLocked() proto.Resources {
 	return free
 }
 
+// claimSlotsLocked is how many more tasks the runner can start without
+// waiting (a.mu held). The runner's FreeSlots alone lags behind: a task
+// takes its uid slot only when its goroutine gets into runner.Run, so a
+// task claimed a moment ago may not show there yet. Every held task that
+// has no final report yet is therefore counted as busy too. Tasks claimed
+// beyond the slots would sit in "fetching" with no progress until the
+// hive's stall deadline fails them.
+func (a *Agent) claimSlotsLocked() int {
+	if a.runner == nil {
+		return 0
+	}
+	busy := 0
+	for _, t := range a.tasks {
+		t.mu.Lock()
+		if t.report == nil {
+			busy++
+		}
+		t.mu.Unlock()
+	}
+	return max(0, min(a.runner.FreeSlots(), a.runnerSlots-busy))
+}
+
 // claimLoop long-polls the hive for work while we have capacity.
 func (a *Agent) claimLoop(ctx context.Context, hc *hiveClient) {
 	backoff := time.Second
@@ -69,10 +93,7 @@ func (a *Agent) claimLoop(ctx context.Context, hc *hiveClient) {
 	for ctx.Err() == nil {
 		a.mu.Lock()
 		free := a.freeLocked()
-		slots := 0
-		if a.runner != nil {
-			slots = a.runner.FreeSlots()
-		}
+		slots := a.claimSlotsLocked()
 		canClaim := slots > 0 && free.Cores >= 0.1-1e-9 && free.MemMB > 0
 		a.mu.Unlock()
 		if slots > 4 {
@@ -148,7 +169,12 @@ func (a *Agent) runTask(ctx context.Context, tk *task) {
 	tk.report = &rep
 	tk.mu.Unlock()
 	a.log.Info("task finished", "task", tk.t.ID, "state", rep.State, "exit", rep.ExitCode, "error_kind", rep.ErrorKind, "error", rep.Error)
-	a.flushOutbox()
+	if !a.shuttingDown.Load() {
+		// While stopping, the report can wait: a flush may block for a
+		// minute on an unresponsive hive, and the hive requeues the task
+		// of a node that went away anyway.
+		a.flushOutbox()
+	}
 	a.poke()
 }
 
@@ -267,45 +293,65 @@ func (a *Agent) dropUnadopted(adopted map[string]bool) {
 	}
 }
 
+// activeTasks lists held tasks that have no final report yet.
+func (a *Agent) activeTasks() []*task {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	var out []*task
+	for _, t := range a.tasks {
+		t.mu.Lock()
+		if t.report == nil {
+			out = append(out, t)
+		}
+		t.mu.Unlock()
+	}
+	return out
+}
+
+// freezeAll freezes or thaws every active task. Both are idempotent, so
+// the power loop repeats a freeze every tick to catch tasks that arrived
+// after the pause began.
 func (a *Agent) freezeAll(frozen bool) {
 	if a.runner == nil {
 		return
 	}
-	a.mu.Lock()
-	var leases []string
-	for l := range a.tasks {
-		leases = append(leases, l)
-	}
-	a.mu.Unlock()
-	for _, l := range leases {
-		if err := a.runner.Freeze(l, frozen); err != nil {
-			a.log.Debug("freeze", "lease", l, "err", err)
+	for _, t := range a.activeTasks() {
+		if err := a.runner.Freeze(t.t.Lease, frozen); err != nil {
+			a.log.Debug("freeze", "lease", t.t.Lease, "err", err)
 		}
 	}
 }
 
+// preemptAll stops every active task so the hive requeues it. The power
+// loop repeats it every tick while the policy says so, to catch tasks that
+// arrived later; each task is logged once.
 func (a *Agent) preemptAll(reason string) {
 	if a.runner == nil {
 		return
 	}
-	a.mu.Lock()
-	var leases []string
-	for l, t := range a.tasks {
-		t.mu.Lock()
-		if t.report == nil {
-			leases = append(leases, l)
+	for _, t := range a.activeTasks() {
+		if err := a.runner.Preempt(t.t.Lease); err != nil {
+			// Not in the runner yet: the next tick tries again.
+			a.log.Debug("preempt", "lease", t.t.Lease, "err", err)
+			continue
 		}
+		t.mu.Lock()
+		first := !t.preempted
+		t.preempted = true
 		t.mu.Unlock()
-	}
-	a.mu.Unlock()
-	for _, l := range leases {
-		a.log.Warn("preempting task", "lease", l, "reason", reason)
-		a.runner.Preempt(l)
+		if first {
+			a.log.Warn("preempting task", "task", t.t.ID, "lease", t.t.Lease, "reason", reason)
+		}
 	}
 }
 
-// shutdownTasks cancels everything still running (agent exit or reboot).
+// shutdownGrace bounds how long shutdownTasks waits for all tasks together.
+var shutdownGrace = 10 * time.Second
+
+// shutdownTasks cancels everything still running (agent exit or reboot)
+// and waits up to shutdownGrace in total for the tasks to wind down.
 func (a *Agent) shutdownTasks() {
+	a.shuttingDown.Store(true)
 	a.mu.Lock()
 	var ts []*task
 	for _, t := range a.tasks {
@@ -315,10 +361,14 @@ func (a *Agent) shutdownTasks() {
 	for _, t := range ts {
 		t.cancel()
 	}
+	deadline := time.NewTimer(shutdownGrace)
+	defer deadline.Stop()
 	for _, t := range ts {
 		select {
 		case <-t.finished:
-		case <-time.After(10 * time.Second):
+		case <-deadline.C:
+			a.log.Warn("stopping without waiting for all tasks", "grace", shutdownGrace)
+			return
 		}
 	}
 }

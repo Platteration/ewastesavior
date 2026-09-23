@@ -303,17 +303,21 @@ func cmdGenkey(a *app, _ context.Context, args []string) int {
 }
 
 func cmdNodeConfig(a *app, ctx context.Context, args []string) int {
-	f := a.flagSet("node-config", "[--hive-addr ADDR] [-o savior.conf] [--force]",
+	f := a.flagSet("node-config", "[--hive-addr ADDR|auto] [-o savior.conf] [--force]",
 		`Write a savior.conf for nodes: the swarm key, the hive's fingerprint pin and
 its address. Copy it to the root of the SAVIOR partition of each node's stick.
 It contains the swarm key, so keep it private.`)
-	hiveAddr := f.String("hive-addr", "", "address nodes should use for the hive (default: the one this command uses)")
+	hiveAddr := f.String("hive-addr", "", "address nodes should use for the hive, or auto to let them find it on the LAN (default: the one this command uses)")
 	out := f.String("o", "savior.conf", "output file, or - for standard output")
 	force := f.Bool("force", false, "overwrite an existing file")
 	if _, code, ok := a.parse(f, args, 0, 0); !ok {
 		return code
 	}
-	if *hiveAddr != "" {
+	if strings.EqualFold(strings.TrimSpace(*hiveAddr), "auto") {
+		// The hive writes hive = auto: nodes find it by its LAN beacon,
+		// and the fingerprint pin still authenticates it.
+		*hiveAddr = "auto"
+	} else if *hiveAddr != "" {
 		if _, err := config.HiveURL(*hiveAddr); err != nil {
 			return a.usageError("invalid --hive-addr: %v", err)
 		}

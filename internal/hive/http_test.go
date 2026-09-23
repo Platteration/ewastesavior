@@ -1,7 +1,10 @@
 package hive
 
 import (
+	"encoding/json"
+	"math"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -227,5 +230,21 @@ func TestNodeDelete(t *testing.T) {
 	h.mustAdmin("GET", "nodes", nil, &list)
 	if len(list) != 0 {
 		t.Fatalf("list: %+v", list)
+	}
+}
+
+// A value JSON can't encode is a 500 with an error body, not an empty 200.
+func TestWriteJSONEncodeError(t *testing.T) {
+	t.Parallel()
+	rec := httptest.NewRecorder()
+	writeJSON(rec, http.StatusOK, map[string]float64{"cpu": math.Inf(1)})
+	var e proto.ErrorResponse
+	if rec.Code != http.StatusInternalServerError || json.Unmarshal(rec.Body.Bytes(), &e) != nil || !strings.Contains(e.Error, "encode") {
+		t.Fatalf("unencodable value: %d %q", rec.Code, rec.Body)
+	}
+	rec = httptest.NewRecorder()
+	writeJSON(rec, http.StatusCreated, map[string]string{"a": "<b>"})
+	if rec.Code != http.StatusCreated || rec.Body.String() != "{\"a\":\"\\u003cb\\u003e\"}\n" || rec.Header().Get("Content-Type") != "application/json" {
+		t.Fatalf("normal value: %d %q %v", rec.Code, rec.Body, rec.Header())
 	}
 }

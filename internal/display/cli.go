@@ -19,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/platteration/ewastesavior/internal/config"
 	"github.com/platteration/ewastesavior/internal/proto"
 	"github.com/platteration/ewastesavior/internal/version"
 )
@@ -362,10 +363,12 @@ func cmdVTReset(args []string, stderr io.Writer) int {
 	fl := flag.NewFlagSet("savior display vt-reset", flag.ContinueOnError)
 	fl.SetOutput(stderr)
 	vt := fl.String("vt", DefaultVT, "VT to reset (/dev/tty0 = the current one)")
-	device := fl.String("device", "auto", "framebuffer to unblank: auto, /dev/fbN or none")
+	device := fl.String("device", "", "framebuffer to unblank: auto, /dev/fbN or none (default: display_device from the config)")
 	if err := fl.Parse(args); err != nil {
 		return 2
 	}
+	given := false
+	fl.Visit(func(f *flag.Flag) { given = given || f.Name == "device" })
 	code := 0
 	if err := resetVT(*vt); err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -375,16 +378,39 @@ func cmdVTReset(args []string, stderr io.Writer) int {
 			code = 1
 		}
 	}
-	if d := *device; d != "none" && d != "" {
-		if d == "auto" {
-			d, _ = AutoDevicePath("/")
-		}
-		if d != "" {
-			_ = unblankFB(d)
-		}
+	if d := vtResetDevice(*device, given); d != "" {
+		_ = unblankFB(d)
 	}
 	if err := restoreSavedBacklight(); err != nil {
 		fmt.Fprintln(stderr, "savior display vt-reset: backlight:", err)
 	}
 	return code
+}
+
+// configDisplayDevice returns display_device from the config the agent
+// reads (config.LoadDefault), "auto" when it has none. Tests replace it.
+var configDisplayDevice = func() string {
+	c, _, err := config.LoadDefault("")
+	if err != nil || c.DisplayDevice == "" {
+		return "auto"
+	}
+	return c.DisplayDevice
+}
+
+// vtResetDevice is the framebuffer vt-reset unblanks ("" = none): the
+// --device flag when given, else display_device from the config, so a
+// screen the agent drove through a fixed /dev/fbN is turned back on too.
+func vtResetDevice(flagVal string, given bool) string {
+	d := flagVal
+	if !given {
+		d = configDisplayDevice()
+	}
+	switch d {
+	case "", "none":
+		return ""
+	case "auto":
+		p, _ := AutoDevicePath("/")
+		return p
+	}
+	return d
 }

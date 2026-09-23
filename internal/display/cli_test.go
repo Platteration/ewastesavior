@@ -110,6 +110,40 @@ func TestCLIVTResetMissingVT(t *testing.T) {
 	}
 }
 
+func TestVTResetDeviceDefaultsToConfig(t *testing.T) {
+	// A screen driven through display_device = /dev/fbN must be unblanked
+	// by vt-reset after a crash, not whatever "auto" would pick.
+	old := configDisplayDevice
+	t.Cleanup(func() { configDisplayDevice = old })
+	configDisplayDevice = func() string { return "/dev/fb3" }
+	for _, tc := range []struct {
+		flag  string
+		given bool
+		want  string
+	}{
+		{"", false, "/dev/fb3"},
+		{"/dev/fb1", true, "/dev/fb1"},
+		{"none", true, ""},
+		{"", true, ""},
+	} {
+		if got := vtResetDevice(tc.flag, tc.given); got != tc.want {
+			t.Errorf("vtResetDevice(%q, %v) = %q, want %q", tc.flag, tc.given, got, tc.want)
+		}
+	}
+	configDisplayDevice = func() string { return "none" }
+	if got := vtResetDevice("", false); got != "" {
+		t.Errorf("display_device = none: %q", got)
+	}
+	// The whole command still works with the configured device (a missing
+	// VT and an unusable framebuffer are not fatal).
+	fb := filepath.Join(t.TempDir(), "fb3")
+	os.WriteFile(fb, nil, 0o644)
+	configDisplayDevice = func() string { return fb }
+	if code, _, stderr := runCLITest("", "vt-reset", "--vt", filepath.Join(t.TempDir(), "tty7")); code != 0 {
+		t.Fatalf("vt-reset: %d %q", code, stderr)
+	}
+}
+
 func TestParseSize(t *testing.T) {
 	for in, want := range map[string][2]int{"1024x768": {1024, 768}, " 640X480 ": {640, 480}, "1x1": {1, 1}} {
 		w, h, err := parseSize(in)

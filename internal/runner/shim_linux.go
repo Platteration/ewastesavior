@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -14,15 +15,18 @@ import (
 
 // statusFD is the descriptor (ExtraFiles[0]) the shim writes its failure
 // reason to before exiting, so the runner can tell a setup failure apart
-// from the task's own exit code.
+// from the task's own exit code. It is close-on-exec: the task never
+// inherits it.
 const statusFD = 3
 
 // shimArgs holds the parsed sandbox-exec flags.
 type shimArgs struct {
 	work     string
+	rootMnt  string // mountpoint for the private root tmpfs (sandbox=full)
 	uid, gid int
 	fsizeMB  int
 	sandbox  string // full | none
+	strict   bool   // sandbox=strict: hardening steps must not be skipped
 	seccomp  bool
 	netns    bool
 	network  bool
@@ -37,11 +41,19 @@ type shimArgs struct {
 // before execve it prints a one-line reason to stderr and the status pipe
 // and exits with a distinctive code.
 func SandboxExecMain(args []string) int {
+	// Capabilities, no_new_privs, the parent-death signal and (without
+	// TSYNC) the seccomp filter are per-thread: every step must run on the
+	// thread that finally execs the command. Never unlocked.
+	runtime.LockOSThread()
+	// The status pipe is for the shim only; the task must not be able to
+	// write a forged setup failure into it.
+	syscall.CloseOnExec(statusFD)
+
 	a, err := parseShimArgs(args)
 	if err != nil {
 		return shimFail("parse args: " + err.Error())
 	}
-	// Step 1 (self-join) must happen before anything else when the runner
+	// Step 1 (self-join) must happen before any real work when the runner
 	// could not hand us a cgroup fd.
 	if a.cgroup != "" {
 		if err := joinCgroup(a.cgroup); err != nil {
@@ -59,10 +71,12 @@ func parseShimArgs(args []string) (shimArgs, error) {
 	fs := flag.NewFlagSet("sandbox-exec", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	fs.StringVar(&a.work, "work", "", "task working directory")
+	fs.StringVar(&a.rootMnt, "root-mnt", "", "empty directory to mount the task root on (sandbox=full)")
 	fs.IntVar(&a.uid, "uid", 0, "task uid")
 	fs.IntVar(&a.gid, "gid", 0, "task gid")
 	fs.IntVar(&a.fsizeMB, "fsize-mb", 0, "RLIMIT_FSIZE in MiB")
 	fs.StringVar(&a.sandbox, "sandbox", "full", "full or none")
+	fs.BoolVar(&a.strict, "strict", false, "fail instead of skipping a hardening step")
 	fs.BoolVar(&a.seccomp, "seccomp", true, "install the seccomp filter")
 	fs.BoolVar(&a.netns, "netns", true, "a fresh network namespace exists")
 	fs.BoolVar(&a.network, "network", false, "the task is allowed network access")
@@ -79,6 +93,9 @@ func parseShimArgs(args []string) (shimArgs, error) {
 	}
 	if len(a.cmd) == 0 {
 		return a, fmt.Errorf("no command given")
+	}
+	if a.sandbox == "full" && a.rootMnt == "" {
+		return a, fmt.Errorf("--root-mnt is required with --sandbox full")
 	}
 	return a, nil
 }
@@ -150,13 +167,15 @@ func setRlimits(fsizeMB int) error {
 
 // dropPrivileges drops to the task uid/gid and locks down capabilities
 // (DESIGN 6.5 step 5). Bounding-set capabilities are dropped before the
-// setuid, while CAP_SETPCAP is still held.
+// setuid, while CAP_SETPCAP is still held. The per-thread steps rely on
+// SandboxExecMain having locked the goroutine to its OS thread; the
+// syscall package's Setgroups/Setresgid/Setresuid apply to every thread.
 func dropPrivileges(a shimArgs) error {
 	root := os.Geteuid() == 0
 	clearAmbientCaps()
 	if root {
 		dropBoundingCaps()
-		if err := unix.Setgroups([]int{}); err != nil {
+		if err := syscall.Setgroups([]int{}); err != nil {
 			return fmt.Errorf("setgroups: %w", err)
 		}
 		if err := unix.Setresgid(a.gid, a.gid, a.gid); err != nil {
@@ -172,11 +191,35 @@ func dropPrivileges(a shimArgs) error {
 			return fmt.Errorf("gid did not drop: %d/%d/%d", rgid, egid, sgid)
 		}
 	}
+	// The uid change cleared the parent-death signal the runner asked for
+	// (SysProcAttr.Pdeathsig): arm it again, then make sure the runner did
+	// not die before that, when the signal could not fire any more.
+	if err := unix.Prctl(unix.PR_SET_PDEATHSIG, uintptr(unix.SIGKILL), 0, 0, 0); err != nil {
+		return fmt.Errorf("pdeathsig: %w", err)
+	}
+	if peerGone(statusFD) {
+		return errors.New("the runner exited")
+	}
 	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
 		return fmt.Errorf("no_new_privs: %w", err)
 	}
 	unix.Prctl(unix.PR_SET_DUMPABLE, 0, 0, 0, 0)
 	return nil
+}
+
+// peerGone reports whether fd is the write end of a pipe whose read end is
+// closed everywhere. The runner holds the read end of the status pipe
+// until the shim execs or exits, so this tells whether the runner is
+// still alive (getppid is useless in a pid namespace: it reads 0).
+func peerGone(fd int) bool {
+	pfd := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLOUT}}
+	for {
+		n, err := unix.Poll(pfd, 0)
+		if err == unix.EINTR {
+			continue
+		}
+		return err == nil && n == 1 && pfd[0].Revents&(unix.POLLERR|unix.POLLHUP) != 0 && pfd[0].Revents&unix.POLLNVAL == 0
+	}
 }
 
 func clearAmbientCaps() {
@@ -190,7 +233,9 @@ func dropBoundingCaps() {
 }
 
 // installSeccomp builds and installs the task filter for the ABIs this
-// kernel and shim use.
+// kernel and shim use. seccomp(2) with SECCOMP_FILTER_FLAG_TSYNC puts it on
+// every thread of the shim; kernels without seccomp(2) get it on the
+// calling (locked, exec'ing) thread through prctl.
 func installSeccomp() error {
 	machine, _ := unameMachine()
 	prog, err := buildSeccompProgram(filterArches(runtime.GOARCH, machine))
@@ -202,7 +247,16 @@ func installSeccomp() error {
 		filter[i] = unix.SockFilter{Code: in.Code, Jt: in.Jt, Jf: in.Jf, K: in.K}
 	}
 	fprog := &unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
-	err = unix.Prctl(unix.PR_SET_SECCOMP, uintptr(unix.SECCOMP_MODE_FILTER), uintptr(unsafe.Pointer(fprog)), 0, 0)
+	r1, _, errno := unix.Syscall(unix.SYS_SECCOMP, unix.SECCOMP_SET_MODE_FILTER, unix.SECCOMP_FILTER_FLAG_TSYNC, uintptr(unsafe.Pointer(fprog)))
+	switch {
+	case errno == unix.ENOSYS || errno == unix.EINVAL:
+		err = unix.Prctl(unix.PR_SET_SECCOMP, uintptr(unix.SECCOMP_MODE_FILTER), uintptr(unsafe.Pointer(fprog)), 0, 0)
+	case errno != 0:
+		err = errno
+	case r1 != 0:
+		// TSYNC names the thread it could not synchronize.
+		err = fmt.Errorf("thread %d could not be synchronized", r1)
+	}
 	runtime.KeepAlive(filter)
 	runtime.KeepAlive(fprog)
 	return err

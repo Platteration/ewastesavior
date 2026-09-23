@@ -2,6 +2,7 @@ package hive
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,12 +30,6 @@ func (s *Server) handleReport(w http.ResponseWriter, r *http.Request, tok string
 	}
 	rep.Error = proto.Sanitize(rep.Error, 4096, true)
 	rep.ErrorKind = proto.Sanitize(rep.ErrorKind, 32, false)
-	if rep.RunS < 0 || rep.RunS != rep.RunS {
-		rep.RunS = 0
-	}
-	if rep.CPUSeconds < 0 || rep.CPUSeconds != rep.CPUSeconds {
-		rep.CPUSeconds = 0
-	}
 	if rep.MaxMemMB < 0 {
 		rep.MaxMemMB = 0
 	}
@@ -64,6 +59,7 @@ func (s *Server) applyReportLocked(n *node, id string, rep proto.TaskReport, now
 		}
 		return http.StatusConflict, "stale lease"
 	}
+	rep.RunS, rep.CPUSeconds = boundUsage(rep.RunS, rep.CPUSeconds, t.job.Spec.TimeoutS, n.Inventory.Cores)
 	if t.liveFor(n.ID, rep.Lease) {
 		if !terminal {
 			s.markRunningLocked(t)
@@ -137,6 +133,30 @@ func (s *Server) applyReportLocked(n *node, id string, rep proto.TaskReport, now
 		s.notifyLocked()
 	}
 	return http.StatusConflict, "stale lease"
+}
+
+// boundUsage sanitizes a report's node-supplied accounting: negative and
+// NaN values become 0, run_s is capped at 10x the task's timeout plus an
+// hour, and cpu_seconds at run_s (or that cap, when run_s is missing) times
+// the node's cores plus 10 % and a second. Without the caps a node could
+// push the swarm's cpu_seconds_total to +Inf, which JSON can't encode.
+func boundUsage(runS, cpuS float64, timeoutS, cores int) (float64, float64) {
+	clamp := func(v, hi float64) float64 {
+		if v < 0 || math.IsNaN(v) {
+			return 0
+		}
+		return math.Min(v, hi)
+	}
+	maxRun := float64(max(timeoutS, 1))*10 + 3600
+	runS = clamp(runS, maxRun)
+	if cores <= 0 || cores > proto.MaxCores {
+		cores = proto.MaxCores
+	}
+	run := runS
+	if run == 0 {
+		run = maxRun
+	}
+	return runS, clamp(cpuS, run*float64(cores)*1.1+1)
 }
 
 // checkOutputsLocked validates a report's outputs (DESIGN 8.5).
@@ -241,19 +261,33 @@ func (s *Server) requeueLocked(t *task, o requeueOpts) {
 }
 
 // nodeErrorLocked handles input/sandbox/output/internal failures: requeue
-// elsewhere, remember the node, and maybe quarantine it.
+// elsewhere (the node joins FailedNodes) and remember the error on the
+// task. Like a fast failure it is evidence against the node only once the
+// same task succeeds on another node (see succeedLocked): a job whose input
+// URL is broken, or whose outputs the hive rejects, fails with node errors
+// everywhere and must not quarantine the swarm.
 func (s *Server) nodeErrorLocked(n *node, t *task, kind, msg string, exit *int, now time.Time) {
 	s.requeueLocked(t, requeueOpts{outcome: "node_error", errKind: kind, err: msg, exitCode: exit, nodeError: true})
+	if t.nodeErrOn == nil {
+		t.nodeErrOn = map[string]nodeErr{}
+	}
+	t.nodeErrOn[n.ID] = nodeErr{at: now, kind: kind, msg: msg}
+}
+
+// noteNodeErrorLocked counts a node error on n whose task then succeeded
+// on another node; quarantineErrors of them within the window quarantine n.
+func (s *Server) noteNodeErrorLocked(n *node, e nodeErr) {
 	win := s.cfg.tune.quarantineWin
 	kept := n.nodeErrs[:0:0]
 	for _, at := range n.nodeErrs {
-		if now.Sub(at) < win {
+		if e.at.Sub(at) < win {
 			kept = append(kept, at)
 		}
 	}
-	n.nodeErrs = append(kept, now)
+	n.nodeErrs = append(kept, e.at)
 	if len(n.nodeErrs) >= quarantineErrors && n.Quarantine == "" {
-		s.quarantineLocked(n, fmt.Sprintf("%d node errors within %s (last: %s: %s)", len(n.nodeErrs), win, kind, proto.Sanitize(msg, 200, false)))
+		s.quarantineLocked(n, fmt.Sprintf("%d node errors within %s on tasks that then succeeded on other nodes (last: %s: %s)",
+			len(n.nodeErrs), win, e.kind, proto.Sanitize(e.msg, 200, false)))
 	}
 }
 
@@ -284,12 +318,19 @@ func (s *Server) quarantineLocked(n *node, reason string) {
 // succeedLocked finishes a task successfully.
 func (s *Server) succeedLocked(t *task, rep proto.TaskReport) {
 	j := t.job
+	// Earlier failures of this task on other nodes are now evidence
+	// against those nodes.
 	for id, at := range t.fastFailedOn {
 		if n := s.nodes[id]; n != nil && id != t.Node {
 			s.noteFastFailLocked(n, t, at)
 		}
 	}
-	t.fastFailedOn = nil
+	for id, e := range t.nodeErrOn {
+		if n := s.nodes[id]; n != nil && id != t.Node {
+			s.noteNodeErrorLocked(n, e)
+		}
+	}
+	t.fastFailedOn, t.nodeErrOn = nil, nil
 	exit := rep.ExitCode
 	s.endAttemptLocked(t, string(proto.TaskSucceeded), &exit, "")
 	if n := s.nodes[t.Node]; n != nil {
@@ -353,9 +394,17 @@ func (s *Server) checkJobDoneLocked(j *job) {
 		return
 	}
 	j.FinishedAt = timePtr(s.now())
+	s.markDoneLocked(j)
 	s.removeFromQueueLocked(j)
 	s.log.Info("job finished", "job", j.ID, "name", j.Spec.Name, "state", j.state())
-	s.enforceRetentionLocked()
+	s.enforceRetentionLocked(j)
+}
+
+// markDoneLocked stamps a job that just finished or was canceled with the
+// next DoneSeq, the order in which retention deletes finished jobs.
+func (s *Server) markDoneLocked(j *job) {
+	j.DoneSeq = s.nextDoneSeq
+	s.nextDoneSeq++
 }
 
 func (s *Server) removeFromQueueLocked(j *job) {
@@ -397,6 +446,7 @@ func (s *Server) cancelJobLocked(j *job) {
 	j.counts.Canceled += u
 	j.Canceled = true
 	j.FinishedAt = timePtr(wall)
+	s.markDoneLocked(j)
 	if r := s.reservation; r != nil {
 		if t := s.tasks[r.taskID]; t == nil || t.job == j {
 			s.clearReservationLocked()
@@ -404,12 +454,15 @@ func (s *Server) cancelJobLocked(j *job) {
 	}
 	s.removeFromQueueLocked(j)
 	s.dirty = true
-	s.enforceRetentionLocked()
+	s.enforceRetentionLocked(j)
 }
 
 // enforceRetentionLocked keeps at most 500 finished jobs and 200k task
-// records, deleting the oldest finished jobs (by Seq) first.
-func (s *Server) enforceRetentionLocked() {
+// records, deleting the jobs that finished first (by DoneSeq, then Seq), so
+// a long job submitted before many short ones keeps its results when it
+// finishes last. just, the job that has just finished (or nil), is never
+// deleted here.
+func (s *Server) enforceRetentionLocked(just *job) {
 	var finished []*job
 	for _, j := range s.jobs {
 		if j.state().Terminal() {
@@ -419,10 +472,23 @@ func (s *Server) enforceRetentionLocked() {
 	if len(finished) <= maxFinishedJobs && s.taskRecords <= maxTaskRecords {
 		return
 	}
-	sort.Slice(finished, func(a, b int) bool { return finished[a].Seq < finished[b].Seq })
-	for len(finished) > 0 && (len(finished) > maxFinishedJobs || s.taskRecords > maxTaskRecords) {
-		s.deleteJobLocked(finished[0])
-		finished = finished[1:]
+	sort.Slice(finished, func(a, b int) bool {
+		x, y := finished[a], finished[b]
+		if x.DoneSeq != y.DoneSeq {
+			return x.DoneSeq < y.DoneSeq // 0 (saved before DoneSeq existed) first
+		}
+		return x.Seq < y.Seq
+	})
+	left := len(finished)
+	for _, j := range finished {
+		if left <= maxFinishedJobs && s.taskRecords <= maxTaskRecords {
+			break
+		}
+		if j == just {
+			continue
+		}
+		s.deleteJobLocked(j)
+		left--
 	}
 }
 
@@ -432,7 +498,10 @@ func (s *Server) deleteJobLocked(j *job) {
 	var logs []string
 	for _, t := range j.tasks {
 		delete(s.tasks, t.ID)
-		if t.LogEnd > 0 || t.tail != nil {
+		// Any dispatched task may have a tail file, even when its last
+		// attempt wrote no output (LogEnd is reset on every dispatch). The
+		// removal goes through the io queue, after any pending tail write.
+		if t.Attempt > 0 || t.LogEnd > 0 || t.tail != nil {
 			logs = append(logs, s.logPath(t.ID))
 		}
 		t.log, t.tail = nil, nil

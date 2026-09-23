@@ -397,3 +397,95 @@ func TestRenderCacheEviction(t *testing.T) {
 		t.Fatalf("oversized entry cached (calls %d)", calls)
 	}
 }
+
+// Stopping Run answers pending claim and log long-polls at once instead of
+// letting them run into the HTTP server's 5 s shutdown timeout (and on,
+// after the final save), and nothing is dispatched after that save.
+func TestRunShutdownEndsLongPolls(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := testConfig(dir)
+	cfg.Listener = ln
+	s, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	eventually(t, "listening", func() bool { return s.Addr() != nil })
+	h := &testHive{t: t, s: s, url: "https://" + s.Addr().String(), dir: dir, hc: pinnedClient(s.Fingerprint())}
+	n := h.newNode(nil)
+	n.register()
+	h.submit(scriptJob(1, nil))
+	tk := n.claim(1)[0]
+
+	type reply struct {
+		code int
+		body []byte
+		err  error
+	}
+	send := func(method, path, bearer, body string) <-chan reply {
+		ch := make(chan reply, 1)
+		go func() {
+			req, _ := http.NewRequest(method, h.url+path, strings.NewReader(body))
+			req.Header.Set("Authorization", "Bearer "+bearer)
+			resp, err := h.hc.Do(req)
+			if err != nil {
+				ch <- reply{err: err}
+				return
+			}
+			defer resp.Body.Close()
+			b, err := io.ReadAll(resp.Body)
+			ch <- reply{resp.StatusCode, b, err}
+		}()
+		return ch
+	}
+	claim := send("POST", "/api/v1/claim", n.token, `{"claim_id":"lp","free":{"cores":4,"mem_mb":4096,"disk_mb":10000},"max":1,"wait_s":25}`)
+	logPoll := send("GET", "/api/v1/admin/tasks/"+tk.ID+"/log?offset=0&wait_s=25", testAdmin, "")
+	eventually(t, "long-polls in flight", func() bool {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.nodes[n.req.NodeID].claims == 1 && s.tasks[tk.ID].log != nil
+	})
+
+	start := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return")
+	}
+	if el := time.Since(start); el > 3*time.Second {
+		t.Fatalf("Run took %v to stop with long-polls pending", el)
+	}
+	var cr proto.ClaimResponse
+	if r := <-claim; r.err != nil || r.code != 200 || json.Unmarshal(r.body, &cr) != nil || len(cr.Tasks) != 0 {
+		t.Fatalf("claim during shutdown: %+v", r)
+	}
+	if r := <-logPoll; r.err != nil || r.code != 200 {
+		t.Fatalf("log poll during shutdown: %+v", r)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "state.json")); err != nil {
+		t.Fatal("state not saved on shutdown")
+	}
+	// A long-poll woken after the final save must not assign anything.
+	s.mu.Lock()
+	j := &job{jobRecord: jobRecord{ID: "jlate", Seq: s.nextSeq, Spec: scriptJob(1, nil)}}
+	j.counts.Pending = 1
+	s.jobs[j.ID] = j
+	s.queue = append(s.queue, j)
+	got := s.dispatchLocked(s.nodes[n.req.NodeID], n.req.Total, 1, time.Now())
+	s.mu.Unlock()
+	if len(got) != 0 {
+		t.Fatalf("dispatched after the final save: %+v", got)
+	}
+}

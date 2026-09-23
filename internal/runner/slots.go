@@ -67,3 +67,16 @@ func (p *slotPool) free() int {
 	}
 	return n
 }
+
+// usable counts the slots that are not retired.
+func (p *slotPool) usable() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for i := range p.retired {
+		if !p.retired[i] {
+			n++
+		}
+	}
+	return n
+}
