@@ -44,6 +44,12 @@ endings are fine. The most important keys:
 Every setting is explained in the file itself. Changes take effect at the
 next boot.
 
+Some sticks are made with settings built in (savior.conf then says so at
+the top). Commenting out or deleting such a line does not switch it off:
+the built-in value stays. Set another value instead, for example
+"console_shell = no", or "ssh_key =" with nothing after the = to remove
+built-in SSH keys.
+
 
 BOOTING FROM THE STICK
 ----------------------

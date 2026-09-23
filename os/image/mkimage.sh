@@ -17,11 +17,22 @@
 #              [--name savior] [--version V] [--formats img,iso,netboot]
 #              [--conf FILE] [--grub-lib /usr/lib/grub] [--fat-mb N]
 #              [--cmdline "extra kernel args"] [--timeout SECONDS]
+#              [--ipxe auto|none|UNDIONLY.KPXE]
 #
 #   --conf FILE   copied to the stick as savior.conf (for editing) and baked
 #                 into boot/savior-conf.cpio (/etc/savior/baked.conf, mode
 #                 0600), which every USB/ISO menu entry loads as a second
 #                 initrd. The netboot tree never gets it (TFTP is public).
+#                 The baked values stay in force when a line of the stick's
+#                 savior.conf is commented out or deleted; only another
+#                 value there overrides them (the stick copy says so on top).
+#   --ipxe F      iPXE's undionly.kpxe for BIOS PXE clients of a hive in
+#                 proxy DHCP mode (the default: GRUB's core.0 cannot boot
+#                 from a plain PXE ROM there; S65netboot chains it through
+#                 iPXE). Goes to /boot/netboot/boot/ipxe/ on the media and
+#                 boot/ipxe/ in the netboot tree. auto (default): the
+#                 host's /usr/lib/ipxe/undionly.kpxe (Debian/Ubuntu package
+#                 ipxe) or /usr/share/ipxe/undionly.kpxe when present.
 #
 # Each medium gets its own grub.cfg: savior.media=UUID=XXXX-XXXX (the FAT
 # volume serial) on the stick, savior.media=UUID=<ISO volume UUID> on the
@@ -32,7 +43,7 @@
 # optionally i386-efi), mkfs.fat, mtools (mcopy, mmd), cpio (--conf), dd,
 # grub-mknetdir (netboot images), and xorriso for the ISO. On Debian/Ubuntu:
 #   apt install grub-common grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
-#               dosfstools mtools xorriso cpio
+#               dosfstools mtools xorriso cpio ipxe
 # COMMON_MODS is word-split on purpose; single-quoted GRUB variables are literal.
 # shellcheck disable=SC2086,SC2016
 set -eu
@@ -50,6 +61,7 @@ FAT_MB=""
 EXTRA_CMDLINE=""
 TIMEOUT=5
 PAYLOADS=""
+IPXE=auto
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -63,6 +75,7 @@ while [ $# -gt 0 ]; do
 	--cmdline) EXTRA_CMDLINE="$2"; shift 2 ;;
 	--timeout) TIMEOUT="$2"; shift 2 ;;
 	--payload) PAYLOADS="$PAYLOADS $2"; shift 2 ;;
+	--ipxe) IPXE="$2"; shift 2 ;;
 	-h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" | sed '/^shellcheck /d'; exit 0 ;;
 	*) die "unknown argument: $1" ;;
 	esac
@@ -85,6 +98,19 @@ need mmd "mtools"
 HAVE_IA32=no
 [ -d "$GRUB_LIB/i386-efi" ] && HAVE_IA32=yes
 [ -z "$CONF" ] || need cpio "cpio"
+case "$IPXE" in
+auto)
+	IPXE=""
+	for f in /usr/lib/ipxe/undionly.kpxe /usr/share/ipxe/undionly.kpxe; do
+		if [ -s "$f" ]; then
+			IPXE=$f
+			break
+		fi
+	done
+	;;
+none) IPXE="" ;;
+*) [ -s "$IPXE" ] || die "--ipxe: $IPXE not found (iPXE's undionly.kpxe, e.g. from the ipxe package)" ;;
+esac
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$OUT"
@@ -265,7 +291,20 @@ EOF
 # savior.conf, README and the firmware folder on the stick
 
 if [ -n "$CONF" ]; then
-	cp "$CONF" "$STAGE/savior.conf"
+	# The baked copy (precedence 3, DESIGN 5.1) sits below this file (4):
+	# say so, or an operator comments out a line to undo it and keeps
+	# the old value (e.g. an ssh_key or console_shell = yes).
+	{
+		cat <<'EOF'
+# This stick was made with the settings below BUILT IN (boot/savior-conf.cpio);
+# they apply even when this file is missing. Commenting out or deleting a
+# line here does NOT undo a built-in setting: set another value here
+# instead, e.g. "console_shell = no", or "ssh_key =" with nothing after the
+# = to remove the built-in SSH keys. Values here override the built-in ones.
+
+EOF
+		cat "$CONF"
+	} >"$STAGE/savior.conf"
 elif [ -f "$HERE/savior.conf.template" ]; then
 	cp "$HERE/savior.conf.template" "$STAGE/savior.conf"
 else
@@ -323,6 +362,15 @@ if command -v grub-mknetdir >/dev/null 2>&1; then
 	for plat in i386-pc x86_64-efi i386-efi; do
 		[ -d "$NETGRUB/boot/grub/$plat" ] && cp -R "$NETGRUB/boot/grub/$plat" "$STAGE/boot/netboot/boot/grub/"
 	done
+	# iPXE for BIOS PXE clients of a hive in proxy DHCP mode (S65netboot).
+	if [ -n "$IPXE" ]; then
+		mkdir -p "$NETGRUB/boot/ipxe" "$STAGE/boot/netboot/boot/ipxe"
+		cp "$IPXE" "$NETGRUB/boot/ipxe/undionly.kpxe"
+		cp "$IPXE" "$STAGE/boot/netboot/boot/ipxe/undionly.kpxe"
+		log "iPXE for BIOS netboot behind proxy DHCP: $IPXE"
+	else
+		log "warning: no iPXE undionly.kpxe (apt install ipxe, or --ipxe FILE): a hive booted from these media PXE-boots BIOS machines only with dhcp_server = yes"
+	fi
 else
 	log "warning: grub-mknetdir not found: no netboot tree, and a hive booted from these media cannot serve PXE"
 fi
@@ -407,6 +455,9 @@ build_iso() {
 	mkfs.fat -C "$isostage/efi.img" "$efi_kb" >/dev/null
 	MTOOLS_SKIP_CHECK=1 mcopy -s -Q -i "$isostage/efi.img" "$STAGE/EFI" ::/
 	# Same layout grub-mkrescue produces: hybrid MBR for USB, GPT EFI partition.
+	# --mbr-force-bootable adds an active (0x80) MBR entry next to the 0xEE
+	# one, as Ubuntu's and Arch's ISOs have: some BIOSes boot a USB disk only
+	# when its MBR has an active partition.
 	# --modification-date sets the volume UUID that savior.media= names.
 	xorriso -as mkisofs -quiet -o "$iso" -V SAVIOR -r -J \
 		--modification-date="$ISO_DATE" \
@@ -414,9 +465,12 @@ build_iso() {
 		-boot-info-table --grub2-boot-info \
 		--grub2-mbr "$GRUB_LIB/i386-pc/boot_hybrid.img" \
 		--efi-boot efi.img -efi-boot-part --efi-boot-image \
-		--protective-msdos-label \
+		--protective-msdos-label --mbr-force-bootable \
 		"$isostage" >"$WORK/xorriso.log" 2>&1 || { cat "$WORK/xorriso.log" >&2; die "xorriso failed"; }
 	rm -rf "$isostage"
+	xorriso -indev "$iso" -report_system_area plain 2>/dev/null |
+		grep -q -E '^MBR partition +: +[0-9]+ +0x80 ' ||
+		die "$iso has no active MBR partition (strict BIOSes would not boot it from USB)"
 	log "wrote $iso ($(du -h "$iso" | cut -f1))"
 }
 
@@ -427,6 +481,7 @@ build_netboot() {
 	rm -rf "$nb"
 	mkdir -p "$nb/boot"
 	cp -R "$NETGRUB/boot/grub" "$nb/boot/"
+	[ ! -d "$NETGRUB/boot/ipxe" ] || cp -R "$NETGRUB/boot/ipxe" "$nb/boot/"
 	# Only the payloads: never the marker, the stick's netboot copy or the
 	# baked config (it may hold the swarm key; TFTP has no access control).
 	for a in $ARCHES; do
@@ -441,6 +496,11 @@ Serve this directory over TFTP (or HTTP). PXE boot files:
   BIOS:        boot/grub/i386-pc/core.0
   UEFI 64-bit: boot/grub/x86_64-efi/core.efi
   UEFI 32-bit: boot/grub/i386-efi/core.efi
+BIOS core.0 takes its TFTP server only from the DHCP server's own reply
+(next-server or option 66); it never sees a proxy DHCP server's reply. Behind
+a proxy DHCP server, give BIOS PXE ROMs iPXE (boot/ipxe/undionly.kpxe, when
+present) and iPXE a script that runs "set netX/next-server <this server>"
+and "chain tftp://<this server>/boot/grub/i386-pc/core.0".
 Netbooted nodes have no stick to read savior.conf from: put savior.<key>=<value>
 settings into savior_cmdline in boot/grub/grub.cfg, ideally
 savior.hive=<address> savior.hive_fingerprint=sha256:... savior.join=keyless
