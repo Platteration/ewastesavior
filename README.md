@@ -72,7 +72,7 @@ pipeline and boot process.
 6. **Put them to work:**
    ```sh
    savior ctl login --hive https://192.168.1.20:7700
-   savior ctl run --count 20 --output 'frame-*.png' --wait --fetch out/ -- render.sh {{index}}
+   savior ctl run --count 20 --input render.sh --output 'frame-*.png' --fetch out/ -- ./render.sh {{index}}
    savior ctl display lobby-screen text --text "Welcome!"
    savior ctl wall create --name lobby --rows 1 --cols 3 --nodes a,b,c --image panorama.jpg
    ```
