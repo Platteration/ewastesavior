@@ -3,6 +3,7 @@ package ctl
 import (
 	"bytes"
 	"context"
+	"debug/elf"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -88,7 +90,7 @@ func (jf *jobFlags) register(f *flags) {
 	f.IntVar(&jf.disk, "disk", 0, "scratch disk per task in MB (default 64)")
 	f.Var(&jf.timeout, "timeout", "task time limit: seconds or a duration like 2h (default 1h)")
 	f.Var(&jf.retries, "retries", "retries after a failed attempt (default 1)")
-	f.StringVar(&jf.arch, "arch", "", "allowed architectures, e.g. amd64,386")
+	f.StringVar(&jf.arch, "arch", "", "allowed architectures, e.g. amd64,386 (default: those of ELF programs among the inputs; any = no limit)")
 	f.StringVar(&jf.cpuFlags, "cpu-flags", "", "required CPU flags, e.g. sse2,avx")
 	f.IntVar(&jf.minMem, "min-mem", 0, "only nodes with at least this much RAM (MB)")
 	f.Var(&jf.labels, "label", "only nodes with label k=v (repeatable)")
@@ -134,8 +136,12 @@ func (a *app) buildJob(jf *jobFlags, command []string, script string) (proto.Job
 		r := jf.retries.v
 		spec.Retries = &r
 	}
+	arch := splitList(jf.arch)
+	if len(arch) == 1 && arch[0] == "any" {
+		arch = nil
+	}
 	spec.Requirements = proto.Requirements{
-		Arch:      splitList(jf.arch),
+		Arch:      arch,
 		CPUFlags:  splitList(jf.cpuFlags),
 		MinMemMB:  jf.minMem,
 		Isolation: jf.isolation,
@@ -196,6 +202,20 @@ func (a *app) buildJob(jf *jobFlags, command []string, script string) (proto.Job
 		spec.Inputs = append(spec.Inputs, proto.Input{Name: name, Blob: sha, Executable: exec})
 		locals = append(locals, localInput{file: file, sha: sha, size: size})
 		localBytes += size
+	}
+	if jf.arch == "" {
+		// Programs shipped as inputs only run on their own architecture
+		// (SaviorOS's 64-bit kernel has no 32-bit emulation).
+		for _, l := range locals {
+			if ar := elfArch(l.file); ar != "" && !slices.Contains(spec.Requirements.Arch, ar) {
+				spec.Requirements.Arch = append(spec.Requirements.Arch, ar)
+			}
+		}
+		if len(spec.Requirements.Arch) > 0 {
+			sort.Strings(spec.Requirements.Arch)
+			fmt.Fprintf(a.stderr, "note: the inputs contain %s programs, so tasks run only on %s nodes (--arch any overrides)\n",
+				strings.Join(spec.Requirements.Arch, " and "), strings.Join(spec.Requirements.Arch, " or "))
+		}
 	}
 	for _, s := range jf.inputURLs {
 		in, err := parseInputURL(s)
@@ -272,6 +292,33 @@ func hashLocalFile(name string) (string, int64, bool, error) {
 		return "", 0, false, fmt.Errorf("--input %s: %w", name, err)
 	}
 	return sha, size, st.Mode().Perm()&0o111 != 0, nil
+}
+
+// elfArch returns the GOARCH name of the machine an ELF program or shared
+// library is built for, or "" when name is not one (or is for a machine
+// without a name here).
+func elfArch(name string) string {
+	f, err := elf.Open(name)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	if f.Type != elf.ET_EXEC && f.Type != elf.ET_DYN {
+		return ""
+	}
+	switch {
+	case f.Machine == elf.EM_X86_64 && f.Class == elf.ELFCLASS64:
+		return "amd64"
+	case f.Machine == elf.EM_386:
+		return "386"
+	case f.Machine == elf.EM_AARCH64:
+		return "arm64"
+	case f.Machine == elf.EM_ARM:
+		return "arm"
+	case f.Machine == elf.EM_RISCV && f.Class == elf.ELFCLASS64:
+		return "riscv64"
+	}
+	return ""
 }
 
 // parseInputURL parses URL:SHA256:SIZE:NAME (the URL may contain colons).

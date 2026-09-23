@@ -335,19 +335,26 @@ Normative for `runner` when the agent runs as root on Linux:
 
 1. The runner creates the task cgroup and starts `savior sandbox-exec` with
    `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC|CLONE_NEWUTS` (and `CLONE_NEWNET`
-   unless `network=true`) and `Pdeathsig=SIGKILL`. It uses `CgroupFD`/`UseCgroupFD`
+   unless `network=true`), `Pdeathsig=SIGKILL` and `Setsid` (its own
+   session, so no controlling terminal; pgid = pid for group kills and
+   SIGSTOP). The shim locks itself to one OS thread before anything else and
+   marks the status pipe close-on-exec. It uses `CgroupFD`/`UseCgroupFD`
    when available; otherwise the shim writes its own pid to `<cgroup>/cgroup.procs`
    as its very first action, before anything else runs.
 2. The shim (still root, inside the namespaces) makes `/` recursively private
-   (`MS_REC|MS_PRIVATE`), then builds a new root on a small tmpfs:
+   (`MS_REC|MS_PRIVATE`), then builds a new root on a small tmpfs mounted on
+   `<WorkRoot>/.sandbox-root` (root 0700, created by the runner; a task dir
+   can never have that name):
    * read-only, nosuid, nodev bind mounts of `/bin`, `/sbin`, `/usr`, `/lib` (and `/lib64`, `/lib32` if present);
    * `/etc` (tmpfs, then read-only) with only `passwd`, `group`, `hosts`, `nsswitch.conf`, `ssl/certs` (bind) and, when `network=true`, `resolv.conf`;
    * `/work`: the task workdir, bind rw, nosuid, nodev (cwd and HOME);
    * `/tmp`: tmpfs, `size=64m`, nosuid, nodev;
    * `/proc`: fresh procfs (`hidepid=2` where supported), with `cmdline`,
      `kcore`, `keys`, `kmsg`, `sysrq-trigger`, `timer_list`, `sched_debug` and `config.gz`
-     masked by bind-mounting `/dev/null` over them; `sys`, `irq` and `bus` remounted read-only;
-   * `/dev`: tmpfs with `null`, `zero`, `full`, `random`, `urandom` and `tty` bind-mounted, plus `devpts` (newinstance) and `ptmx`, `shm` as tmpfs;
+     masked by bind-mounting `/dev/null` over them; `sys`, `irq` and `bus`
+     bind-mounted onto themselves and remounted read-only, nosuid, nodev,
+     noexec (a failure is fatal in `strict` mode);
+   * `/dev`: tmpfs with `null`, `zero`, `full`, `random` and `urandom` bind-mounted, plus `devpts` (newinstance) and `ptmx`, `shm` as tmpfs (no `tty`);
    * no `/sys`, `/media`, `/run`, `/var`, `/root`.
    It then runs `pivot_root`, detaches the old root and `chdir /work`.
 3. Brings `lo` up in a new network namespace.
@@ -357,8 +364,11 @@ Normative for `runner` when the agent runs as root on Linux:
 5. Drops privileges in order: `setgroups([])`, `setresgid(g,g,g)`,
    `setresuid(u,u,u)` with u = g = `10000 + slot` (a per-concurrency-slot uid),
    then verifies with `getresuid`. It clears ambient and bounding
-   capabilities, sets `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE 0`.
-6. Installs a seccomp-BPF filter (`golang.org/x/sys/unix`). It checks
+   capabilities, sets `PR_SET_NO_NEW_PRIVS` and `PR_SET_DUMPABLE 0`, sets
+   `PR_SET_PDEATHSIG` again (the uid change clears it) and exits if the
+   runner is already gone (the status pipe has no reader).
+6. Installs a seccomp-BPF filter (`golang.org/x/sys/unix`) with
+   `SECCOMP_FILTER_FLAG_TSYNC` (prctl fallback on old kernels). It checks
    `seccomp_data.arch` (AUDIT_ARCH_X86_64 or I386 as native; on x86_64 kills
    i386-compat and x32 syscalls), returns ENOSYS for `clone3`, and EPERM for
    `unshare, setns, mount, umount2, pivot_root, chroot, fsopen, fsconfig,
@@ -370,7 +380,12 @@ Normative for `runner` when the agent runs as root on Linux:
    clock_settime, adjtimex, clock_adjtime, iopl, ioperm, ptrace,
    process_vm_readv, process_vm_writev, quotactl, lookup_dcookie, vhangup,
    syslog` and `clone` with any `CLONE_NEW*` flag.
-7. `execve` of the command.
+7. `execve` of the command. A command that isn't found exits 127 and one
+   that can't be executed (permissions, wrong architecture) exits 126, like a
+   shell: ErrorKind `exit`, which uses up an attempt. Any failure before
+   this step writes a reason to the status pipe and exits 125, and only that
+   combination is ErrorKind `sandbox`. Since the pipe is close-on-exec, the
+   task can't forge it.
 
 `sandbox=none` skips steps 1-3 and 6, but when root it still does 4, 5 and
 `no_new_privs`. The node reports its effective `Sandbox` and `SandboxCaps`
@@ -501,12 +516,14 @@ reports them in `HiveInfo.Warnings` ("another hive with this swarm key at …").
 
 A node claims when not draining/paused/pending and free cores ≥ 0.1. The
 hive computes free = min(req.Free, Total − Allocated) and, for each job in
-queue order, dispatches tasks that fit (`Resources.Fits(need, ScratchInRAM)`)
-and whose requirements match. Requirements are:
+queue order, dispatches tasks that fit (`Resources.Fits(need, ScratchInRAM)`, and with
+disk scratch also `need.disk_mb ≤ free.disk_mb`) and whose requirements
+match. Requirements are:
 * `arch` (any of), `min_mem_mb` (node inventory total) and `cpu_flags` (all);
 * `labels` (all equal, effective labels) and `nodes` (IDs);
 * isolation: `full` needs `FullIsolation`;
-* not in the task's `FailedNodes` unless no other online eligible node exists.
+* not in the task's `FailedNodes` unless no other online eligible node exists;
+* never a requeued task the node still holds (lists or has not reported).
 It dispatches at most `max` tasks. Every dispatch gets a new lease, `Attempt++`,
 and a history entry. Before committing (including after a long-poll wakeup),
 the hive re-checks under the mutex that the node is still online/eligible and
@@ -540,10 +557,15 @@ requirements together) gets `JobView.Warning`. It stays queued, since nodes may 
 * Hard cap: a task fails with "too many interruptions" when
   `Attempt ≥ 1 + retries + MaxInterruptions`.
 * **Quarantine:** a node is quarantined (no tasks, `NodeView.Quarantine`
-  reason) until `NodePatch.ClearQuarantine` when, within 10 minutes, it has
-  ≥ 3 node errors, or ≥ 5 distinct tasks failed on it within 10 s of starting
-  *and then succeeded on another node*. The second rule needs evidence against
-  the machine: a job that fails fast everywhere must not quarantine the swarm.
+  reason) until `NodePatch.ClearQuarantine` when, within 10 minutes, ≥ 3
+  tasks got a node error on it, or ≥ 5 distinct tasks failed on it within
+  10 s of starting, *and those tasks then succeeded on another node*. Both
+  rules need evidence against the machine: a job that fails everywhere (a
+  missing input URL, a broken command) must not quarantine the swarm. The
+  evidence is kept in memory only; a hive restart forgets it.
+* **Usage bounds:** reported `run_s` is capped at `max(timeout_s,1) × 10 +
+  3600` and `cpu_seconds` at `run_s × cores × 1.1 + 1`; negative or NaN
+  values become 0.
 * **Job state:** `queued` (nothing dispatched), `running`, `succeeded` (all
   succeeded), `failed` (all terminal, ≥1 failed), `canceled`.
 
@@ -594,7 +616,9 @@ requirements together) gets `JobView.Warning`. It stays queued, since nodes may 
   (monotonic time). GC removes only unreferenced, untouched blobs. `DELETE`
   of a referenced blob is 409. `BlobInfo.LastTouched` is updated on PUT/GET.
 * **Retention:** at most 500 finished jobs and at most 200k task records.
-  The oldest finished jobs (by Seq) are deleted first.
+  Finished jobs are deleted in the order they finished (`DoneSeq`, a
+  persisted counter, then `Seq`). The job that just finished is never the
+  one deleted. Deleting a job removes the logs of every task that ran.
 
 ### 8.6 Hive restart
 
@@ -725,7 +749,12 @@ when it starts, and reboot or poweroff are acked in a heartbeat before being
 executed. Each action ID runs at most once per agent process.
 
 At start, before registering, the agent kills and removes any leftover
-`<CgroupRoot>/task-*` cgroups (`cgroup.kill`) and wipes `<WorkRoot>/*`. It
+`<CgroupRoot>/task-*` cgroups (`cgroup.kill`), SIGKILLs every process whose
+real, effective or saved uid is a slot uid (via pidfd, bounded at 5 s) and
+wipes `<WorkRoot>/*`. The claim loop never asks for more tasks than the
+runner has free slots. Power pause and preempt are level-triggered: they
+are applied to every running task on every tick while they hold. On
+shutdown all tasks share one 10 s grace period. It
 writes `/run/savior/status.json` (0644, atomic) every heartbeat for `savior console`.
 
 ### 10.6 Link state and console
@@ -921,8 +950,13 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
    `HOME=/work`, `TMPDIR=/tmp`, `LANG=C.UTF-8`, the `SAVIOR_*` vars and the spec's `env`.
 6. Stream combined output to `logs`. Enforce `timeout_s` on unfrozen time
    (`Freeze` stops the clock), then `cgroup.kill` and wait for
-   `cgroup.events populated 0`.
-7. Collect outputs (8.5), upload them (phase `uploading`), and record
+   `cgroup.events populated 0`. The output pipes get 2 s to drain after that.
+   Without a cgroup, a process that left the group and still holds them is
+   killed by its slot uid, and the slot is retired only if that fails. A
+   preempt that arrives before the process starts means it never starts.
+   A task killed by a signal failed with exit code 128 + signal.
+7. Collect outputs (8.5) only from a task that ran to its end (not canceled,
+   preempted or failed in setup), upload them (phase `uploading`), and record
    `cpu.stat usage_usec` and `memory.peak`.
 8. Clean up: unmount and remove the workdir and remove the cgroup.
 

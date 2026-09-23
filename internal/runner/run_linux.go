@@ -155,15 +155,10 @@ func (r *Runner) run(ctx context.Context, t proto.Task, logs io.Writer, progress
 
 	rep := r.execute(ctx, tk, ts, env, argv, logs)
 	rep.Lease = t.Lease
-	if tk.leaked {
-		retire = true
-	}
-	if rep.State == proto.TaskFailed && (rep.ErrorKind == proto.ErrSandbox || rep.ErrorKind == proto.ErrInternal) {
-		// The uid may still own live processes we could not account for.
-		if tk.cg == nil && plan.dropPriv {
-			retire = true
-		}
-	}
+	// A sandbox or internal failure means the command never ran: the shim
+	// reports those only before execve (its status pipe is close-on-exec),
+	// so the slot uid owns nothing and stays in use.
+	retire = tk.leaked
 	return rep
 }
 

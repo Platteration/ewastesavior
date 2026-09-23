@@ -134,7 +134,13 @@ savior ctl cancel <job-id>
 
 **Placement:** `--arch amd64` (or `386`), `--label room=lab`, `--node lab-3`,
 `--min-mem 1024` and `--cpu-flags sse2` restrict where tasks run. A task that
-fits no node waits and shows a warning.
+fits no node waits and shows a warning. When you ship programs with
+`--input`, `ctl` reads their ELF headers and limits the job to their
+architecture: a 64-bit SaviorOS node can't run 32-bit programs, and a 32-bit
+machine can't run 64-bit ones. To run on both, ship both builds and pick one
+in a script by `uname -m`; `--arch any` turns the automatic limit off. A
+command that isn't found exits with 127, and one that can't run on the
+machine exits with 126. Both count as a failed attempt.
 
 **Retries:** failed tasks are retried (`--retries`, default 1). If a machine
 disappears, is unplugged or overheats, its tasks move to another node without

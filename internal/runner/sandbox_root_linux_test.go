@@ -384,3 +384,40 @@ func waitGone(pid int, timeout time.Duration) bool {
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestExecFailureIsTheCommands runs commands that can't be executed through
+// the real shim with dropped privileges. They fail like a shell reports it
+// (127 not found, 126 not executable), use up an attempt, and leave every
+// slot usable.
+func TestExecFailureIsTheCommands(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to drop privileges")
+	}
+	r := newTestRunner(t, ModeAuto, nil)
+	if !r.caps[CapMountNS] || !r.caps[CapPidNS] {
+		t.Skip("namespaces unavailable")
+	}
+	cases := []struct {
+		cmd  []string
+		code int
+	}{
+		{[]string{"no-such-command-savior"}, 127},
+		{[]string{"/no/such/dir/prog"}, 127},
+		{[]string{"/etc/passwd"}, 126}, // not executable
+		{[]string{"/work"}, 126},       // a directory
+	}
+	for i, c := range cases {
+		task := scriptTask(fmt.Sprintf("texecfail%d", i), "")
+		task.Kind, task.Script, task.Command = proto.KindExec, "", c.cmd
+		rep, logs := runTask(t, r, task)
+		if rep.State != proto.TaskFailed || rep.ErrorKind != proto.ErrExit || rep.ExitCode != c.code {
+			t.Errorf("%v: got %s/%s exit %d err %q, want failed/exit %d", c.cmd, rep.State, rep.ErrorKind, rep.ExitCode, rep.Error, c.code)
+		}
+		if !strings.Contains(logs, c.cmd[0]) {
+			t.Errorf("%v: log doesn't name the command: %q", c.cmd, logs)
+		}
+	}
+	if got := r.UsableSlots(); got != r.cfg.Slots {
+		t.Errorf("%d of %d slots usable after exec failures (retired?)", got, r.cfg.Slots)
+	}
+}

@@ -61,6 +61,11 @@ func SandboxExecMain(args []string) int {
 		}
 	}
 	if err := runShim(a); err != nil {
+		var ee execError
+		if errors.As(err, &ee) {
+			fmt.Fprintln(os.Stderr, "savior: "+ee.msg)
+			return ee.code
+		}
 		return shimFail(err.Error())
 	}
 	return shimFail("execve returned without an error") // unreachable on success
@@ -262,14 +267,33 @@ func installSeccomp() error {
 	return err
 }
 
+// execError is an execve failure that is the command's own fault. The shim
+// exits with the shell's code for it (127 not found, 126 not executable)
+// instead of the sandbox failure code, so the task fails like any other
+// non-zero exit and uses up an attempt.
+type execError struct {
+	code int
+	msg  string
+}
+
+func (e execError) Error() string { return e.msg }
+
 // execCommand resolves the command against the task PATH and execve's it
 // with the minimal environment (DESIGN 12 step 5).
 func execCommand(a shimArgs) error {
 	path, ok := lookPath(a.cmd[0], getenv(a.env, "PATH"))
 	if !ok {
-		return fmt.Errorf("command not found: %s", a.cmd[0])
+		return execError{127, "command not found: " + a.cmd[0]}
 	}
 	if err := syscall.Exec(path, a.cmd, a.env); err != nil {
+		switch err {
+		case syscall.ENOENT, syscall.ENOTDIR, syscall.ELOOP, syscall.ENAMETOOLONG:
+			// Also a missing #! interpreter.
+			return execError{127, fmt.Sprintf("%s: %v", a.cmd[0], err)}
+		case syscall.EACCES, syscall.ENOEXEC, syscall.EISDIR, syscall.ETXTBSY:
+			// ENOEXEC: not a program for this machine (wrong architecture).
+			return execError{126, fmt.Sprintf("%s: %v", a.cmd[0], err)}
+		}
 		return fmt.Errorf("execve %s: %w", path, err)
 	}
 	return nil

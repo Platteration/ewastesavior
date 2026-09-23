@@ -2,6 +2,8 @@ package ctl
 
 import (
 	"bytes"
+	"debug/elf"
+	"encoding/binary"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -283,5 +285,58 @@ func TestJobsTasksAndCancel(t *testing.T) {
 	}
 	if code, _, stderr := e.run("job", "../../nodes"); code != 1 || !strings.Contains(stderr, "invalid job") {
 		t.Errorf("path-like job id: %d %s", code, stderr)
+	}
+}
+
+// elfHeader returns a minimal ELF header for the given class and machine.
+func elfHeader(class elf.Class, machine elf.Machine) []byte {
+	var b bytes.Buffer
+	b.Write([]byte{0x7f, 'E', 'L', 'F', byte(class), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)})
+	b.Write(make([]byte, 9))
+	le := binary.LittleEndian
+	b.Write(le.AppendUint16(nil, uint16(elf.ET_EXEC)))
+	b.Write(le.AppendUint16(nil, uint16(machine)))
+	b.Write(le.AppendUint32(nil, uint32(elf.EV_CURRENT)))
+	if class == elf.ELFCLASS64 {
+		b.Write(make([]byte, 8*3+4))                    // entry, phoff, shoff, flags
+		b.Write(le.AppendUint16(nil, 64))               // ehsize
+		b.Write([]byte{56, 0, 0, 0, 64, 0, 0, 0, 0, 0}) // phentsize, phnum, shentsize, shnum, shstrndx
+	} else {
+		b.Write(make([]byte, 4*3+4))
+		b.Write(le.AppendUint16(nil, 52))
+		b.Write([]byte{32, 0, 0, 0, 40, 0, 0, 0, 0, 0})
+	}
+	return b.Bytes()
+}
+
+func TestRunArchFromELFInputs(t *testing.T) {
+	h := newFakeHive(t)
+	e := loggedIn(t, h)
+	dir := t.TempDir()
+	amd64 := writeFile(t, filepath.Join(dir, "render"), elfHeader(elf.ELFCLASS64, elf.EM_X86_64), 0o755)
+	i386 := writeFile(t, filepath.Join(dir, "render32"), elfHeader(elf.ELFCLASS32, elf.EM_386), 0o755)
+	data := writeFile(t, filepath.Join(dir, "scene.dat"), []byte("\x7fELF but not really"), 0o644)
+	for _, c := range []struct {
+		args []string
+		want []string
+		note bool
+	}{
+		{[]string{"--input", amd64, "--input", data, "--", "./render"}, []string{"amd64"}, true},
+		{[]string{"--input", i386, "--input", amd64, "--", "sh", "-c", "true"}, []string{"386", "amd64"}, true},
+		{[]string{"--input", data, "--", "cat", "scene.dat"}, nil, false},
+		{[]string{"--arch", "386", "--input", amd64, "--", "./render"}, []string{"386"}, false},
+		{[]string{"--arch", "any", "--input", amd64, "--", "./render"}, nil, false},
+	} {
+		n := len(h.submitted)
+		code, _, stderr := e.run(append([]string{"run"}, c.args...)...)
+		if code != 0 || len(h.submitted) != n+1 {
+			t.Fatalf("%v: code %d stderr %s", c.args, code, stderr)
+		}
+		if got := h.submitted[n].Requirements.Arch; !reflect.DeepEqual(got, c.want) {
+			t.Errorf("%v: arch %v, want %v", c.args, got, c.want)
+		}
+		if strings.Contains(stderr, "note: the inputs contain") != c.note {
+			t.Errorf("%v: note shown = %v, want %v (stderr %q)", c.args, !c.note, c.note, stderr)
+		}
 	}
 }
