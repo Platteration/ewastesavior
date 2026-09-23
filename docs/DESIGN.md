@@ -178,7 +178,7 @@ and repeated lines within one source append.
 | `net` | str | `dhcp` | `dhcp`, `static`, `off`. With `dhcp` and no lease after 30 s, IPv4 link-local (169.254/16) is used if the image has `zcip`. |
 | `ip`, `gateway`, `dns` | | | Static addressing (`ip` in CIDR). |
 | `wifi_ssid`, `wifi_psk`, `wifi_country` | | "", "", `US` | Wi-Fi (WPA2-PSK or open). |
-| `dhcp_server` | bool | no | Serve DHCP on the first wired interface (needs `net=static`). With `netboot=yes` dnsmasq does DHCP+PXE instead. |
+| `dhcp_server` | bool | no | Serve DHCP on the first wired interface (needs `net=static` and `ip`). With `netboot=yes` dnsmasq does DHCP+PXE instead; without a static `ip` the hive answers only as a proxy DHCP server and says so on the console. |
 | `dhcp_range` | str | "" | `first-last`; empty = .100-.200 of the static subnet. |
 | `netboot` | bool | no | Serve PXE boot (hive role). |
 | `ntp` | list | `pool.ntp.org` | NTP servers or `off`. |
@@ -337,8 +337,9 @@ Normative for `runner` when the agent runs as root on Linux:
    `CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWIPC|CLONE_NEWUTS` (and `CLONE_NEWNET`
    unless `network=true`), `Pdeathsig=SIGKILL` and `Setsid` (its own
    session, so no controlling terminal; pgid = pid for group kills and
-   SIGSTOP). The shim locks itself to one OS thread before anything else and
-   marks the status pipe close-on-exec. It uses `CgroupFD`/`UseCgroupFD`
+   SIGSTOP). The shim locks itself to one OS thread before anything else,
+   marks the status pipe close-on-exec and sets umask 022 (the agent runs
+   with 077, which would make the generated `/etc` unreadable to the task). It uses `CgroupFD`/`UseCgroupFD`
    when available; otherwise the shim writes its own pid to `<cgroup>/cgroup.procs`
    as its very first action, before anything else runs.
 2. The shim (still root, inside the namespaces) makes `/` recursively private
@@ -441,7 +442,7 @@ or bearer) or the admin token (bearer).
 | `POST pair` | → `PairCode` (admin only; the hive screen shows one too) |
 | `GET info` | → `HiveInfo` (includes `X-Savior-Client-Time` handling, 10.2) |
 | `GET node-config?hive=<addr>\|auto` | → `text/plain` savior.conf with `swarm_key`, `hive_fingerprint`, `hive` (default: the Host the request came in on) |
-| `GET nodes` / `GET nodes/{ref}` | → `[]NodeView` / `NodeView` (`ref` = ID or name) |
+| `GET nodes` / `GET nodes/{ref}` | → `[]NodeView` / `NodeView` (`ref` = ID, name, or a 3-character short code in any case that matches exactly one node; an ambiguous short code gives 409, or 400 in a wall cell) |
 | `PATCH nodes/{ref}` | `NodePatch` → `NodeView` (409 for duplicate names, display of wall members, mode=wall) |
 | `DELETE nodes/{ref}` | → `{}` (offline only) |
 | `POST nodes/{ref}/action` | `NodeAction` → `{}` |
@@ -977,9 +978,13 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
   with `netboot=yes`).
 * **`savior.iso`:** El Torito BIOS (`i386-pc-eltorito`) + UEFI (`efi.img` with
   both EFI loaders). It has a hybrid MBR and a GPT EFI partition, so it also
-  boots when written to a USB stick. Volume ID `SAVIOR`.
+  boots when written to a USB stick. The MBR has an active dummy entry
+  (`--mbr-force-bootable`, checked by mkimage) because some BIOSes skip USB
+  disks without one. Volume ID `SAVIOR`.
 * **`netboot/`:** `grub-mknetdir` images for i386-pc, x86_64-efi and
-  i386-efi. The payloads are fetched over TFTP, or over HTTP from the hive's port 7702 when served by a hive.
+  i386-efi, plus iPXE's `boot/ipxe/undionly.kpxe` (`mkimage --ipxe
+  auto|none|FILE`; auto takes it from the host's `ipxe` package) for BIOS
+  clients behind proxy DHCP (13.3, `S65netboot`). The payloads are fetched over TFTP, or over HTTP from the hive's port 7702 when served by a hive.
 * **Payload selection** is baked in at build time; there are no runtime file
   tests (they fail over TFTP). With both payloads: `cpuid -l` → x86_64, else
   i686, on every platform (the x86_64 kernel has `EFI_MIXED`, so 32-bit UEFI
@@ -1008,7 +1013,9 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
   rescue entry has its own verbose base command line.
 * With `--conf`, `mkimage` also bakes `boot/savior-conf.cpio`
   (`etc/savior/baked.conf`, 0600) as a second initrd on USB and ISO media,
-  never in the netboot tree.
+  never in the netboot tree. The stick's `savior.conf` then starts with a
+  header saying these settings are built in: commenting a line out doesn't
+  undo it, setting another value does.
 * **Kernel cmdline:** `consoleblank=0 quiet loglevel=3 console=ttyS0,115200 console=tty0`.
 
 ### 13.2 Payload (initramfs) and memory budget
@@ -1066,7 +1073,7 @@ background (`start-stop-daemon -b`) with progress on tty1.
 | `S35dhcpd` | udhcpd when `dhcp_server=yes` and not `netboot=yes` |
 | `S40time` | ntpd if present and `ntp` isn't off (optional) |
 | `S50sshd` | dropbear (`-R`, ed25519) when `ssh_key` is set; background |
-| `S65netboot` | dnsmasq when `netboot=yes` (hive role): proxy-DHCP with a PXE menu, or with `dhcp_server=yes` full DHCP with the boot file chosen by client architecture (0 → `i386-pc/core.0`, 7/9 → `x86_64-efi/core.efi`, 6 → `i386-efi/core.efi`; UEFI firmware ignores PXE menus). TFTP root `/run/savior/tftp`: world-readable RAM copies of the GRUB network images (dnsmasq serves only world-readable files) and a generated `grub.cfg` that loads `(http,<hive ip>:7702)/boot/<arch>/{vmlinuz,initrd}` (served by the hive from the stick; faster than TFTP), retries 5 times and then reboots, with `savior.hive=<ip>:7700 savior.hive_fingerprint=... savior.join=keyless savior.media=none`. Never the key, `savior.conf` or `savior-conf.cpio` |
+| `S65netboot` | dnsmasq when `netboot=yes` (hive role): proxy-DHCP with a PXE menu, or, only with `dhcp_server=yes`, `net=static` and `ip`, full DHCP with the boot file chosen by client architecture (0 → `i386-pc/core.0`, 7/9 → `x86_64-efi/core.efi`, 6 → `i386-efi/core.efi`; UEFI firmware ignores PXE menus). TFTP root `/run/savior/tftp`: world-readable RAM copies of the GRUB network images (dnsmasq serves only world-readable files) and a generated `grub.cfg` that loads `(http,<hive ip>:7702)/boot/<arch>/{vmlinuz,initrd}` (served by the hive from the stick; faster than TFTP), retries 5 times and then reboots, with `savior.hive=<ip>:7700 savior.hive_fingerprint=... savior.join=keyless savior.media=none`. Never the key, `savior.conf` or `savior-conf.cpio`. In proxy mode BIOS clients never get `core.0` directly: GRUB's i386-pc PXE driver reads only the cached DHCPACK, which is the router's. With `dhcp-userclass=set:ipxe,iPXE`, plain PXE ROMs get `boot/ipxe/undionly.kpxe` and iPXE gets a generated `boot/ipxe/savior.ipxe` (`set netX/next-server <hive>`, then `chain tftp://<hive>/boot/grub/i386-pc/core.0`; the override is needed because iPXE takes next-server from the router's packet first, and dnsmasq-based routers name themselves). Without `undionly.kpxe` on the stick there is no BIOS service in proxy mode, and the console says BIOS netboot needs `dhcp_server = yes` with `net = static` |
 
 A hive writes its status panel (URLs, fingerprint, pairing code, nodes
 online, persistence) to `/run/savior/hive-status.json` (0600). The node's
@@ -1082,18 +1089,28 @@ vt-reset` before and after (restore the console after a crash).
 Test support: with `console=ttyS0` on the command line, rcS prints
 `SAVIOR-BOOT: rcS start` and `/usr/libexec/savior/boot-report` prints
 `SAVIOR-BOOT: rcS done ... cfg= media= key= fb= net= console= node= ver=` on
-the serial console (never secrets). `savior_dumplog=1` also copies the boot
-log and syslog there.
+the serial console (never secrets), then `SAVIOR-AGENT: up= agent=up|crashing|down
+age= starts= arch= ver=` once `savior node` has run 10 s without a restart
+(or hasn't). S65netboot prints `SAVIOR-NETBOOT: mode=full|proxy iface= addr=
+bios=grub|undionly|ipxe|no uefi=yes|no`. `savior_dumplog=1` also copies the
+boot log and syslog there.
 
 ### 13.4 Hive data partition
 
 On first start with the hive role and `hive_data=auto`, `savior storage init-data`:
 1. finds the device holding the booted SAVIOR partition;
 2. if it has exactly one MBR partition and ≥ 256 MiB unallocated after it,
+   zeroes the first MiB of that space and writes an ownership marker there
+   (`SAVIOR-DATA-PENDING`, start sector, length; fsync and read back), then
    appends partition 2 (type 0x83, 1 MiB aligned, to the end of the device) by
    writing the 16-byte entry itself (fsync and read back), then `BLKRRPART`,
    or `BLKPG` when a partition of the disk is mounted (the stick always is);
-3. formats it with `mke2fs -t ext4 -L SAVIOR-DATA` (or ext2 with busybox mke2fs);
+3. formats it with `mke2fs -t ext4 -L SAVIOR-DATA` (or ext2 with busybox
+   mke2fs) and erases the marker. An existing partition 2 is mounted when it
+   is ext with the SAVIOR-DATA label, formatted only when it has no
+   recognised filesystem and carries the marker for exactly its geometry
+   (an interrupted run), and refused otherwise: SaviorOS never formats a
+   partition it didn't create;
 4. mounts it at `/var/lib/savior/data`. The hive keeps its state in
    `/var/lib/savior/data/hive`.
 
@@ -1120,8 +1137,14 @@ entries on the host; the sandbox `/etc/passwd` lists `savior-job:x:<uid>:<uid>::
   wireless-regdb, linux-firmware (allowlist), dnsmasq, e2fsprogs (mke2fs),
   squashfs (host), ca-certificates.
   The post-build step installs the prebuilt `savior` binaries, deletes any
-  non-allowlisted `/etc/init.d/S*`, builds the modloop squashfs, checks the
-  budget and writes `/etc/savior-release`. Boot media are made by
+  non-allowlisted `/etc/init.d/S*`, makes `/etc/dropbear` a real 0700
+  directory (the package links it into `/run`), builds the modloop squashfs
+  from the kernel named by `BR2_LINUX_KERNEL_VERSION` (never a stale build
+  directory), checks the budget and writes `/etc/savior-release`. A
+  post-fakeroot script clears the setuid bit Buildroot's device table puts
+  on `/bin/busybox`; post-image refuses any setuid or setgid file in the
+  initrd. A board overlay sets `options radeon cik_support=0` (no amdgpu:
+  GCN 1.1 GPUs keep the firmware framebuffer). Boot media are made by
   `os/image/mkimage.sh` from the Buildroot kernel and initrd, with host GRUB
   packages (the same GRUB verified in the QEMU tests).
 * **Kernel:** arch defconfig + fragments in `board/savior/linux/`, with a
@@ -1163,19 +1186,39 @@ entries on the host; the sandbox `/etc/passwd` lists `savior-job:x:<uid>:<uid>::
 * **Dev image** (`os/dev/build.sh`): Ubuntu 24.04 `linux-image-unsigned`,
   `linux-modules` and `linux-modules-extra`, fetched with `apt-get download`. The
   modules come from the checked-in `os/dev/modules.txt` plus their dependency
-  closure from `modules.dep`; `.ko.zst` files are decompressed and `depmod`
-  is run. It also uses `busybox-static` (`/init` → busybox; applets symlinked),
+  closure from `modules.dep` and `modules.softdep` (e.g. r8169 → realtek);
+  `.ko.zst` files are decompressed and `depmod` is run. `firmware: MODULE
+  PACKAGE` lines bring in the firmware a module asks for from an Ubuntu
+  firmware package (radeon). `/etc/ssl/certs/ca-certificates.crt` is Mozilla's
+  set from Ubuntu's `ca-certificates` package, never the build host's bundle.
+  iPXE's `undionly.kpxe` comes from the host's `ipxe` package or `apt-get
+  download ipxe`. It also uses `busybox-static` (`/init` → busybox; applets symlinked),
   optionally dropbear and dnsmasq with their libraries, the same
   `os/rootfs-overlay`, and the savior binary. The cpio is compressed with
   `xz --check=crc32`.
-* **QEMU tests** (`os/dev/qemu-test.sh`, TCG): SeaBIOS USB-EHCI stick (boot +
-  fb0 present); OVMF x64; ISO under BIOS and UEFI; PXE via slirp TFTP; and a
-  multi-VM swarm on a socket-multicast LAN with a random group/port per run
-  and `localaddr=127.0.0.1`. Each VM gets a distinct MAC and `-uuid`. The
-  swarm run (hive + 2 compute + 1 display) runs a job end to end, checks the
-  display through `screendump`, and runs a duplicate-ID test. Buildroot CI
-  adds `qemu-system-i386 -cpu pentium3,-pae -m 256` (join, a default job,
-  16 bpp via the nomodeset entry, MemAvailable) and OVMF32 → i686.
+* **QEMU tests** (`os/dev/qemu-test.sh`, TCG): static checks of the payload
+  (`image`: soft dependencies, the Realtek PHY driver, radeon firmware, the CA
+  bundle); SeaBIOS USB-EHCI stick; OVMF x64; ISO under BIOS and UEFI; PXE via
+  slirp TFTP; a baked `--conf` image; and multi-VM tests on a
+  socket-multicast LAN with a random group/port per run and
+  `localaddr=127.0.0.1`. Each VM gets a distinct MAC and `-uuid`. Boot tests
+  require `agent=up starts=1` in the `SAVIOR-AGENT` line and no agent restart
+  for 30 s. The swarm run (hive + 2 compute + 1 display) runs a job end to end
+  (tasks also check they can read the CA bundle), compares the display text
+  pixel for pixel with `savior display render` after a black reference
+  screen, and runs a duplicate-ID test. `hive-pxe` netboots BIOS and UEFI
+  clients from a hive that is the DHCP server; `hive-pxe-proxy` does it behind
+  a router VM (udhcpd, then a dnsmasq that names itself as next-server), with
+  a PXE probe that checks plain PXE ROMs get iPXE (QEMU's own NIC ROMs are
+  iPXE), and checks that `dhcp_server = yes` without a static address stays
+  a proxy.
+* **Release CI** (`.github/workflows/images.yml`, `scripts/qemu-smoke.sh`):
+  Buildroot x86_64 and i686 payloads, then boots under SeaBIOS, OVMF x64, the
+  ISO, `qemu-system-i386 -cpu pentium3,-pae -m 256` and OVMF32, and the
+  universal image on all of them. Each boot must report `node=yes fb=yes`, a
+  DHCP lease, a real version, `agent=up` (on the Pentium III this proves the
+  SSE2/softfloat pick) and the expected `arch=`, and each netboot tree must
+  contain `undionly.kpxe`. Tagged builds become GitHub releases.
 
 ## 15. Testing strategy
 

@@ -83,6 +83,11 @@ the state of the hive connection with a hint when something is wrong:
 To find out which machine is which, use **Identify**. `savior ctl identify
 --all` shows every screen's short code in huge letters and beeps. Then
 rename the machines: `savior ctl rename <short-code-or-id> lab-shelf-3`.
+The commands that manage a node (`node`, `rename`, `label`, `drain`,
+`identify`, `reboot`, `forget`, `display`, `wall create --nodes` ...) accept
+its ID, name or short code, in any case; job placement (`--node`) takes
+names and IDs only. Two machines can show the same code: the hive then says
+the code is ambiguous, and you use the name or ID from `savior ctl nodes`.
 
 ## 5. Use the dashboard
 
@@ -200,8 +205,10 @@ nodes use the hive's clock and prepare the next slide in advance.
 
 For a lab of machines that can network-boot, set `netboot = yes` on a
 SaviorOS hive booted from a stick. It serves the boot files and answers PXE
-requests next to your existing DHCP server (proxy-DHCP). With
-`dhcp_server = yes` and a static `ip`, it's the network's DHCP server too,
-which suits an isolated switch. Netbooted machines never receive the swarm
+requests next to your existing DHCP server (proxy-DHCP). Legacy-BIOS
+machines boot through iPXE, which the stick carries. With
+`dhcp_server = yes`, `net = static` and a static `ip`, the hive is the
+network's DHCP server too, which suits an isolated switch. Without the
+static address it stays a proxy and says so on its screen. Netbooted machines never receive the swarm
 key. They join *keyless* and wait until you approve them in the dashboard.
 Only use netboot on a network you trust.

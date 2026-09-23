@@ -106,3 +106,9 @@ make swarm-test   # multi-VM swarm end-to-end test
 
 No license has been chosen yet. Until one is added, all rights are reserved
 by the authors.
+
+The boot images also contain third-party software under its own licenses,
+among them the Linux kernel and firmware, BusyBox, GRUB, iPXE, dnsmasq and
+dropbear (mostly GPL). Anyone distributing images must also provide their
+licenses and corresponding source; for Buildroot images, `make legal-info`
+in the Buildroot output directory collects both.

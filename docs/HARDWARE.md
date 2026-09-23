@@ -82,10 +82,11 @@ monitor sizes in one video wall.
 | Intel GMA 900/950/X3100/4500 and later HD Graphics | Works (i915 driver). |
 | Intel GMA 500/600/3600 (Poulsbo netbooks) | Works (gma500 driver). |
 | ATI/AMD Radeon R100 – Southern Islands (≈2000–2013) | Works (radeon driver + firmware). |
+| AMD GCN 1.1 (Kabini/Beema/Mullins/Kaveri APUs, HD 7790, R7 260, R9 290) | Uses the firmware framebuffer: radeon leaves these to amdgpu (`cik_support=0`), which isn't included. |
 | NVIDIA GeForce 2 – GTX 700 era | Works (nouveau driver). |
 | Matrox G200 server graphics, ASPEED BMCs | Works (mgag200 / ast). |
 | VIA UniChrome, SiS, S3 Savage, Intel 810/815, ATI Rage | No modern driver. Uses the VESA framebuffer GRUB sets up (1024×768 or 800×600). |
-| Newer AMD (GCN 1.2+, amdgpu) | Not included, to keep the image small. Uses the firmware framebuffer. |
+| Newer AMD (GCN 1.2+, amdgpu) | amdgpu isn't included, to keep the image small. Uses the firmware framebuffer. |
 
 Laptops: the lid switch blanks the panel. A connected external monitor keeps
 the screen on. The *identify* action flashes a large 3-character code on every
