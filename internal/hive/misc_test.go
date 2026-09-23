@@ -252,6 +252,7 @@ func TestNetbootHandler(t *testing.T) {
 	os.WriteFile(filepath.Join(nb, "boot", "x86_64", "vmlinuz"), []byte("kernel"), 0o644)
 	os.WriteFile(filepath.Join(nb, "savior.conf"), []byte("swarm_key = leak"), 0o644)
 	os.WriteFile(filepath.Join(nb, ".hidden"), []byte("x"), 0o644)
+	os.WriteFile(filepath.Join(nb, "boot", "savior-conf.cpio"), []byte("baked key"), 0o644)
 	h := netbootHandler(nb)
 	get := func(method, p string) (int, string) {
 		rec := &recorder{hdr: http.Header{}}
@@ -262,7 +263,7 @@ func TestNetbootHandler(t *testing.T) {
 	if code, body := get("GET", "/boot/x86_64/vmlinuz"); code != 200 || body != "kernel" {
 		t.Fatalf("payload: %d %q", code, body)
 	}
-	for _, p := range []string{"/savior.conf", "/SAVIOR.CONF", "/.hidden", "/", "/boot/", "/../etc/passwd"} {
+	for _, p := range []string{"/savior.conf", "/SAVIOR.CONF", "/boot/savior-conf.cpio", "/.hidden", "/", "/boot/", "/../etc/passwd"} {
 		if code, _ := get("GET", p); code != http.StatusNotFound {
 			t.Fatalf("%s: %d", p, code)
 		}

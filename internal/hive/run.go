@@ -177,7 +177,7 @@ func netbootHandler(dir string) http.Handler {
 
 type netbootFS struct{ fs http.FileSystem }
 
-var netbootBlocked = []string{"savior.conf", "baked.conf", "swarm_key", "admin_token", "state.json", "key.pem"}
+var netbootBlocked = []string{"savior.conf", "savior-conf.cpio", "baked.conf", "swarm_key", "admin_token", "state.json", "key.pem"}
 
 // Open implements http.FileSystem, refusing hidden and secret-looking
 // names and directories.

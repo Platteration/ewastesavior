@@ -984,9 +984,11 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
   tests (they fail over TFTP). With both payloads: `cpuid -l` → x86_64, else
   i686, on every platform (the x86_64 kernel has `EFI_MIXED`, so 32-bit UEFI
   on a 64-bit CPU boots it).
-* **Early config** (embedded in every core image): if the marker file exists on
-  `$root` (the boot device), use it. Otherwise
-  `search --no-floppy --file --set=root <marker>`. Then `configfile /boot/grub/grub.cfg`.
+* **Early config** (embedded in every core image; it runs under GRUB's rescue
+  parser, which has no `if`): `search --no-floppy --file --set=root
+  --hint=$root <marker>`, so the boot device wins when it has the marker and
+  other disks are scanned otherwise. Then `configfile /boot/grub/grub.cfg`,
+  which prints how the medium was found.
 * **Menu** (timeout 5):
   * default, with `gfxpayload=1024x768x32,1024x768x16,800x600x32,800x600x16,auto`
     on BIOS so firmware framebuffers exist;
@@ -1000,8 +1002,13 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
   * reboot and power off.
   If the file `/boot-options.cfg` exists, it is sourced first, so an operator can set
   `savior_args="video=LVDS-1:d"` from any computer. Every entry appends
-  `$savior_args` and `savior.media=<serial>` (USB/ISO) or
-  `savior.media=none` (netboot).
+  `$savior_args` and `savior.media=UUID=<FAT volume serial>` (USB),
+  `savior.media=UUID=<ISO volume UUID, YYYY-MM-DD-hh-mm-ss-cc>` (ISO, set with
+  xorriso `--modification-date`) or `savior.media=none` (netboot). The
+  rescue entry has its own verbose base command line.
+* With `--conf`, `mkimage` also bakes `boot/savior-conf.cpio`
+  (`etc/savior/baked.conf`, 0600) as a second initrd on USB and ISO media,
+  never in the netboot tree.
 * **Kernel cmdline:** `consoleblank=0 quiet loglevel=3 console=ttyS0,115200 console=tty0`.
 
 ### 13.2 Payload (initramfs) and memory budget
@@ -1027,10 +1034,16 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
 
 ### 13.3 Init sequence (BusyBox init)
 
+The kernel starts the overlay's `/init`. The kernel's initramfs root can't
+be moved by `pivot_root(2)` (EINVAL), which the task sandbox needs, so
+`/init` bind-mounts `/` onto `/mnt`, moves it to `/`, chroots into it and
+execs `/sbin/init`. Nothing is copied. If a step fails it execs
+`/sbin/init` directly (tasks then fail with a sandbox error).
+
 `/etc/inittab` (os/rootfs-overlay):
 ```
 ::sysinit:/etc/init.d/rcS
-tty1::respawn:/usr/bin/savior console
+tty1::respawn:/usr/libexec/savior/run console
 tty2::respawn:/usr/libexec/savior/tty2          (shell if console_shell=yes, else a notice)
 ::respawn:/usr/libexec/savior/run node
 ::respawn:/usr/libexec/savior/run hive          (exec sleep forever unless role hive)
@@ -1049,20 +1062,28 @@ background (`start-stop-daemon -b`) with progress on tty1.
 | `S08config` | `savior storage find-media`: wait up to 20 s for the medium named by `savior.media=` (removable/USB/sr devices first, fixed disks last), else LABEL=SAVIOR, else any removable vfat/iso9660 with `/savior.conf` (so a CD-booted machine can take its config from a plain USB stick). Mount read-only with the 6.5 options, set `firmware_class.path=/media/savior/firmware` and re-probe Wi-Fi drivers without a netdev, merge config (5.1), write `/run/savior/{savior.conf,env}`, print "no savior.conf found" on tty1 when nothing turns up |
 | `S10system` | hostname, timezone, sysctls (6.5), cpufreq governor, zram swap (50% of RAM, lz4 or zstd) |
 | `S20scratch` | task scratch (`scratch_wipe` honored; ext4 via mke2fs when available, else busybox mke2fs) — background if formatting |
-| `S30network` | lo; wired interfaces via udhcpc (`-s /usr/libexec/savior/udhcpc.script`, background) or static; Wi-Fi via wpa_supplicant; resolv.conf; link-local fallback |
+| `S30network` | lo; wired interfaces via udhcpc (`-s /usr/libexec/savior/udhcpc.script`, background) or static (then any other wired NICs use DHCP, so a hive can have an uplink; the static gateway and DNS win); Wi-Fi via wpa_supplicant; resolv.conf; link-local fallback |
 | `S35dhcpd` | udhcpd when `dhcp_server=yes` and not `netboot=yes` |
 | `S40time` | ntpd if present and `ntp` isn't off (optional) |
 | `S50sshd` | dropbear (`-R`, ed25519) when `ssh_key` is set; background |
-| `S65netboot` | dnsmasq when `netboot=yes` (hive role): proxy-DHCP, or full DHCP when `dhcp_server=yes`; TFTP root `/run/savior/tftp` (symlinks to the stick's boot files + generated `grub.cfg` with `savior.hive=<ip>:7700 savior.hive_fingerprint=... savior.join=keyless savior.media=none`, never the key) |
+| `S65netboot` | dnsmasq when `netboot=yes` (hive role): proxy-DHCP with a PXE menu, or with `dhcp_server=yes` full DHCP with the boot file chosen by client architecture (0 → `i386-pc/core.0`, 7/9 → `x86_64-efi/core.efi`, 6 → `i386-efi/core.efi`; UEFI firmware ignores PXE menus). TFTP root `/run/savior/tftp`: world-readable RAM copies of the GRUB network images (dnsmasq serves only world-readable files) and a generated `grub.cfg` that loads `(http,<hive ip>:7702)/boot/<arch>/{vmlinuz,initrd}` (served by the hive from the stick; faster than TFTP), retries 5 times and then reboots, with `savior.hive=<ip>:7700 savior.hive_fingerprint=... savior.join=keyless savior.media=none`. Never the key, `savior.conf` or `savior-conf.cpio` |
 
 A hive writes its status panel (URLs, fingerprint, pairing code, nodes
 online, persistence) to `/run/savior/hive-status.json` (0600). The node's
 status scene and `savior console` read it.
 
-`/usr/libexec/savior/run <svc>` sources the env and execs
-`savior <svc> --config /run/savior/savior.conf --log-file /var/log/savior-<svc>.log`.
-For `hive` without the hive role it runs `exec sleep 2147483647`. For `node` it
-first runs `savior display vt-reset` (restore the console after a crash).
+`/usr/libexec/savior/run <node|hive|console>` sources the env and runs
+`savior <svc> --config /run/savior/savior.conf --log-file /var/log/savior-<svc>.log`
+as a child, logs its exit status, and sleeps 5 s when it ran for less than
+10 s (so a crashing agent restarts at most every 5 s). For `hive` without the
+hive role it runs `exec sleep 2147483647`. For `node` it runs `savior display
+vt-reset` before and after (restore the console after a crash).
+
+Test support: with `console=ttyS0` on the command line, rcS prints
+`SAVIOR-BOOT: rcS start` and `/usr/libexec/savior/boot-report` prints
+`SAVIOR-BOOT: rcS done ... cfg= media= key= fb= net= console= node= ver=` on
+the serial console (never secrets). `savior_dumplog=1` also copies the boot
+log and syslog there.
 
 ### 13.4 Hive data partition
 
@@ -1070,7 +1091,8 @@ On first start with the hive role and `hive_data=auto`, `savior storage init-dat
 1. finds the device holding the booted SAVIOR partition;
 2. if it has exactly one MBR partition and ≥ 256 MiB unallocated after it,
    appends partition 2 (type 0x83, 1 MiB aligned, to the end of the device) by
-   writing the 16-byte entry itself, then `BLKRRPART`;
+   writing the 16-byte entry itself (fsync and read back), then `BLKRRPART`,
+   or `BLKPG` when a partition of the disk is mounted (the stick always is);
 3. formats it with `mke2fs -t ext4 -L SAVIOR-DATA` (or ext2 with busybox mke2fs);
 4. mounts it at `/var/lib/savior/data`. The hive keeps its state in
    `/var/lib/savior/data/hive`.
