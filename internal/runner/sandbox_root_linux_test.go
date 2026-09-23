@@ -421,3 +421,48 @@ func TestExecFailureIsTheCommands(t *testing.T) {
 		t.Errorf("%d of %d slots usable after exec failures (retired?)", got, r.cfg.Slots)
 	}
 }
+
+// TestSandboxEtcReadableUnderUmask077 runs the real sandbox from an agent
+// with umask 077, as /usr/libexec/savior/run starts it. The task user must
+// still be able to read the generated /etc and the CA bundle, and gets
+// the usual umask 022.
+func TestSandboxEtcReadableUnderUmask077(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to drop privileges")
+	}
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+	r := newTestRunner(t, ModeAuto, nil)
+	if !r.caps[CapMountNS] || !r.caps[CapPidNS] {
+		t.Skip("namespaces unavailable")
+	}
+	checks := []string{"/etc/passwd", "/etc/group", "/etc/hosts", "/etc/nsswitch.conf"}
+	if _, err := os.Stat("/etc/ssl/certs"); err == nil {
+		checks = append(checks, "/etc/ssl/certs")
+	}
+	var script []string
+	for i, f := range checks {
+		script = append(script, fmt.Sprintf("[ -r %s ] && echo r%d=yes || echo r%d=no", f, i, i))
+	}
+	script = append(script, "echo umask=$(umask)", "id -un 2>/dev/null | sed 's/^/user=/'")
+	task := scriptTask("tumask", strings.Join(script, "\n"))
+	task.Network = true // also writes /etc/resolv.conf
+	checks = append(checks, "/etc/resolv.conf")
+	task.Script += fmt.Sprintf("\n[ -r /etc/resolv.conf ] && echo r%d=yes || echo r%d=no", len(checks)-1, len(checks)-1)
+	rep, logs := runTask(t, r, task)
+	if rep.State != proto.TaskSucceeded {
+		t.Fatalf("state %s kind %s err %q\n%s", rep.State, rep.ErrorKind, rep.Error, logs)
+	}
+	kv := parseKV(logs)
+	for i, f := range checks {
+		if kv[fmt.Sprintf("r%d", i)] != "yes" {
+			t.Errorf("the task can't read %s\n%s", f, logs)
+		}
+	}
+	if kv["umask"] != "0022" {
+		t.Errorf("task umask %q, want 0022", kv["umask"])
+	}
+	if kv["user"] != "savior-job" {
+		t.Errorf("id -un = %q: /etc/passwd is not readable", kv["user"])
+	}
+}

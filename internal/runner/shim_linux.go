@@ -48,6 +48,10 @@ func SandboxExecMain(args []string) int {
 	// The status pipe is for the shim only; the task must not be able to
 	// write a forged setup failure into it.
 	syscall.CloseOnExec(statusFD)
+	// The agent runs with umask 077 (the run wrapper). The sandbox's /etc,
+	// mount points and the task itself need the usual 022, or the task
+	// user can't read /etc/passwd, resolv.conf or the CA bundle.
+	syscall.Umask(0o022)
 
 	a, err := parseShimArgs(args)
 	if err != nil {
