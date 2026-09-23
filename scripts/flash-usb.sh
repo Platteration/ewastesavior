@@ -10,15 +10,25 @@
 #   --list     show the removable disks and exit
 #   --unmount  unmount the stick's mounted partitions first (default: refuse)
 #   --force    allow a disk that does not report itself as removable/USB
-#              (the disk holding the running system is refused regardless)
+#              (the disk holding the running system, and virtual or stacked
+#              devices such as /dev/mapper/*, /dev/dm-*, /dev/md*, are
+#              refused regardless)
 #   --yes      don't ask for confirmation (for scripts; the checks still apply)
 #
-# Safety: refuses partitions, disks holding the running system (/, /boot,
-# swap, the APFS/boot container on macOS), mounted disks (unless --unmount),
-# non-removable disks (unless --force) and disks smaller than the image. It
-# shows the disk's model and size and asks you to type its name back.
-# Afterwards edit savior.conf on the stick's SAVIOR partition (any OS).
+# Safety: refuses partitions, virtual and stacked block devices (loop,
+# device-mapper/LVM/LUKS, md RAID, ...), disks holding the running system
+# (/, /boot, swap, the APFS/boot container on macOS), mounted disks (unless
+# --unmount), non-removable disks (unless --force) and disks smaller than
+# the image. It shows the disk's model and size and asks you to type its
+# name back. Afterwards edit savior.conf on the stick's SAVIOR partition
+# (any OS).
 set -eu
+
+# Test hook for scripts/test-scripts.sh, not for use: with
+# FLASH_USB_TEST_ROOT=DIR the Linux checks read DIR/sys and DIR/proc instead
+# of /sys and /proc, skip the root and block-device checks, and the script
+# stops after the checks. Nothing is unmounted or written in that mode.
+R=${FLASH_USB_TEST_ROOT:-}
 
 die() { echo "flash-usb: $*" >&2; exit 1; }
 say() { echo "flash-usb: $*" >&2; }
@@ -47,6 +57,7 @@ while [ $# -gt 0 ]; do
 done
 
 OS=$(uname -s)
+[ -z "$R" ] || OS=Linux
 human() { awk -v b="$1" 'BEGIN { split("B KB MB GB TB", u, " "); i = 1; while (b >= 1000 && i < 5) { b /= 1000; i++ } printf (i == 1 ? "%d %s" : "%.1f %s"), b, u[i] }'; }
 
 # ---------------------------------------------------------------------------
@@ -56,13 +67,13 @@ human() { awk -v b="$1" 'BEGIN { split("B KB MB GB TB", u, " "); i = 1; while (b
 # to their disk; device-mapper/md devices to the disks under them).
 disk_of() {
 	_n=$1
-	[ -e "/sys/class/block/$_n" ] || return 0
-	if [ -e "/sys/class/block/$_n/partition" ]; then
-		basename "$(dirname "$(readlink -f "/sys/class/block/$_n")")"
+	[ -e "$R/sys/class/block/$_n" ] || return 0
+	if [ -e "$R/sys/class/block/$_n/partition" ]; then
+		basename "$(dirname "$(readlink -f "$R/sys/class/block/$_n")")"
 		return 0
 	fi
 	_s=""
-	for _slave in /sys/class/block/"$_n"/slaves/*; do
+	for _slave in "$R"/sys/class/block/"$_n"/slaves/*; do
 		[ -e "$_slave" ] || continue
 		_s=yes
 		disk_of "$(basename "$_slave")"
@@ -73,8 +84,8 @@ disk_of() {
 # mounted_disks: whole disks behind mounted filesystems and active swap.
 linux_used_disks() {
 	{
-		awk '$1 ~ /^\/dev\// { print $1 }' /proc/mounts
-		awk 'NR > 1 && $1 ~ /^\/dev\// { print $1 }' /proc/swaps 2>/dev/null
+		awk '$1 ~ /^\/dev\// { print $1 }' "$R/proc/mounts"
+		awk 'NR > 1 && $1 ~ /^\/dev\// { print $1 }' "$R/proc/swaps" 2>/dev/null
 	} | while IFS= read -r dev; do
 		real=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
 		disk_of "$(basename "$real")"
@@ -83,19 +94,19 @@ linux_used_disks() {
 
 linux_system_disks() {
 	for mp in / /boot /boot/efi /usr /var; do
-		src=$(awk -v m="$mp" '$2 == m && $1 ~ /^\/dev\// { print $1 }' /proc/mounts | tail -n 1)
+		src=$(awk -v m="$mp" '$2 == m && $1 ~ /^\/dev\// { print $1 }' "$R/proc/mounts" | tail -n 1)
 		[ -n "$src" ] || continue
 		disk_of "$(basename "$(readlink -f "$src")")"
 	done
-	awk 'NR > 1 && $1 ~ /^\/dev\// { print $1 }' /proc/swaps 2>/dev/null | while IFS= read -r dev; do
+	awk 'NR > 1 && $1 ~ /^\/dev\// { print $1 }' "$R/proc/swaps" 2>/dev/null | while IFS= read -r dev; do
 		disk_of "$(basename "$(readlink -f "$dev")")"
 	done
 }
 
 linux_is_removable() {
-	[ "$(sysread "/sys/block/$1/removable")" = 1 ] && return 0
-	case "$(readlink -f "/sys/block/$1")" in */usb*) return 0 ;; esac
-	case "$1" in mmcblk*) [ "$(sysread "/sys/block/$1/device/type")" = SD ] && return 0 ;; esac
+	[ "$(sysread "$R/sys/block/$1/removable")" = 1 ] && return 0
+	case "$(readlink -f "$R/sys/block/$1")" in */usb*) return 0 ;; esac
+	case "$1" in mmcblk*) [ "$(sysread "$R/sys/block/$1/device/type")" = SD ] && return 0 ;; esac
 	return 1
 }
 
@@ -103,18 +114,29 @@ linux_is_removable() {
 sysread() { if [ -r "$1" ]; then tr -s ' ' <"$1"; fi; }
 
 linux_describe() {
-	vendor=$(sysread "/sys/block/$1/device/vendor")
-	model=$(sysread "/sys/block/$1/device/model")
-	[ -n "$model" ] || model=$(sysread "/sys/block/$1/device/name")
+	vendor=$(sysread "$R/sys/block/$1/device/vendor")
+	model=$(sysread "$R/sys/block/$1/device/model")
+	[ -n "$model" ] || model=$(sysread "$R/sys/block/$1/device/name")
 	[ -n "$model" ] || model="unknown model"
-	bytes=$(( $(cat "/sys/block/$1/size") * 512 ))
+	bytes=$(( $(cat "$R/sys/block/$1/size") * 512 ))
 	echo "$(echo "$vendor $model" | sed 's/^ *//; s/ *$//') ($(human "$bytes"))"
 }
 
+# is_virtual NAME: a virtual or stacked block device (never a USB stick):
+# loop, RAM disks, CD-ROMs, device-mapper (LVM, LUKS), md RAID, nbd, bcache,
+# DRBD, Ceph RBD, ZFS zvols, or anything built on other block devices.
+is_virtual() {
+	case "$1" in loop*|ram*|zram*|dm-*|md*|sr*|nbd*|bcache*|drbd*|rbd*|zd*) return 0 ;; esac
+	for _slave in "$R"/sys/block/"$1"/slaves/*; do
+		if [ -e "$_slave" ]; then return 0; fi
+	done
+	return 1
+}
+
 linux_list() {
-	for d in /sys/block/*; do
+	for d in "$R"/sys/block/*; do
 		n=$(basename "$d")
-		case "$n" in loop*|ram*|zram*|dm-*|md*|sr*|nbd*) continue ;; esac
+		is_virtual "$n" && continue
 		[ "$(cat "$d/size")" -gt 0 ] || continue
 		if linux_is_removable "$n"; then kind=removable; else kind="fixed (needs --force)"; fi
 		if linux_system_disks | grep -qx "$n"; then kind="SYSTEM DISK (refused)"; fi
@@ -175,17 +197,22 @@ else
 	sig=$(od -An -tx1 -j 510 -N 2 "$IMAGE" | tr -d ' \n')
 	[ "$sig" = 55aa ] || say "warning: $IMAGE has no MBR boot signature; is it really a SaviorOS image?"
 fi
-[ "$(id -u)" = 0 ] || die "run as root (sudo) to write $DEVICE"
+[ "$(id -u)" = 0 ] || [ -n "$R" ] || die "run as root (sudo) to write $DEVICE"
 
 case "$OS" in
 Linux)
-	[ -b "$DEVICE" ] || die "$DEVICE is not a block device"
+	[ -b "$DEVICE" ] || [ -n "$R" ] || die "$DEVICE is not a block device"
 	name=$(basename "$(readlink -f "$DEVICE")")
-	[ -e "/sys/block/$name" ] || {
-		[ -e "/sys/class/block/$name/partition" ] && die "$DEVICE is a partition; give the whole disk (e.g. /dev/$(disk_of "$name"))"
+	[ -e "$R/sys/block/$name" ] || {
+		[ -e "$R/sys/class/block/$name/partition" ] && die "$DEVICE is a partition; give the whole disk (e.g. /dev/$(disk_of "$name"))"
 		die "$DEVICE is not a whole disk"
 	}
-	case "$name" in loop*|ram*|zram*|dm-*|md*|sr*) [ "$FORCE" = yes ] || die "$DEVICE is not a USB stick or SD card" ;; esac
+	# Refused even with --force: the system and mount checks below resolve
+	# mounts to the physical disks under device-mapper and md, so they would
+	# never match a /dev/mapper/... or /dev/md... target, even a mounted root.
+	if is_virtual "$name"; then
+		die "$DEVICE ($name) is a virtual or stacked device, not a USB stick or SD card; refusing (even with --force)"
+	fi
 	if linux_system_disks | grep -qx "$name"; then
 		die "$DEVICE holds the running system; refusing (even with --force)"
 	fi
@@ -195,6 +222,7 @@ Linux)
 	fi
 	if linux_used_disks | grep -qx "$name"; then
 		[ "$UNMOUNT" = yes ] || die "$DEVICE has mounted partitions (or swap); unmount them or use --unmount"
+		[ -z "$R" ] || { echo "flash-usb: test mode: would unmount $DEVICE, nothing done"; exit 0; }
 		awk '{ print $1, $2 }' /proc/mounts | while read -r src mp; do
 			case "$src" in /dev/*) ;; *) continue ;; esac
 			[ "$(disk_of "$(basename "$(readlink -f "$src")")")" = "$name" ] || continue
@@ -206,7 +234,7 @@ Linux)
 		done
 		! linux_used_disks | grep -qx "$name" || die "$DEVICE is still in use"
 	fi
-	dev_bytes=$(( $(cat "/sys/block/$name/size") * 512 ))
+	dev_bytes=$(( $(cat "$R/sys/block/$name/size") * 512 ))
 	desc=$(linux_describe "$name")
 	OUT="/dev/$name"
 	;;
@@ -246,6 +274,10 @@ echo "  image:  $IMAGE ($(human "$img_bytes"))"
 echo "  target: $OUT - $desc [$kind]"
 echo "  EVERYTHING ON THIS DISK WILL BE ERASED."
 echo
+if [ -n "$R" ]; then
+	echo "flash-usb: test mode: checks passed for $name, nothing written"
+	exit 0
+fi
 if [ "$YES" != yes ]; then
 	[ -r /dev/tty ] || die "no terminal to confirm on; use --yes"
 	printf 'Type the disk name (%s) to continue: ' "$name" >/dev/tty

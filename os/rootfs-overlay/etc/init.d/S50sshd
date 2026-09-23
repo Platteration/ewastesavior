@@ -25,8 +25,14 @@ install_keys() {
 }
 
 host_key() {
-	mkdir -p "$KEYDIR"
-	chmod 0700 "$KEYDIR"
+	# Buildroot's dropbear package ships /etc/dropbear as a link to
+	# /var/run/dropbear, which dangles on a fresh /run: the RAM rootfs is
+	# writable, so replace any link with a directory.
+	[ ! -L "$KEYDIR" ] || rm -f "$KEYDIR"
+	if ! mkdir -p "$KEYDIR" || ! chmod 0700 "$KEYDIR"; then
+		log "sshd: cannot create $KEYDIR"
+		return 1
+	fi
 	if is_mounted "$DATA"; then
 		mkdir -p "$PERSIST"
 		chmod 0700 "$PERSIST"

@@ -9,15 +9,17 @@
 #   1. installs the prebuilt savior binaries (x86_64: /usr/bin/savior;
 #      i686: /usr/bin/savior-sse2 + /usr/bin/savior-softfloat, S00mounts keeps
 #      one of them) after checking they are static ELF files for ARCH;
-#   2. writes /etc/savior-release and /usr/lib/os-release;
+#   2. writes /etc/savior-release and /usr/lib/os-release (the kernel is
+#      the one BR2_CONFIG names, build/linux-<BR2_LINUX_KERNEL_VERSION>);
 #   3. deletes every /etc/init.d/S* script the rootfs overlay doesn't ship and
-#      asserts the result;
+#      asserts the result; makes /etc/dropbear a directory;
 #   4. strips files a RAM-only node doesn't need;
 #   5. moves /lib/modules and /lib/firmware into /lib/modloop.sqfs (xz squashfs
 #      with top-level directories modules/ and firmware/), leaving empty
 #      mountpoints for S00mounts;
 #   6. prunes the firmware to board/savior/firmware.list on the way;
-#   7. checks the applets and programs the init scripts rely on.
+#   7. checks the applets and programs the init scripts rely on, and the
+#      radeon module option this kernel needs.
 #
 # Environment from Buildroot: HOST_DIR, BUILD_DIR, BR2_CONFIG.
 # Optional environment (the top-level Makefile sets these):
@@ -55,6 +57,8 @@ BUILD_DIR=${BUILD_DIR:-$(dirname "$HOST_DIR")/build}
 OVERLAY=${SAVIOR_OVERLAY:-$REPO/os/rootfs-overlay}
 BIN_DIR=${SAVIOR_BIN_DIR:-$REPO/build/linux-$GOARCH}
 FW_LIST="$BOARD_DIR/firmware.list"
+# shellcheck source=kernel-dir.sh
+. "$BOARD_DIR/kernel-dir.sh"
 
 # ---------------------------------------------------------------------------
 # 1. savior binaries
@@ -128,14 +132,14 @@ BR_VERSION=""
 if [ -n "${BR2_CONFIG:-}" ] && [ -f "$BR2_CONFIG" ]; then
 	BR_VERSION=$(sed -n 's/^# Buildroot \([^ ]*\) Configuration$/\1/p' "$BR2_CONFIG" | head -n 1)
 fi
-KVER=""
-for d in "$BUILD_DIR"/linux-*/; do
-	case "$(basename "$d")" in linux-headers-*|linux-firmware-*|linux-tools-*) continue ;; esac
-	if [ -f "$d/.config" ] && [ -f "$d/include/config/kernel.release" ]; then
-		KVER=$(cat "$d/include/config/kernel.release")
-		break
-	fi
-done
+# The kernel this configuration builds (not the first build/linux-*: an old
+# one stays there after a kernel bump).
+KDIR=$(savior_kernel_dir) || die "cannot tell which kernel this build uses"
+if [ ! -f "$KDIR/.config" ] || [ ! -f "$KDIR/include/config/kernel.release" ]; then
+	die "$KDIR has no .config or include/config/kernel.release (did the kernel build?)"
+fi
+KVER=$(cat "$KDIR/include/config/kernel.release")
+case "$KVER" in ""|*/*|.*) die "bad kernel release '$KVER' in $KDIR" ;; esac
 
 # Never write through a symlink that could point out of TARGET_DIR.
 rm -f "$TARGET_DIR/etc/savior-release"
@@ -160,7 +164,7 @@ HOME_URL="https://github.com/platteration/ewastesavior"
 EOF
 chmod 0644 "$TARGET_DIR/usr/lib/os-release"
 ln -s ../usr/lib/os-release "$TARGET_DIR/etc/os-release"
-log "release $VERSION, kernel ${KVER:-unknown}, Buildroot ${BR_VERSION:-unknown}"
+log "release $VERSION, kernel $KVER ($KDIR), Buildroot ${BR_VERSION:-unknown}"
 
 # ---------------------------------------------------------------------------
 # 3. init scripts: only what the overlay ships (rcS runs an allowlist anyway)
@@ -213,6 +217,22 @@ if [ -f "$TARGET_DIR/etc/shadow" ]; then
 	esac
 fi
 
+# SSH host key directory. Buildroot's dropbear package makes /etc/dropbear a
+# link to /var/run/dropbear and relies on its S50dropbear (deleted above) to
+# replace the link with a directory at boot. /run is an empty tmpfs here, so
+# the link would dangle and S50sshd could not write the host key.
+if [ -L "$TARGET_DIR/etc/dropbear" ]; then
+	rm -f "$TARGET_DIR/etc/dropbear"
+	log "replaced the /etc/dropbear link with a directory"
+fi
+# A reinstalled package ("ln -snf" onto the directory) leaves a link inside.
+if [ -L "$TARGET_DIR/etc/dropbear/dropbear" ]; then rm -f "$TARGET_DIR/etc/dropbear/dropbear"; fi
+mkdir -p "$TARGET_DIR/etc/dropbear"
+chmod 0700 "$TARGET_DIR/etc/dropbear"
+if [ -L "$TARGET_DIR/etc/dropbear" ] || [ ! -d "$TARGET_DIR/etc/dropbear" ]; then
+	die "/etc/dropbear in target is not a directory"
+fi
+
 # ---------------------------------------------------------------------------
 # 4. strip what a RAM-only node doesn't need
 
@@ -253,6 +273,9 @@ if [ -d "$TARGET_DIR/lib/modules" ]; then
 		# Buildroot's depmod hook may have written index files into the empty
 		# directory we left on a previous run: only real module trees count.
 		if [ -n "$(find "$d" -name '*.ko*' -print | head -n 1)" ]; then
+			# Modules the kernel we ship could never load (a package built
+			# against another kernel): fail rather than drop them quietly.
+			[ "$k" = "$KVER" ] || die "target has modules for kernel $k, but this build's kernel is $KVER ($KDIR)"
 			rm -rf "${STAGE:?}/modules/$k"
 			mv "$d" "$STAGE/modules/$k"
 			log "staged kernel modules $k"
@@ -261,12 +284,12 @@ if [ -d "$TARGET_DIR/lib/modules" ]; then
 		fi
 	done
 fi
-if [ -n "$KVER" ]; then
-	for d in "$STAGE"/modules/*; do
-		[ -d "$d" ] || continue
-		[ "$(basename "$d")" = "$KVER" ] || { rm -rf "$d"; log "dropped stale modules $(basename "$d")"; }
-	done
-fi
+# Module trees staged by earlier runs for an older kernel.
+for d in "$STAGE"/modules/*; do
+	[ -d "$d" ] || continue
+	[ "$(basename "$d")" = "$KVER" ] || { rm -rf "$d"; log "dropped stale modules $(basename "$d")"; }
+done
+[ -d "$STAGE/modules/$KVER" ] || die "no kernel modules for $KVER (did the kernel install its modules?)"
 if [ -d "$TARGET_DIR/lib/firmware" ]; then
 	# File by file: a package reinstalled later may ship part of a directory
 	# another package also installs into (e.g. radeon/ vs amdgpu/ links).
@@ -302,8 +325,7 @@ SOURCE_DATE_EPOCH=$BUILD_UNIX "$MKSQUASHFS" "$STAGE" "$TARGET_DIR/lib/modloop.sq
 chmod 0644 "$TARGET_DIR/lib/modloop.sqfs"
 # Empty mountpoints. Keep lib/modules/<kver> so Buildroot's depmod hook finds
 # its directory on the next run; the modloop mount hides it.
-mkdir -p "$TARGET_DIR/lib/modules" "$TARGET_DIR/lib/firmware"
-[ -z "$KVER" ] || mkdir -p "$TARGET_DIR/lib/modules/$KVER"
+mkdir -p "$TARGET_DIR/lib/modules/$KVER" "$TARGET_DIR/lib/firmware"
 log "modloop: $nmods modules, $(find "$STAGE/firmware" \( -type f -o -type l \) | wc -l | tr -d ' ') firmware files -> /lib/modloop.sqfs ($(($(wc -c <"$TARGET_DIR/lib/modloop.sqfs") / 1024)) KiB)"
 
 # ---------------------------------------------------------------------------
@@ -312,7 +334,7 @@ log "modloop: $nmods modules, $(find "$STAGE/firmware" \( -type f -o -type l \) 
 missing=""
 for c in sh mount umount losetup mdev modprobe insmod udhcpc udhcpd ntpd zcip findfs blkid \
 	mkfs.vfat fdisk mkswap swapon sysctl hwclock ip start-stop-daemon logger setsid \
-	syslogd klogd setpriv timeout \
+	syslogd klogd setpriv timeout pidof uname tr \
 	mke2fs dropbear dropbearkey dnsmasq wpa_supplicant wpa_passphrase iw; do
 	found=no
 	for d in bin sbin usr/bin usr/sbin; do
@@ -322,6 +344,14 @@ for c in sh mount umount losetup mdev modprobe insmod udhcpc udhcpd ntpd zcip fi
 done
 [ -z "$missing" ] || die "missing programs in target:$missing (check busybox.fragment / defconfig)"
 [ -f "$TARGET_DIR/etc/ssl/certs/ca-certificates.crt" ] || die "CA bundle missing (BR2_PACKAGE_CA_CERTIFICATES)"
+# radeon without amdgpu's CIK support claims GCN 1.1 GPUs, whose firmware
+# firmware.list leaves out, and kills the firmware framebuffer on them
+# (board/savior/rootfs-overlay/etc/modprobe.d/savior-kernel.conf).
+if grep -Eq '^CONFIG_DRM_RADEON=[ym]$' "$KDIR/.config" && ! grep -q '^CONFIG_DRM_AMDGPU_CIK=y$' "$KDIR/.config"; then
+	cat "$TARGET_DIR"/etc/modprobe.d/*.conf 2>/dev/null |
+		grep -Eq '^[[:space:]]*options[[:space:]]+radeon([[:space:]].*)?[[:space:]]cik_support=0([[:space:]]|$)' ||
+		die "radeon is built without amdgpu CIK support, but no /etc/modprobe.d file sets 'options radeon cik_support=0' (is board/savior/rootfs-overlay in BR2_ROOTFS_OVERLAY?)"
+fi
 suid=$(find "$TARGET_DIR" -type f \( -perm -4000 -o -perm -2000 \) -print | head -n 5)
 [ -z "$suid" ] || die "setuid/setgid files in target: $suid"
 

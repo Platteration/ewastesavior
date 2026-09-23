@@ -33,8 +33,13 @@ BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_MDEV=y
 # BR2_TARGET_GENERIC_GETTY is not set
 # Networking is done by the overlay's S30network, not ifupdown.
 BR2_SYSTEM_DHCP=""
-BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_SAVIOR_PATH)/../rootfs-overlay"
+# The shared overlay, then board/savior/rootfs-overlay: settings that only
+# this kernel needs (see its etc/modprobe.d/savior-kernel.conf).
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_SAVIOR_PATH)/../rootfs-overlay $(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/rootfs-overlay"
 BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/post-build.sh"
+# Runs inside fakeroot after makedevs: clears the setuid bit that busybox's
+# permission table puts on /bin/busybox.
+BR2_ROOTFS_POST_FAKEROOT_SCRIPT="$(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/post-fakeroot.sh"
 BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/post-image.sh"
 BR2_ROOTFS_POST_SCRIPT_ARGS="x86_64"
 

@@ -41,6 +41,8 @@ BOARD_DIR=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$BOARD_DIR/../../../.." && pwd)
 BUILD_DIR=${BUILD_DIR:-$(dirname "$BIN")/build}
 TARGET_DIR=${TARGET_DIR:-$(dirname "$BIN")/target}
+# shellcheck source=kernel-dir.sh
+. "$BOARD_DIR/kernel-dir.sh"
 
 KERNEL="$BIN/bzImage"
 [ -f "$KERNEL" ] || die "$KERNEL not found (BR2_LINUX_KERNEL_BZIMAGE)"
@@ -91,7 +93,7 @@ xz -dc "$INITRD" | (cd "$WORK" && cpio -itv --quiet) >"$WORK/listing" 2>/dev/nul
 # Mode string is field 1 (e.g. -rwsr-xr-x); s/S in the user or group
 # execute position means setuid/setgid.
 suid=$(awk '{ m = $1; if (substr(m, 4, 1) ~ /[sS]/ || substr(m, 7, 1) ~ /[sS]/) print $NF }' "$WORK/listing" | head -n 5)
-[ -z "$suid" ] || die "setuid/setgid files in the initrd: $suid"
+[ -z "$suid" ] || die "setuid/setgid files in the initrd: $suid (post-fakeroot.sh should have refused them)"
 for f in init sbin/init etc/inittab lib/modloop.sqfs etc/savior-release; do
 	# cpio -tv prints the path last; symlinks end in "path -> target".
 	awk -v f="$f" '{ p = $0; sub(/ -> .*$/, "", p); n = split(p, a, " "); if (a[n] == f || a[n] == "./" f) found = 1 } END { exit !found }' \
@@ -138,14 +140,11 @@ cp "$KERNEL" "$PAYLOAD/vmlinuz"
 cp "$INITRD" "$PAYLOAD/initrd"
 rm -f "$PAYLOAD/savior-release" "$PAYLOAD/kernel.config"
 [ -f "$TARGET_DIR/etc/savior-release" ] && cp "$TARGET_DIR/etc/savior-release" "$PAYLOAD/savior-release"
-for d in "$BUILD_DIR"/linux-*/; do
-	case "$(basename "$d")" in linux-headers-*|linux-firmware-*|linux-tools-*) continue ;; esac
-	if [ -f "$d/.config" ] && grep -q '^CONFIG_X86=y$' "$d/.config"; then
-		cp "$d/.config" "$PAYLOAD/kernel.config"
-		break
-	fi
-done
-[ -f "$PAYLOAD/kernel.config" ] || log "warning: kernel .config not found under $BUILD_DIR"
+# The .config of the kernel this configuration builds, which check-kconfig
+# validates (not the first build/linux-*: an old one stays after a bump).
+KDIR=$(savior_kernel_dir) || die "cannot tell which kernel this build uses"
+[ -f "$KDIR/.config" ] || die "$KDIR/.config not found (did the kernel build?)"
+cp "$KDIR/.config" "$PAYLOAD/kernel.config"
 if command -v sha256sum >/dev/null 2>&1; then
 	(cd "$PAYLOAD" && sha256sum vmlinuz initrd >SHA256SUMS)
 else

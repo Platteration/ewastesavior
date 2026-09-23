@@ -73,7 +73,10 @@ board/savior/
   busybox.fragment                       applets the init scripts and task scripts rely on
   firmware.list                          firmware allowlist (DESIGN 13.2)
   install-firmware.sh                    installs / prunes firmware by that list
-  post-build.sh, post-image.sh           see below
+  rootfs-overlay/                        second overlay: settings only this kernel needs
+  post-build.sh, post-fakeroot.sh,       see below
+  post-image.sh
+  kernel-dir.sh                          which build/linux-<version> this build uses
 ```
 
 Kernel: the pinned 6.12.y LTS release (`BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE`),
@@ -87,7 +90,13 @@ the modloop.
 
 The rootfs overlay is `os/rootfs-overlay` (`BR2_ROOTFS_OVERLAY`). It is shared
 with the dev image and provides inittab, rcS/rcK, the `S??` init scripts and
-`/usr/libexec/savior`.
+`/usr/libexec/savior`. `board/savior/rootfs-overlay` is applied after it and
+holds what only this kernel needs: `etc/modprobe.d/savior-kernel.conf` sets
+`options radeon cik_support=0`. This kernel has no amdgpu, so without that
+option radeon would claim GCN 1.1 (CIK) GPUs such as Kabini, Kaveri, Mullins,
+Bonaire and Hawaii, remove the firmware framebuffer, and then fail for lack
+of the CIK firmware that `firmware.list` leaves out, leaving the screen dark.
+With it, those GPUs keep simpledrm/efifb/vesafb.
 
 ## post-build.sh
 
@@ -99,12 +108,21 @@ idempotent and does the following:
   that each one is a static ELF for the right architecture, and that the Go
   build info says `GOAMD64=v1`, `GO386=sse2` or `GO386=softfloat`.
 * It writes `/etc/savior-release` (`VERSION=`, `ARCH=`, `BUILD_UNIX=`,
-  `KERNEL=`, `BUILDROOT=`) and `/usr/lib/os-release`.
+  `KERNEL=`, `BUILDROOT=`) and `/usr/lib/os-release`. The kernel is the one
+  `BR2_CONFIG` names, `build/linux-<BR2_LINUX_KERNEL_VERSION>`
+  (`kernel-dir.sh`). After a kernel bump Buildroot keeps the old
+  `build/linux-<old>` next to the new one, so the scripts never guess by
+  globbing.
 * It deletes every `/etc/init.d/S*` that the overlay doesn't ship. That
   covers Buildroot's syslogd, klogd, mdev, network, dropbear, dnsmasq and
   seedrng scripts. It then asserts that the remaining scripts, `inittab`,
   `rcS` and `rcK` are byte-identical to the overlay, and warns about
   differences from the DESIGN 13.3 table.
+* It makes `/etc/dropbear` a directory (mode 0700). Buildroot's dropbear
+  package installs it as a link to `/var/run/dropbear` and relies on its own
+  `S50dropbear`, which is deleted above, to replace the link at boot. On the
+  fresh `/run` tmpfs the link would dangle, and `S50sshd` could not write the
+  host key.
 * It asserts that root has no usable password.
 * It strips documentation, headers and static libraries, plus the e2fsprogs
   tools a node never runs (it keeps `mke2fs` and `e2fsck`).
@@ -116,12 +134,26 @@ idempotent and does the following:
   `SOURCE_DATE_EPOCH`. The squashfs has two top-level directories, `modules/`
   and `firmware/`, and the empty `/lib/modules` and `/lib/firmware` are left
   as mountpoints. S00mounts loop-mounts it on `/run/modloop` and bind-mounts
-  the two directories.
+  the two directories. Only the modules of this build's kernel go in:
+  modules staged by an earlier run for an older kernel are dropped, and a
+  module tree in the target for any other kernel fails the build.
 * It checks that the programs the init scripts call exist. These include
   mdev, udhcpc, udhcpd, ntpd, zcip, findfs, blkid, mkfs.vfat, fdisk,
-  start-stop-daemon, logger, setsid, setpriv, mke2fs, dropbear, dnsmasq,
-  wpa_supplicant and iw. It also checks for the CA bundle and that there are
-  no setuid files.
+  start-stop-daemon, logger, setsid, setpriv, pidof, mke2fs, dropbear,
+  dnsmasq, wpa_supplicant and iw. It also checks for the CA bundle, that there
+  are no setuid files, and, while the kernel builds radeon without amdgpu's
+  CIK support, that a modprobe.d file sets `radeon cik_support=0`.
+
+## post-fakeroot.sh
+
+Buildroot runs it inside fakeroot on the copy of the target it packs into
+`rootfs.cpio`, after `makedevs` has applied the device and permission
+tables (`BR2_ROOTFS_POST_FAKEROOT_SCRIPT`). Buildroot's busybox package puts
+`/bin/busybox f 4755 0 0` into that table, so at this point `/bin/busybox` is
+setuid root even though post-build.sh saw it as 0755. SaviorOS has no setuid
+applets (`FEATURE_SUID` is off) and allows no setuid files, so the script
+sets `/bin/busybox` back to 0755 and fails on any setuid or setgid file that
+is left. post-image.sh checks the packed initrd again.
 
 ## post-image.sh
 
@@ -160,7 +192,8 @@ follows the pinned Buildroot release. It installs only the files that match
 * Ralink rt2x00.
 * Broadcom brcmsmac.
 * radeon R100 to Southern Islands, excluding CIK parts and the UVD/VCE
-  engines.
+  engines. radeon is told to leave CIK GPUs alone (see the board overlay
+  above).
 
 Old names that upstream now lists as WHENCE `Link:` entries still work. This
 approach avoids depending on the per-driver `BR2_PACKAGE_LINUX_FIRMWARE_*`
@@ -188,14 +221,23 @@ release. The images workflow's job summary prints the hash.
   Sections are `[all]`, `[x86_64]` and `[i686]`. Values can be `=y`, `=m`,
   `=y|m`, exact strings, or `# CONFIG_X is not set`.
 * `scripts/test-scripts.sh` (`make test-scripts`): self-tests for the
-  scripts above, plus install-firmware, fetch-buildroot and post-build
-  against a fake Buildroot tree.
+  scripts above, plus install-firmware, fetch-buildroot, post-fakeroot,
+  post-build and post-image against fake Buildroot trees (including a
+  kernel bump on an existing tree and busybox's setuid bit), flash-usb.sh
+  against a fake sysfs, qemu-smoke.sh with the images workflow's
+  expectations against a fake QEMU, and S50sshd in a chroot.
 * `scripts/qemu-smoke.sh`: boots a payload directory, USB image or ISO under
   SeaBIOS, OVMF x64 or OVMF ia32, and waits for the boot marker on the serial
   console. CI boots the i686 image on `-cpu pentium3,-pae -m 256` under TCG,
-  because under KVM an SSE2 instruction would still run.
+  because under KVM an SSE2 instruction would still run. Every boot must show
+  `node=yes fb=yes net=10.0.2.x` and a real `ver=` on the `SAVIOR-BOOT` line,
+  then `agent=up` and the payload's `arch=` on the `SAVIOR-AGENT` line that
+  boot-report prints once `savior node` has run for 10 s without a restart.
+  On the Pentium III that proves the SSE2/softfloat pick.
 * `.github/workflows/images.yml` runs all of this for both architectures,
-  builds the universal image, and publishes a GitHub release on `v*` tags.
+  checks that the netboot trees contain iPXE (`undionly.kpxe` from the
+  host's `ipxe` package), builds the universal image, and publishes a
+  GitHub release on `v*` tags.
 
 ## Changing things
 
@@ -203,7 +245,9 @@ release. The images workflow's job summary prints the hash.
   defconfigs, and the `BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_x` series if
   the major version changes. `check-kconfig` then tells you about renamed
   symbols (for example `PAGE_TABLE_ISOLATION` became
-  `MITIGATION_PAGE_TABLE_ISOLATION` in 6.9).
+  `MITIGATION_PAGE_TABLE_ISOLATION` in 6.9). Rebuilding an existing
+  `build/br-<arch>` is fine: post-build and post-image use the kernel the
+  configuration names, not the old `build/linux-<old>`.
 * **New driver.** Add it as `=m` to the matching fragment, add its firmware
   to `firmware.list`, and add it to `required.txt` if the DESIGN requires it.
 * **New package.** Add it to both defconfigs. If it installs an init script,

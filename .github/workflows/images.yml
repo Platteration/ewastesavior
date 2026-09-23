@@ -27,9 +27,21 @@ env:
   # Line the rootfs overlay prints on the serial console once rcS is done
   # (os/rootfs-overlay/usr/libexec/savior/boot-report)...
   BOOT_MARKER: "SAVIOR-BOOT: rcS done"
-  # ...and its fields that must say yes: the node agent runs (on i686 that
-  # proves the SSE2/softfloat pick), and a framebuffer exists.
-  BOOT_EXPECT: --expect node=yes --expect fb=yes
+  # ...and what every boot must show (scripts/qemu-smoke.sh also fails on
+  # agent=crashing and agent=down):
+  #   node=yes        the run wrapper started savior node (only that);
+  #   fb=yes          a framebuffer exists;
+  #   net=10.0.2.     the e1000 module loaded from the modloop and got a
+  #                   lease from QEMU's user network (net=none fails);
+  #   ver=            /usr/bin/savior runs on this CPU (ver=unknown fails);
+  #   agent=up        the SAVIOR-AGENT line: savior node wrote its status and
+  #                   kept running for 10 s without a restart. On the
+  #                   Pentium III (TCG, no SSE2) that proves the
+  #                   SSE2/softfloat pick; a Go crash (SIGILL) on the serial
+  #                   console fails at once.
+  # Each step adds --expect arch=x86_64|i686 for the payload it must boot.
+  # scripts/test-scripts.sh runs this line against fake boot logs.
+  BOOT_EXPECT: --expect node=yes --expect fb=yes --expect net=10.0.2. --expect agent=up --fail net=none --fail ver=unknown --fail SIGILL
 
 jobs:
   buildroot:
@@ -54,7 +66,7 @@ jobs:
             build-essential bc bison flex cpio file rsync unzip wget curl python3 perl patch \
             xz-utils squashfs-tools libelf-dev libssl-dev \
             qemu-system-x86 ovmf ovmf-ia32 grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
-            mtools dosfstools xorriso
+            mtools dosfstools xorriso ipxe
       - name: Enable KVM when the runner has it
         run: |
           if [ -e /dev/kvm ]; then
@@ -88,6 +100,10 @@ jobs:
             set -- "BUILDROOT_VERSION=$BUILDROOT_VERSION_INPUT"
           fi
           make image ARCH=${{ matrix.arch }} "$@"
+      # mkimage.sh only warns without iPXE; a release must have it (BIOS PXE
+      # clients of a hive in proxy DHCP mode chain through it).
+      - name: Netboot tree has iPXE
+        run: test -s build/images/${{ matrix.arch }}/netboot/boot/ipxe/undionly.kpxe
 
       - name: Summary
         if: always()
@@ -108,23 +124,23 @@ jobs:
 
       - name: QEMU x86_64 (USB stick, SeaBIOS)
         if: matrix.arch == 'x86_64'
-        run: sh scripts/qemu-smoke.sh --image build/images/x86_64/savior-x86_64.img --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/x86_64-bios.log
+        run: sh scripts/qemu-smoke.sh --image build/images/x86_64/savior-x86_64.img --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --timeout 900 --log build/logs/x86_64-bios.log
       - name: QEMU x86_64 (USB stick, OVMF x64)
         if: matrix.arch == 'x86_64'
-        run: sh scripts/qemu-smoke.sh --image build/images/x86_64/savior-x86_64.img --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/x86_64-uefi.log
+        run: sh scripts/qemu-smoke.sh --image build/images/x86_64/savior-x86_64.img --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --timeout 900 --log build/logs/x86_64-uefi.log
       - name: QEMU x86_64 (ISO, SeaBIOS)
         if: matrix.arch == 'x86_64'
-        run: sh scripts/qemu-smoke.sh --iso build/images/x86_64/savior-x86_64.iso --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/x86_64-iso.log
+        run: sh scripts/qemu-smoke.sh --iso build/images/x86_64/savior-x86_64.iso --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --timeout 900 --log build/logs/x86_64-iso.log
       # TCG on purpose: under KVM an SSE2 instruction would still run.
       - name: QEMU i686 (Pentium III, no PAE, no SSE2, 256 MB)
         if: matrix.arch == 'i686'
         run: >-
           sh scripts/qemu-smoke.sh --arch i686 --image build/images/i686/savior-i686.img
-          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 1500
-          --log build/logs/i686-pentium3.log
+          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=i686
+          --timeout 1500 --log build/logs/i686-pentium3.log
       - name: QEMU i686 (OVMF ia32)
         if: matrix.arch == 'i686'
-        run: sh scripts/qemu-smoke.sh --arch i686 --image build/images/i686/savior-i686.img --firmware uefi32 --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 1500 --log build/logs/i686-uefi32.log
+        run: sh scripts/qemu-smoke.sh --arch i686 --image build/images/i686/savior-i686.img --firmware uefi32 --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=i686 --timeout 1500 --log build/logs/i686-uefi32.log
 
       - name: Collect artifacts
         run: |
@@ -165,7 +181,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 ovmf ovmf-ia32 grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
-            mtools dosfstools xorriso cpio xz-utils
+            mtools dosfstools xorriso cpio xz-utils ipxe
       - uses: actions/download-artifact@v4
         with:
           name: image-x86_64
@@ -180,19 +196,21 @@ jobs:
           (cd dist/i686/payload && sha256sum -c SHA256SUMS)
       - name: make universal-media
         run: make universal-media X86_64_PAYLOAD=dist/x86_64/payload I686_PAYLOAD=dist/i686/payload
+      - name: Netboot tree has iPXE
+        run: test -s build/images/netboot/boot/ipxe/undionly.kpxe
       - name: QEMU universal (SeaBIOS, 64-bit CPU -> x86_64 payload)
-        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/universal-bios.log
+        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --timeout 900 --log build/logs/universal-bios.log
       - name: QEMU universal (OVMF x64)
-        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/universal-uefi.log
+        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --timeout 900 --log build/logs/universal-uefi.log
       # 32-bit UEFI on a 64-bit CPU: GRUB picks x86_64 (cpuid -l), booted in
       # EFI mixed mode (DESIGN 13.1).
       - name: QEMU universal (OVMF ia32, 64-bit CPU -> x86_64 via EFI_MIXED)
-        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --firmware uefi32 --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 1500 --log build/logs/universal-uefi32.log
+        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --firmware uefi32 --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --timeout 1500 --log build/logs/universal-uefi32.log
       - name: QEMU universal (Pentium III -> i686 payload)
         run: >-
           sh scripts/qemu-smoke.sh --arch i686 --image build/images/savior-universal.img
-          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 1500
-          --log build/logs/universal-pentium3.log
+          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=i686
+          --timeout 1500 --log build/logs/universal-pentium3.log
       - name: Collect release files
         run: |
           mkdir -p release

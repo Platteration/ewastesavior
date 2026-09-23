@@ -151,6 +151,8 @@ CONFIG_DMESG=y
 CONFIG_BB_SYSCTL=y
 CONFIG_HWCLOCK=y
 CONFIG_DATE=y
+# boot-report's arch= field.
+CONFIG_UNAME=y
 # /dev/mem poking has no place on a node.
 # CONFIG_DEVMEM is not set
 

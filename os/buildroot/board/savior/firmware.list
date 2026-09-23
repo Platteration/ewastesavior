@@ -74,7 +74,10 @@ brcm/bcm43xx-0.fw
 brcm/bcm43xx_hdr-0.fw
 
 # --- AMD/ATI radeon, R100 to Southern Islands. Not CIK (radeon's GCN parts
-# are amdgpu territory) and no video decode/encode engines.
+# are amdgpu territory) and no video decode/encode engines. Without its
+# firmware radeon must not claim a CIK GPU at all, or the firmware
+# framebuffer is lost: rootfs-overlay/etc/modprobe.d/savior-kernel.conf sets
+# radeon cik_support=0 (post-build.sh checks it).
 radeon/*
 !radeon/[Bb][Oo][Nn][Aa][Ii][Rr][Ee]*
 !radeon/[Hh][Aa][Ww][Aa][Ii][Ii]*

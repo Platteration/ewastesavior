@@ -21,13 +21,23 @@
 #   --append ARGS       extra kernel arguments (--payload-dir only)
 #   --marker TEXT       success string on the serial console (default "SAVIOR-BOOT: rcS done",
 #                       which the rootfs overlay prints when the boot scripts finish)
-#   --expect TEXT       another string that must also appear (repeatable)
+#   --expect TEXT       another string that must also appear, before or
+#                       after the marker (repeatable)
 #   --fail TEXT         string that means failure (repeatable; always
-#                       includes "Kernel panic" and "SAVIOR-FAIL")
+#                       includes "Kernel panic", "SAVIOR-FAIL" and the
+#                       SAVIOR-AGENT failure states "agent=crashing" and
+#                       "agent=down")
 #   --timeout S         give up after S seconds (default 300)
 #   --log FILE          serial log (default: a temporary file, shown on failure)
 #   --no-net            no network card (default: e1000 with user networking)
 #   -- ARGS...          extra QEMU arguments
+#
+# The rootfs overlay's boot-report prints two lines (boot-report explains
+# the fields): the marker line "SAVIOR-BOOT: rcS done ... fb= net= node= ver=",
+# then "SAVIOR-AGENT: agent=up|crashing|down ... arch= ver=" once the node
+# agent has run for 10 s (or has not). A release check therefore looks like
+#   --expect net=10.0.2. --expect agent=up --expect arch=i686 --fail ver=unknown
+# Both lines are printed at the end, pass or fail.
 #
 # Exit status: 0 marker (and all --expect strings) seen, 1 failure or
 # timeout, 2 usage error.
@@ -52,7 +62,7 @@ NET=yes
 NL='
 '
 EXPECTS=""
-FAILS="Kernel panic${NL}SAVIOR-FAIL"
+FAILS="Kernel panic${NL}SAVIOR-FAIL${NL}agent=crashing${NL}agent=down"
 
 while [ $# -gt 0 ]; do
 	case "$1" in
@@ -167,6 +177,10 @@ QPID=$!
 
 # found TEXT: TEXT appears in the serial log.
 found() { grep -a -q -F -- "$1" "$LOG"; }
+# report: the boot-report status lines seen so far.
+report() {
+	grep -a -E 'SAVIOR-(BOOT|AGENT): ' "$LOG" | tr -d '\r' | sed 's/^/qemu-smoke:   /' >&2 || true
+}
 result=""
 missing=""
 start=$(date +%s)
@@ -187,6 +201,7 @@ while :; do
 		IFS=$OLDIFS
 		if [ -z "$missing" ]; then
 			echo "qemu-smoke: PASS: '$MARKER' after $(($(date +%s) - start)) s" >&2
+			report
 			exit 0
 		fi
 	fi
@@ -208,6 +223,7 @@ while :; do
 done
 
 echo "qemu-smoke: FAIL: $result" >&2
+report
 echo "--- QEMU output" >&2
 tail -n 20 "$WORK/qemu.out" >&2 || true
 echo "--- last 60 lines of the serial console ($LOG)" >&2

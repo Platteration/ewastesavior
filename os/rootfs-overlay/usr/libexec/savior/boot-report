@@ -15,7 +15,20 @@
 # /dev/fb0 exists; console/node: /usr/libexec/savior/run has started
 # savior console / savior node; t: uptime when the address, /dev/fb0 and
 # the console were first seen ("-" = not within 40 s). Used by
-# os/dev/qemu-test.sh, which also sets savior_dumplog=1 (see the end).
+# os/dev/qemu-test.sh, which also sets savior_dumplog=1 (see below).
+#
+# node=yes only means the run wrapper has started savior node once. A second
+# line follows once the agent has shown that it keeps running (or not):
+#
+#   SAVIOR-AGENT: up=<s> agent=up|crashing|down age=<s>|- starts=<n>
+#                 arch=<uname -m> ver=<version>
+#
+# agent=up: a "savior node" process has written /run/savior/status.json and
+# has been running for AGENT_UP_S (10) s without a restart; crashing: the
+# run wrapper had to start it again; down: neither within AGENT_WAIT_S (90)
+# s (time spent waiting for S20scratch does not count). age: how long that
+# process had been running; starts: run-node.starts. On i686, agent=up also
+# proves the SSE2/softfloat pick. scripts/qemu-smoke.sh (CI) expects it.
 set -u
 # shellcheck source=lib.sh
 . /usr/libexec/savior/lib.sh
@@ -80,4 +93,67 @@ case " $(cat /proc/cmdline 2>/dev/null) " in
 	} >/dev/ttyS0 2>/dev/null
 	;;
 esac
+
+# --- the node agent keeps running (SAVIOR-AGENT line) ---------------------------
+
+AGENT_UP_S=10
+AGENT_WAIT_S=90
+
+# node_pid: the pid of the running "savior node" process.
+node_pid() {
+	for _p in $(pidof savior 2>/dev/null); do
+		_c=$(tr '\0' ' ' <"/proc/$_p/cmdline" 2>/dev/null) || continue
+		case "$_c" in
+		*"savior node "* | *"savior node")
+			echo "$_p"
+			return 0
+			;;
+		esac
+	done
+	return 1
+}
+
+# proc_age PID: whole seconds PID has been running (start time in clock
+# ticks, field 22 of /proc/PID/stat; USER_HZ is 100 on x86).
+proc_age() {
+	_st=$(sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | awk '{ print $20 }')
+	_up=$(uptime_s)
+	case "$_st${_up%%.*}" in '' | *[!0-9]*) return 1 ;; esac
+	echo $((${_up%%.*} - _st / 100))
+}
+
+node_starts() {
+	_n=$(cat "$RUN_DIR/run-node.starts" 2>/dev/null) || _n=0
+	case "$_n" in '' | *[!0-9]*) _n=0 ;; esac
+	echo "$_n"
+}
+
+agent=down
+age=-
+n=0
+w=0
+while [ "$n" -lt "$AGENT_WAIT_S" ] && [ "$w" -lt 1800 ]; do
+	if [ "$(node_starts)" -gt 1 ]; then
+		agent=crashing
+		break
+	fi
+	if pid=$(node_pid) && [ -e "$RUN_DIR/status.json" ] && age=$(proc_age "$pid"); then
+		if [ "$age" -ge "$AGENT_UP_S" ]; then
+			agent=up
+			break
+		fi
+	else
+		age=-
+	fi
+	# run waits for S20scratch before it starts the agent.
+	if [ -e "$RUN_DIR/scratch.pending" ]; then w=$((w + 1)); else n=$((n + 1)); fi
+	sleep 1
+done
+ver=$(/usr/bin/savior version 2>/dev/null | awk '{ print $2 }')
+serial_mark "SAVIOR-AGENT: up=$(uptime_s)" \
+	"agent=$agent" \
+	"age=$age" \
+	"starts=$(node_starts)" \
+	"arch=$(uname -m 2>/dev/null || echo unknown)" \
+	"ver=${ver:-unknown}"
 exit 0
