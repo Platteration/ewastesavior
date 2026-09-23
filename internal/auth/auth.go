@@ -7,12 +7,14 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/hmac"
+	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"errors"
@@ -25,13 +27,42 @@ import (
 )
 
 const (
-	nodeLabel = "savior-node-v1"
-	hiveLabel = "savior-hive-v1"
-	hintLabel = "savior-swarm-hint-v1"
+	nodeLabel  = "savior-node-v1"
+	hiveLabel  = "savior-hive-v1"
+	adminLabel = "savior-admin-v1"
+	hintLabel  = "savior-swarm-hint-v2"
+
+	// KDFIterations is the PBKDF2-SHA256 cost of stretching a swarm key or
+	// admin token. About 1-2 s once per process on a Pentium M.
+	KDFIterations = 200000
 )
 
-func mac(key, label string, parts ...string) string {
-	h := hmac.New(sha256.New, []byte(key))
+// Secret is a stretched shared secret (swarm key or admin token). Proofs
+// and hints are computed from the stretched key, so an observed proof or
+// beacon only allows slow offline guessing.
+type Secret struct {
+	k []byte
+}
+
+// NewSwarmSecret stretches a swarm key.
+func NewSwarmSecret(swarmKey string) Secret { return stretch(swarmKey, "savior-swarm-v1") }
+
+// NewAdminSecret stretches an admin token.
+func NewAdminSecret(adminToken string) Secret { return stretch(adminToken, "savior-admin-v1") }
+
+func stretch(pass, salt string) Secret {
+	k, err := pbkdf2.Key(sha256.New, pass, []byte(salt), KDFIterations, 32)
+	if err != nil {
+		panic("auth: pbkdf2: " + err.Error())
+	}
+	return Secret{k: k}
+}
+
+// IsZero reports whether s was never initialized.
+func (s Secret) IsZero() bool { return len(s.k) == 0 }
+
+func (s Secret) mac(label string, parts ...string) string {
+	h := hmac.New(sha256.New, s.k)
 	h.Write([]byte(label))
 	for _, p := range parts {
 		h.Write([]byte{0})
@@ -42,14 +73,27 @@ func mac(key, label string, parts ...string) string {
 
 // NodeProof is the node's proof of swarm-key possession, bound to the hive
 // nonce, its own nonce, its node ID and the TLS fingerprint it observed.
-func NodeProof(swarmKey, hiveNonce, nodeNonce, nodeID, fingerprint string) string {
-	return mac(swarmKey, nodeLabel, hiveNonce, nodeNonce, nodeID, fingerprint)
+func (s Secret) NodeProof(hiveNonce, nodeNonce, nodeID, fingerprint string) string {
+	return s.mac(nodeLabel, hiveNonce, nodeNonce, nodeID, fingerprint)
 }
 
 // HiveProof is the hive's proof of swarm-key possession, bound to the same
 // values and the hive's own certificate fingerprint.
-func HiveProof(swarmKey, hiveNonce, nodeNonce, nodeID, fingerprint string) string {
-	return mac(swarmKey, hiveLabel, hiveNonce, nodeNonce, nodeID, fingerprint)
+func (s Secret) HiveProof(hiveNonce, nodeNonce, nodeID, fingerprint string) string {
+	return s.mac(hiveLabel, hiveNonce, nodeNonce, nodeID, fingerprint)
+}
+
+// AdminProof is `savior ctl`'s login proof (s = NewAdminSecret(token)); the
+// hive answers with HiveProof computed from the same admin secret.
+func (s Secret) AdminProof(hiveNonce, clientNonce, fingerprint string) string {
+	return s.mac(adminLabel, hiveNonce, clientNonce, fingerprint)
+}
+
+// SwarmHint is the 8-hex-char (32-bit) swarm identifier broadcast in
+// beacons: enough to tell swarms apart on a LAN, useless on its own for
+// confirming a key guess.
+func (s Secret) SwarmHint() string {
+	return s.mac(hintLabel)[:8]
 }
 
 // VerifyProof compares two hex proofs in constant time.
@@ -57,13 +101,47 @@ func VerifyProof(expected, got string) bool {
 	return len(expected) == len(got) && subtle.ConstantTimeCompare([]byte(expected), []byte(got)) == 1
 }
 
-// SwarmHint identifies a swarm in beacons without revealing the key.
-func SwarmHint(swarmKey string) string {
-	h := sha256.New()
-	h.Write([]byte(hintLabel))
-	h.Write([]byte{0})
-	h.Write([]byte(swarmKey))
-	return hex.EncodeToString(h.Sum(nil))[:16]
+// NonceIssuer makes stateless hive nonces: hex(unix time (8 bytes) ||
+// random (16) || HMAC(process key, time||random)[:8]). Check verifies the
+// MAC and age; single use is enforced separately by the caller.
+type NonceIssuer struct{ key []byte }
+
+// NewNonceIssuer returns an issuer with a fresh random key.
+func NewNonceIssuer() *NonceIssuer {
+	k := make([]byte, 32)
+	if _, err := rand.Read(k); err != nil {
+		panic("auth: crypto/rand failed: " + err.Error())
+	}
+	return &NonceIssuer{key: k}
+}
+
+// Issue returns a new nonce stamped with now.
+func (n *NonceIssuer) Issue(now time.Time) string {
+	b := make([]byte, 32)
+	binary.BigEndian.PutUint64(b[:8], uint64(now.Unix()))
+	if _, err := rand.Read(b[8:24]); err != nil {
+		panic("auth: crypto/rand failed: " + err.Error())
+	}
+	h := hmac.New(sha256.New, n.key)
+	h.Write(b[:24])
+	copy(b[24:], h.Sum(nil)[:8])
+	return hex.EncodeToString(b)
+}
+
+// Check reports whether nonce was issued by n and is at most ttl old.
+func (n *NonceIssuer) Check(nonce string, now time.Time, ttl time.Duration) bool {
+	b, err := hex.DecodeString(nonce)
+	if err != nil || len(b) != 32 {
+		return false
+	}
+	h := hmac.New(sha256.New, n.key)
+	h.Write(b[:24])
+	if !hmac.Equal(b[24:], h.Sum(nil)[:8]) {
+		return false
+	}
+	issued := time.Unix(int64(binary.BigEndian.Uint64(b[:8])), 0)
+	age := now.Sub(issued)
+	return age >= -5*time.Second && age <= ttl
 }
 
 func randHex(n int) string {

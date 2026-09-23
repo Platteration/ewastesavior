@@ -14,7 +14,7 @@ import (
 
 func TestDefaults(t *testing.T) {
 	c := Default()
-	if c.Hive != "auto" || c.Net != "dhcp" || c.MaxMemPercent != 75 || !c.Beacon || c.DisplayDevice != "/dev/fb0" {
+	if c.Hive != "auto" || c.Net != "dhcp" || c.MaxMemPercent != 75 || !c.Beacon || c.DisplayDevice != "auto" || c.Join != "key" || c.JoinPolicy != "open" {
 		t.Fatalf("unexpected defaults: %+v", c)
 	}
 	if !reflect.DeepEqual(c.Roles, []string{"auto"}) || !reflect.DeepEqual(c.NTP, []string{"pool.ntp.org"}) {

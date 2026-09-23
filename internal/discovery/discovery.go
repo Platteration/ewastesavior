@@ -13,6 +13,8 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/platteration/ewastesavior/internal/proto"
@@ -30,7 +32,10 @@ type AnnounceOptions struct {
 	Targets []string
 	// ListenAddr overrides the probe listen address (default ":<Port>").
 	ListenAddr string
-	Log        *slog.Logger
+	// AllowAnySource answers probes from any address (tests); by default only
+	// probes from directly connected subnets are answered.
+	AllowAnySource bool
+	Log            *slog.Logger
 }
 
 // Announce broadcasts b every Interval and answers probes with a unicast
@@ -77,7 +82,7 @@ func Announce(ctx context.Context, b proto.Beacon, o AnnounceOptions) error {
 			<-ctx.Done()
 			probe.Close()
 		}()
-		go answerProbes(probe, payload, log)
+		go answerProbes(probe, payload, log, o.AllowAnySource)
 	}
 
 	t := time.NewTicker(o.Interval)
@@ -104,8 +109,9 @@ func Announce(ctx context.Context, b proto.Beacon, o AnnounceOptions) error {
 	}
 }
 
-func answerProbes(conn net.PacketConn, payload []byte, log *slog.Logger) {
+func answerProbes(conn net.PacketConn, payload []byte, log *slog.Logger, allowAny bool) {
 	buf := make([]byte, MaxDatagram+1)
+	last := map[string]time.Time{}
 	for {
 		n, from, err := conn.ReadFrom(buf)
 		if err != nil {
@@ -114,17 +120,65 @@ func answerProbes(conn net.PacketConn, payload []byte, log *slog.Logger) {
 			}
 			continue
 		}
-		if n > MaxDatagram {
+		// Probes are padded to MinProbeSize so the reply is never larger
+		// than the request (no amplification).
+		if n > MaxDatagram || n < proto.MinProbeSize {
 			continue
 		}
 		var p proto.Probe
 		if json.Unmarshal(buf[:n], &p) != nil || p.Svc != proto.ProbeService {
 			continue
 		}
+		udp, ok := from.(*net.UDPAddr)
+		if !ok || (!allowAny && !onLocalSubnet(udp.IP)) {
+			continue
+		}
+		key := udp.IP.String()
+		now := time.Now()
+		if t, ok := last[key]; ok && now.Sub(t) < time.Second {
+			continue
+		}
+		if len(last) > 4096 {
+			last = map[string]time.Time{}
+		}
+		last[key] = now
 		if _, err := conn.WriteTo(payload, from); err != nil {
 			log.Debug("discovery: probe reply failed", "to", from, "err", err)
 		}
 	}
+}
+
+// onLocalSubnet reports whether ip is inside a subnet of one of our up
+// interfaces (probes from elsewhere are ignored).
+func onLocalSubnet(ip net.IP) bool {
+	if ip.IsLoopback() {
+		return true
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return false
+	}
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, _ := ifc.Addrs()
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.Contains(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// NewProbe returns a padded probe datagram.
+func NewProbe() []byte {
+	p := proto.Probe{Svc: proto.ProbeService, V: proto.APIVersion}
+	b, _ := json.Marshal(p)
+	p.Pad = strings.Repeat("0", proto.MinProbeSize-len(b))
+	b, _ = json.Marshal(p)
+	return b
 }
 
 // DiscoverOptions configures the node side.
@@ -137,10 +191,55 @@ type DiscoverOptions struct {
 	ListenAddr string
 }
 
-// Discover waits for a beacon whose swarm hint matches and returns the hive
-// base URL ("https://ip:port") and the beacon. It sends probes so a hive
-// answers immediately instead of at its next beacon.
+// Candidate is a hive seen on the network.
+type Candidate struct {
+	URL    string // https://ip:port
+	Beacon proto.Beacon
+}
+
+// Discover waits for the first beacon whose swarm hint matches and returns
+// the hive base URL and the beacon.
 func Discover(ctx context.Context, swarmHint string, o DiscoverOptions) (string, proto.Beacon, error) {
+	var first Candidate
+	err := Listen(ctx, o, func(c Candidate) bool {
+		if c.Beacon.SwarmHint != swarmHint {
+			return true
+		}
+		first = c
+		return false
+	})
+	if first.URL != "" {
+		return first.URL, first.Beacon, nil
+	}
+	return "", proto.Beacon{}, err
+}
+
+// Collect gathers every distinct hive (by URL) seen within window. Beacons
+// of any swarm are returned so callers can tell "wrong key" from "no hive".
+func Collect(ctx context.Context, window time.Duration, o DiscoverOptions) ([]Candidate, error) {
+	ctx, cancel := context.WithTimeout(ctx, window)
+	defer cancel()
+	var mu sync.Mutex
+	var out []Candidate
+	seen := map[string]bool{}
+	err := Listen(ctx, o, func(c Candidate) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		if !seen[c.URL+"|"+c.Beacon.HiveID] {
+			seen[c.URL+"|"+c.Beacon.HiveID] = true
+			out = append(out, c)
+		}
+		return true
+	})
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		err = nil
+	}
+	return out, err
+}
+
+// Listen sends probes and calls fn for every valid beacon until fn returns
+// false or ctx is done.
+func Listen(ctx context.Context, o DiscoverOptions, fn func(Candidate) bool) error {
 	if o.Port == 0 {
 		o.Port = proto.DiscoveryPort
 	}
@@ -157,16 +256,18 @@ func Discover(ctx context.Context, swarmHint string, o DiscoverOptions) (string,
 		// ephemeral port; we will still get unicast probe replies.
 		conn, err = listenBroadcast(":0")
 		if err != nil {
-			return "", proto.Beacon{}, err
+			return err
 		}
 	}
 	defer conn.Close()
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	go func() {
 		<-ctx.Done()
 		conn.Close()
 	}()
 
-	probe, _ := json.Marshal(proto.Probe{Svc: proto.ProbeService, V: proto.APIVersion})
+	probe := NewProbe()
 	sendProbes := func() {
 		targets := o.Targets
 		if len(targets) == 0 {
@@ -197,22 +298,25 @@ func Discover(ctx context.Context, swarmHint string, o DiscoverOptions) (string,
 		n, from, err := conn.ReadFrom(buf)
 		if err != nil {
 			if ctx.Err() != nil {
-				return "", proto.Beacon{}, ctx.Err()
+				return ctx.Err()
 			}
 			if errors.Is(err, net.ErrClosed) {
-				return "", proto.Beacon{}, err
+				return err
 			}
 			continue
 		}
 		b, ok := ParseBeacon(buf[:n])
-		if !ok || b.SwarmHint != swarmHint {
+		if !ok {
 			continue
 		}
 		udp, ok := from.(*net.UDPAddr)
 		if !ok {
 			continue
 		}
-		return "https://" + net.JoinHostPort(udp.IP.String(), strconv.Itoa(b.Port)), b, nil
+		c := Candidate{URL: "https://" + net.JoinHostPort(udp.IP.String(), strconv.Itoa(b.Port)), Beacon: b}
+		if !fn(c) {
+			return nil
+		}
 	}
 }
 

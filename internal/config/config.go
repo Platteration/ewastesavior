@@ -23,15 +23,17 @@ import (
 // Default locations.
 const (
 	ImageConfigFile  = "/etc/savior/savior.conf"
+	BakedConfigFile  = "/etc/savior/baked.conf"
 	StickConfigFile  = "/media/savior/savior.conf"
 	MergedConfigFile = "/run/savior/savior.conf"
 	CmdlineFile      = "/proc/cmdline"
 	CmdlinePrefix    = "savior."
 	MinSwarmKeyLen   = 16
+	MinAdminTokenLen = 32
 )
 
 // DefaultFiles is the config file search list used when no --file is given.
-var DefaultFiles = []string{ImageConfigFile, StickConfigFile}
+var DefaultFiles = []string{ImageConfigFile, BakedConfigFile, StickConfigFile}
 
 // Config holds every savior.conf key. Field comments name the key.
 type Config struct {
@@ -43,6 +45,7 @@ type Config struct {
 	Hive            string // hive
 	SwarmKey        string // swarm_key
 	HiveFingerprint string // hive_fingerprint
+	Join            string // join
 
 	Net         string   // net
 	IP          string   // ip
@@ -70,14 +73,16 @@ type Config struct {
 	MaxTempC          int    // max_temp_c
 	CPUGovernor       string // cpu_governor
 
-	DisplayMode   string // display_mode
-	DisplayText   string // display_text
-	DisplayRotate int    // display_rotate
-	DisplayDevice string // display_device
+	DisplayMode    string // display_mode
+	DisplayText    string // display_text
+	DisplayRotate  int    // display_rotate
+	DisplayDevice  string // display_device
+	DisplayIdleOff int    // display_idle_off_min
 
 	HiveListen string // hive_listen
 	HiveData   string // hive_data
 	AdminToken string // admin_token
+	JoinPolicy string // join_policy
 	Beacon     bool   // beacon
 
 	LogLevel string // log_level
@@ -104,7 +109,6 @@ type keyDef struct {
 var (
 	nameRE   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,62}$`)
 	labelRE  = regexp.MustCompile(`^[a-z0-9][a-z0-9_.\-/]{0,62}$`)
-	wordRE   = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
 	fpRE     = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	countryR = regexp.MustCompile(`^[A-Z]{2}$`)
 )
@@ -316,6 +320,8 @@ var defs = []keyDef{
 			return n, nil
 		}),
 
+	str("join", "key", "key = join with swarm_key; keyless = join without a key and wait for admin approval (netboot).", false,
+		func(c *Config) *string { return &c.Join }, oneOf("key", "keyless")),
 	str("net", "dhcp", "Wired/wireless addressing: dhcp, static or off.", false,
 		func(c *Config) *string { return &c.Net }, oneOf("dhcp", "static", "off")),
 	str("ip", "", "Static address in CIDR form, e.g. 10.77.0.1/24 (net=static).", false,
@@ -405,21 +411,23 @@ var defs = []keyDef{
 	boolean("run_on_battery", false, "Laptops: keep taking tasks on battery power.", func(c *Config) *bool { return &c.RunOnBattery }),
 	integer("battery_min_percent", 40, 0, 100, "On battery below this, running tasks are handed back to the hive.", func(c *Config) *int { return &c.BatteryMinPercent }),
 	integer("max_temp_c", 85, 40, 110, "Pause tasks above this CPU temperature (resume 10 C lower).", func(c *Config) *int { return &c.MaxTempC }),
-	str("cpu_governor", "ondemand", "cpufreq governor: ondemand, schedutil, performance, powersave, conservative.", false,
+	str("cpu_governor", "auto", "cpufreq governor: auto (schedutil, else ondemand), ondemand, schedutil, performance, powersave, conservative.", false,
 		func(c *Config) *string { return &c.CPUGovernor },
-		oneOf("ondemand", "schedutil", "performance", "powersave", "conservative")),
+		oneOf("auto", "ondemand", "schedutil", "performance", "powersave", "conservative")),
 
 	str("display_mode", "status", "Local screen mode until the hive sends one: status, off, text, clock, test.", false,
 		func(c *Config) *string { return &c.DisplayMode }, oneOf("status", "off", "text", "clock", "test")),
 	str("display_text", "", "Text shown when display_mode=text.", false, func(c *Config) *string { return &c.DisplayText }, nil),
 	integer("display_rotate", 0, 0, 0, "Rotate the screen: 0, 90, 180 or 270.", func(c *Config) *int { return &c.DisplayRotate }, 0, 90, 180, 270),
-	str("display_device", "/dev/fb0", "Framebuffer device.", false, func(c *Config) *string { return &c.DisplayDevice },
+	str("display_device", "auto", "Framebuffer device: auto (first connected display) or /dev/fbN.", false, func(c *Config) *string { return &c.DisplayDevice },
 		func(v string) (string, error) {
-			if !strings.HasPrefix(v, "/dev/") {
-				return "", fmt.Errorf("must be a /dev path")
+			v = strings.TrimSpace(v)
+			if v != "auto" && !strings.HasPrefix(v, "/dev/") {
+				return "", fmt.Errorf("must be auto or a /dev path")
 			}
 			return v, nil
 		}),
+	integer("display_idle_off_min", 15, 0, 1440, "Blank the screen after N idle minutes in the local status/clock modes (0 = never).", func(c *Config) *int { return &c.DisplayIdleOff }),
 
 	str("hive_listen", ":7700", "Hive HTTPS listen address.", false, func(c *Config) *string { return &c.HiveListen },
 		func(v string) (string, error) {
@@ -435,14 +443,16 @@ var defs = []keyDef{
 			}
 			return v, nil
 		}),
-	str("admin_token", "", "Admin API token. Empty = generated on first start (stored in hive_data/admin_token).", true,
+	str("admin_token", "", "Admin API token (min 32 chars). Empty = generated on first start (stored in hive_data/admin_token).", true,
 		func(c *Config) *string { return &c.AdminToken },
 		func(v string) (string, error) {
-			if v != "" && len(v) < MinSwarmKeyLen {
-				return "", fmt.Errorf("too short (min %d characters)", MinSwarmKeyLen)
+			if v != "" && len(v) < MinAdminTokenLen {
+				return "", fmt.Errorf("too short (min %d characters)", MinAdminTokenLen)
 			}
 			return v, nil
 		}),
+	str("join_policy", "open", "open = nodes with the swarm key join directly; approve = new nodes wait for admin approval.", false,
+		func(c *Config) *string { return &c.JoinPolicy }, oneOf("open", "approve")),
 	boolean("beacon", true, "Hive announces itself on the LAN.", func(c *Config) *bool { return &c.Beacon }),
 
 	str("log_level", "info", "debug, info, warn or error.", false, func(c *Config) *string { return &c.LogLevel }, oneOf("debug", "info", "warn", "error")),
@@ -771,9 +781,10 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
-// EffectiveRoles resolves "auto": compute, plus display when a framebuffer
-// exists. The result is deduplicated and ordered compute, display, hive.
-func (c Config) EffectiveRoles(hasFramebuffer bool) []proto.Role {
+// EffectiveRoles resolves "auto": compute, plus display when a display
+// device (DRM card or framebuffer) exists. The result is deduplicated and
+// ordered compute, display, hive.
+func (c Config) EffectiveRoles(hasDisplay bool) []proto.Role {
 	set := map[proto.Role]bool{}
 	roles := c.Roles
 	if len(roles) == 0 {
@@ -783,7 +794,7 @@ func (c Config) EffectiveRoles(hasFramebuffer bool) []proto.Role {
 		switch r {
 		case "auto":
 			set[proto.RoleCompute] = true
-			if hasFramebuffer {
+			if hasDisplay {
 				set[proto.RoleDisplay] = true
 			}
 		default:

@@ -96,3 +96,29 @@ func TestBroadcastTargets(t *testing.T) {
 		t.Fatalf("targets %v", ts)
 	}
 }
+
+func TestProbePadding(t *testing.T) {
+	if n := len(NewProbe()); n < proto.MinProbeSize || n > proto.MinProbeSize+8 {
+		t.Fatalf("probe size %d", n)
+	}
+}
+
+func TestCollectSeesOtherSwarms(t *testing.T) {
+	hivePort := freeUDPPort(t)
+	nodePort := freeUDPPort(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go Announce(ctx, proto.Beacon{HiveID: "x", Port: 7700, SwarmHint: "other"}, AnnounceOptions{
+		Port: hivePort, Interval: 50 * time.Millisecond,
+		ListenAddr: "127.0.0.1:" + strconv.Itoa(hivePort),
+		Targets:    []string{"127.0.0.1:" + strconv.Itoa(nodePort)},
+	})
+	got, err := Collect(ctx, 400*time.Millisecond, DiscoverOptions{
+		Port: hivePort, ProbeInterval: 50 * time.Millisecond,
+		ListenAddr: "127.0.0.1:" + strconv.Itoa(nodePort),
+		Targets:    []string{"127.0.0.1:" + strconv.Itoa(hivePort)},
+	})
+	if err != nil || len(got) != 1 || got[0].Beacon.SwarmHint != "other" {
+		t.Fatalf("collect: %v %+v", err, got)
+	}
+}

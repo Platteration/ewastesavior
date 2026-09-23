@@ -16,6 +16,7 @@ import (
 	"github.com/platteration/ewastesavior/internal/hwinfo"
 	"github.com/platteration/ewastesavior/internal/node"
 	"github.com/platteration/ewastesavior/internal/runner"
+	"github.com/platteration/ewastesavior/internal/storage"
 	"github.com/platteration/ewastesavior/internal/version"
 )
 
@@ -31,6 +32,7 @@ var commands = []struct {
 	{"display", "test or drive the screen (test, render, show)", display.Main, false},
 	{"config", "read the merged savior.conf (env, get, dump, keys, sample)", config.Main, false},
 	{"console", "text status screen (runs on tty1)", node.ConsoleMain, false},
+	{"storage", "boot media and data partition helpers (SaviorOS)", storage.Main, true},
 	{"sandbox-exec", "internal: task sandbox shim", runner.SandboxExecMain, true},
 }
 
