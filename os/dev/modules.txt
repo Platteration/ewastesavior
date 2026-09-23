@@ -1,12 +1,17 @@
 # os/dev/modules.txt - kernel modules of the SaviorOS dev image.
 #
 # The dev image uses the Ubuntu 24.04 generic kernel (os/dev/build.sh). These
-# modules, plus everything they depend on (modules.dep), go into
+# modules, plus everything they depend on (modules.dep) and their soft
+# dependencies (modules.softdep, e.g. r8169 -> realtek), go into
 # /lib/modloop.sqfs. Syntax, one module per line:
 #   name              required: the build fails if the kernel has neither a
 #                     module nor a built-in driver of that name
 #   optional: name    skipped (with a note) when the kernel lacks it
 #   a|b               the first of these names that exists (renamed drivers)
+#   firmware: name package
+#                     when module "name" is in the modloop, every firmware
+#                     file it asks for (modinfo -F firmware) is taken from
+#                     the Ubuntu package (apt-get download) into firmware/
 # "-" and "_" are interchangeable. Modules the kernel has built in are fine
 # (they need no file). The production list is the Kconfig in
 # os/buildroot/board/savior/linux (DESIGN 14).
@@ -65,7 +70,7 @@ optional: video
 optional: acpi-cpufreq
 
 # --- real hardware (DESIGN 14 list), not needed in QEMU -------------------
-# Wired NICs.
+# Wired NICs. r8169 needs its PHY driver, realtek: a soft dependency.
 optional: r8169
 optional: e100
 optional: sky2
@@ -85,8 +90,13 @@ optional: ax88179_178a
 optional: r8152
 optional: cdc_ether
 # GPUs (large: i915, radeon and nouveau are about 3 MiB compressed together).
+# radeon removes the firmware framebuffer and then needs its microcode on
+# R600 and later (Radeon HD 2000 and up): without it such a machine has no
+# /dev/fb0 at all. So it gets its firmware (232 files, 1.7 MiB in the modloop).
+# i915 and nouveau keep a working display without firmware.
 optional: i915
 optional: radeon
+firmware: radeon linux-firmware-amd-graphics
 optional: nouveau
 optional: gma500_gfx
 optional: mgag200

@@ -5,6 +5,11 @@
 #   os/dev/qemu-test.sh [options] <test>...
 #
 # Tests:
+#   image          the payload without booting it: every soft dependency of
+#                  a module in the modloop is there too (r8169 -> realtek,
+#                  and BusyBox modprobe finds realtek for a Realtek PHY),
+#                  radeon has all its firmware, and the CA bundle is
+#                  Mozilla's set (not the build host's)
 #   boot-bios      USB stick (usb-storage on EHCI), SeaBIOS
 #   boot-uefi      USB stick, OVMF (x86_64 UEFI)
 #   boot-iso-bios  the ISO as an IDE CD-ROM, SeaBIOS (config from the CD)
@@ -17,21 +22,33 @@
 #                  (second initrd) is used when the stick has no savior.conf
 #   swarm          hive + 2 compute nodes + 1 display node on a private
 #                  multicast LAN, driven with `savior ctl` from this host:
-#                  job with count=4 and outputs, display text, identify,
-#                  duplicate node ID
+#                  job with count=4 and outputs (the tasks must see the CA
+#                  bundle), display black then text (compared pixel for
+#                  pixel with savior display render), identify, duplicate
+#                  node ID
 #   hive-pxe       a hive with netboot = yes PXE-boots diskless VMs (BIOS,
 #                  then UEFI) on a private LAN (S65netboot: dnsmasq DHCP +
 #                  TFTP, kernels over HTTP); each node joins keyless, is
 #                  pending, and gets approved with savior ctl
-#   all            every test above except swarm and hive-pxe (--swarm
-#                  adds them)
+#   hive-pxe-proxy netboot next to the LAN's own DHCP server (proxy DHCP,
+#                  the default): a "router" VM hands out the addresses
+#                  (SaviorOS udhcpd, then a dnsmasq whose replies name
+#                  itself as next-server, like OpenWrt), the hive answers
+#                  PXE only; BIOS and UEFI clients boot and join. A PXE
+#                  probe on the LAN checks that plain PXE ROMs get iPXE
+#                  (undionly.kpxe) and iPXE gets savior.ipxe; QEMU's own
+#                  NIC ROMs are iPXE, so no VM takes the undionly path.
+#                  Last, a hive with dhcp_server = yes but net = dhcp
+#                  must stay a proxy and say why.
+#   all            every test above except swarm, hive-pxe and
+#                  hive-pxe-proxy (--swarm adds them)
 #
 # Options:
 #   --out DIR          dev image directory (default build/dev); logs go to
 #                      DIR/logs/<test>.log, serial consoles to
 #                      DIR/logs/<test>[-vm].serial, screendumps to *.ppm
 #   --keep             keep the per-run work directory (stick copies etc.)
-#   --swarm            include swarm and hive-pxe in "all"
+#   --swarm            include swarm, hive-pxe and hive-pxe-proxy in "all"
 #   --expect-display   screen: also require a picture on the screen
 #                      (non-black pixels), for when the display agent works
 #   --timeout S        seconds to wait for a VM to boot (default 300)
@@ -45,6 +62,10 @@
 # boot (os/rootfs-overlay/usr/libexec/savior/boot-report):
 #   SAVIOR-BOOT: rcS done up=.. cfg=yes media=/dev/sda1 key=yes fb=yes
 #                net=10.0.2.15 console=yes node=yes ver=.. t=...
+# and, once savior node has kept running for 10 s (or has not):
+#   SAVIOR-AGENT: up=.. agent=up age=.. starts=1 arch=x86_64 ver=..
+# savior node's own log (stderr) also goes to the serial console, so the
+# harness sees every start ('savior node starting') and crash.
 
 # Functions run through trap and check() look unreachable to shellcheck,
 # and single-quoted $arch below is GRUB's variable:
@@ -60,7 +81,7 @@ EXPECT_DISPLAY=no
 BOOT_TIMEOUT=300
 MEM=512
 TESTS=""
-ALL_TESTS="boot-bios boot-uefi boot-iso-bios boot-iso-uefi pxe-bios pxe-uefi screen baked-conf"
+ALL_TESTS="image boot-bios boot-uefi boot-iso-bios boot-iso-uefi pxe-bios pxe-uefi screen baked-conf"
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 while [ $# -gt 0 ]; do
@@ -83,9 +104,9 @@ for t in $TESTS; do
 	case "$t" in
 	all)
 		expanded="$expanded $ALL_TESTS"
-		[ "$SWARM" = no ] || expanded="$expanded swarm hive-pxe"
+		[ "$SWARM" = no ] || expanded="$expanded swarm hive-pxe hive-pxe-proxy"
 		;;
-	boot-bios | boot-uefi | boot-iso-bios | boot-iso-uefi | pxe-bios | pxe-uefi | screen | baked-conf | swarm | hive-pxe)
+	image | boot-bios | boot-uefi | boot-iso-bios | boot-iso-uefi | pxe-bios | pxe-uefi | screen | baked-conf | swarm | hive-pxe | hive-pxe-proxy)
 		expanded="$expanded $t"
 		;;
 	*) echo "qemu-test: unknown test $t" >&2; exit 2 ;;
@@ -274,14 +295,51 @@ check_report() {
 	done
 }
 
-# check_respawn SERIAL: savior programs that exit at once (placeholders,
-# crashes) must not be restarted in a tight loop: at most 8 "exited" lines
-# from stub commands in 30 s.
+# node_starts SERIAL: how often savior node has started. The run wrapper
+# sends the agent's stderr (its log) to the serial console when the kernel
+# console is ttyS0, as in every SaviorOS menu entry.
+node_starts() { grep -a -c 'msg="savior node starting"' "$1"; }
+
+# NODE_EXIT_RE: signs on the serial console that savior node exited or
+# crashed: its last log line, a startup error, a Go crash (SIGILL on a CPU
+# without SSE2, panics), or a restart logged by the run wrapper (in the
+# syslog that savior_dumplog copies to the console).
+NODE_EXIT_RE='msg="(node agent stopped|cannot start the node agent)"|^savior node: |^(panic|fatal error): |^SIG[A-Z]+: |savior-run: node exited'
+node_exits() { grep -a -c -E "$NODE_EXIT_RE" "$1"; }
+
+# check_agent SERIAL PID: boot-report's SAVIOR-AGENT line must say that
+# savior node wrote its status and kept running for 10 s without a restart
+# (agent=up, starts=1), on x86_64, and that /usr/bin/savior runs (ver=).
+# node=yes in the boot line only means the run wrapper started it once.
+check_agent() {
+	if ! wait_for "$1" 'SAVIOR-AGENT: ' 150 "$2"; then
+		fail "no SAVIOR-AGENT line (boot-report) within 150 s of the boot report"
+		return 1
+	fi
+	_bl=$BOOTLINE
+	BOOTLINE=$(grep -a 'SAVIOR-AGENT: ' "$1" | tail -n 1 | tr -d '\r')
+	info "$BOOTLINE"
+	check_report agent=up starts=1 arch=x86_64
+	_v=$(field ver)
+	check "savior runs on the guest (ver = '$_v')" [ "${_v:-unknown}" != unknown ]
+	BOOTLINE=$_bl
+}
+
+# check_respawn SERIAL PID: savior node came up (check_agent), and 30 s
+# later it has still started only once and nothing on the console says it
+# exited or crashed. A crashing agent is restarted every 5-15 s by the run
+# wrapper, so a crash loop shows up as more starts and exit lines.
 check_respawn() {
-	_a=$(grep -a -c 'not implemented yet' "$1")
+	check_agent "$1" "$2"
+	_s0=$(node_starts "$1")
 	sleep 30
-	_b=$(grep -a -c 'not implemented yet' "$1")
-	check "no respawn flood ($((_b - _a)) placeholder exits in 30 s)" [ $((_b - _a)) -le 8 ]
+	_s1=$(node_starts "$1")
+	_e1=$(node_exits "$1")
+	check "no respawn: savior node started once ($_s1 starts, $((_s1 - _s0)) in the last 30 s)" [ "$_s1" -eq 1 ]
+	check "no respawn: savior node never exited or crashed ($_e1 exit or crash lines)" [ "$_e1" -eq 0 ]
+	if [ "$_e1" -gt 0 ]; then
+		grep -a -E "$NODE_EXIT_RE" "$1" | head -n 5 | tr -d '\r' | sed 's/^/        | /' | tee -a "$TLOG"
+	fi
 }
 
 # hmp VM COMMAND: run a QEMU monitor command.
@@ -337,6 +395,84 @@ ppm_stats() {
 	echo "$_dim $_nz $_tot"
 }
 
+# img_diff PNG PPM: the number of pixels that differ between an 8-bit RGB
+# or RGBA PNG (savior display render) and a P6 PPM screendump, or "size"
+# when their sizes differ (needs python3).
+img_diff() {
+	python3 - "$1" "$2" <<'PY'
+import struct, sys, zlib
+
+def png_rgb(path):
+    d = open(path, "rb").read()
+    if d[:8] != b"\x89PNG\r\n\x1a\n":
+        sys.exit("not a PNG: " + path)
+    i, idat = 8, b""
+    while i < len(d):
+        n, t = struct.unpack("!I4s", d[i:i + 8])
+        c = d[i + 8:i + 8 + n]
+        if t == b"IHDR":
+            w, h, depth, ctype, _, _, lace = struct.unpack("!IIBBBBB", c)
+            if depth != 8 or ctype not in (2, 6) or lace:
+                sys.exit("unsupported PNG: depth %d, color type %d, interlace %d" % (depth, ctype, lace))
+            bpp = 3 if ctype == 2 else 4
+        elif t == b"IDAT":
+            idat += c
+        i += 12 + n
+    raw = zlib.decompress(idat)
+    stride = w * bpp
+    out = bytearray()
+    prev = bytearray(stride)
+    p = 0
+    for _ in range(h):
+        f = raw[p]
+        line = bytearray(raw[p + 1:p + 1 + stride])
+        p += 1 + stride
+        if f:
+            for x in range(stride):
+                a = line[x - bpp] if x >= bpp else 0
+                b = prev[x]
+                c = prev[x - bpp] if x >= bpp else 0
+                if f == 1:
+                    line[x] = (line[x] + a) & 255
+                elif f == 2:
+                    line[x] = (line[x] + b) & 255
+                elif f == 3:
+                    line[x] = (line[x] + ((a + b) >> 1)) & 255
+                elif f == 4:
+                    pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                    line[x] = (line[x] + (a if pa <= pb and pa <= pc else b if pb <= pc else c)) & 255
+        prev = line
+        if bpp == 3:
+            out += line
+        else:
+            for x in range(0, stride, 4):
+                out += line[x:x + 3]
+    return w, h, bytes(out)
+
+def ppm_rgb(path):
+    d = open(path, "rb").read()
+    parts, i = [], 0
+    while len(parts) < 4:
+        while d[i:i + 1].isspace():
+            i += 1
+        j = i
+        while not d[j:j + 1].isspace():
+            j += 1
+        parts.append(d[i:j])
+        i = j
+    if parts[0] != b"P6" or parts[3] != b"255":
+        sys.exit("not a P6 PPM: " + path)
+    return int(parts[1]), int(parts[2]), d[i + 1:]
+
+pw, ph, a = png_rgb(sys.argv[1])
+sw, sh, b = ppm_rgb(sys.argv[2])
+if (pw, ph) != (sw, sh) or len(a) != len(b):
+    print("size")
+    sys.exit(0)
+print(sum(1 for k in range(0, len(a), 3) if a[k:k + 3] != b[k:k + 3]))
+PY
+}
+
 # ---------------------------------------------------------------------------
 # Media
 
@@ -388,6 +524,110 @@ usb_stick_args() { echo "-drive if=none,id=stick,format=raw,file=$1 -device usb-
 # ---------------------------------------------------------------------------
 # Tests
 
+# image: the payload, checked without booting it. The initrd's
+# /lib/modloop.sqfs must hold every soft dependency of its modules (modprobe
+# loads them, and r8169 finds no PHY driver without realtek), and the
+# image's own BusyBox modprobe must find realtek for a Realtek PHY (the
+# kernel asks for "mdio:<PHY ID in binary>"; run with -D, which loads
+# nothing, in a chroot). radeon must have every firmware file it asks for:
+# it removes the firmware framebuffer before it loads them. The CA bundle
+# must be Mozilla's set and hold none of the build host's own CAs
+# (/usr/local/share/ca-certificates, e.g. a proxy's).
+t_image() {
+	need_file "$OUT/initrd" || return
+	for _t in unsquashfs modinfo cpio; do
+		command -v "$_t" >/dev/null 2>&1 || { fail "this test needs $_t (squashfs-tools, kmod, cpio)"; return; }
+	done
+	x=$W/image
+	rm -rf "$x"
+	mkdir -p "$x/root" "$x/chroot/bin"
+	(cd "$x/root" && xz -dc "$OUT/initrd" | cpio -id --quiet 'lib/modloop.sqfs' 'bin/busybox' 'etc/ssl/*') 2>>"$TLOG"
+	if [ ! -s "$x/root/lib/modloop.sqfs" ]; then
+		fail "the initrd has no /lib/modloop.sqfs"
+		return
+	fi
+	unsquashfs -q -n -d "$x/chroot/lib" "$x/root/lib/modloop.sqfs" >>"$TLOG" 2>&1 || { fail "unsquashfs failed"; return; }
+	kv=""
+	for _d in "$x/chroot/lib/modules"/*; do
+		kv=${_d##*/}
+		break
+	done
+	md=$x/chroot/lib/modules/$kv
+	info "modloop: kernel $kv, $(find "$md" -name '*.ko' | wc -l) modules, $(find "$x/chroot/lib/firmware" -type f | wc -l) firmware files"
+
+	# Soft dependencies: depmod wrote those of the modloop's modules to its
+	# modules.softdep. Each must be a module in the modloop (by name or
+	# exact alias) or built in.
+	find "$md" -name '*.ko' | sed 's|.*/||; s|\.ko$||; s|-|_|g' | sort -u >"$x/names"
+	sed 's|.*/||; s|\.ko$||; s|-|_|g' "$md/modules.builtin" >>"$x/names"
+	awk '$1 == "alias" { a = $2; gsub(/-/, "_", a); print a }' "$md/modules.alias" >>"$x/names"
+	awk '$1 == "softdep" { m = $2; on = 0; for (i = 3; i <= NF; i++) { if ($i == "pre:" || $i == "post:") on = 1; else if (on) print m, $i } }' \
+		"$md/modules.softdep" >"$x/softdeps"
+	missing=""
+	while read -r _m _d; do
+		grep -q -x -F "$(printf '%s\n' "$_d" | tr - _)" "$x/names" || missing="$missing $_m->$_d"
+	done <"$x/softdeps"
+	info "soft dependencies: $(awk '{ printf "%s->%s ", $1, $2 }' "$x/softdeps")"
+	check "every soft dependency of a module in the modloop is in it (missing:${missing:- none})" [ -z "$missing" ]
+	if [ -n "$(find "$md" -name r8169.ko)" ]; then
+		check "r8169's PHY driver realtek.ko is in the modloop" [ -n "$(find "$md" -name realtek.ko)" ]
+		# RTL8211E, PHY ID 0x001cc915.
+		cp "$x/root/bin/busybox" "$x/chroot/bin/busybox"
+		[ "$kv" = "$(uname -r)" ] || ln -s "$kv" "$x/chroot/lib/modules/$(uname -r)"
+		set -- chroot
+		[ "$(id -u)" = 0 ] || set -- unshare -r chroot
+		if "$@" "$x/chroot" /bin/busybox true 2>/dev/null; then
+			out=$("$@" "$x/chroot" /bin/busybox modprobe -D mdio:00000000000111001100100100010101 2>&1)
+			printf '%s\n' "$out" | sed 's/^/        | /' >>"$TLOG"
+			ok=no
+			case "$out" in *"/realtek.ko"*) ok=yes ;; esac
+			check "BusyBox modprobe finds realtek.ko for a Realtek PHY (mdio: alias): $out" [ "$ok" = yes ]
+		else
+			info "cannot chroot here (not root, no unshare -r): BusyBox modprobe not tried"
+		fi
+	fi
+
+	# radeon's firmware.
+	ko=$(find "$md" -name radeon.ko | head -n 1)
+	if [ -n "$ko" ]; then
+		n=0
+		absent=0
+		for f in $(modinfo -F firmware "$ko"); do
+			n=$((n + 1))
+			[ -s "$x/chroot/lib/firmware/$f" ] || absent=$((absent + 1))
+		done
+		check "radeon has all the firmware it asks for ($((n - absent)) of $n files in firmware/)" [ $((n > 0 && absent == 0)) -eq 1 ]
+	else
+		info "no radeon.ko in the modloop"
+	fi
+
+	# The CA bundle.
+	ca=$x/root/etc/ssl/certs/ca-certificates.crt
+	if [ ! -s "$ca" ]; then
+		fail "no /etc/ssl/certs/ca-certificates.crt in the initrd"
+		return
+	fi
+	n=$(grep -c -e '-----BEGIN CERTIFICATE-----' "$ca")
+	check "the CA bundle holds Mozilla's set ($n certificates, want >= 100)" [ "$n" -ge 100 ]
+	check "the CA bundle is readable by everyone (mode $(stat -c %a "$ca"))" [ "$(stat -c %a "$ca")" = 644 ]
+	# pem_bodies FILE...: one line per certificate, its base64 text.
+	pem_bodies() {
+		awk '/-----BEGIN CERTIFICATE-----/ { b = ""; on = 1; next }
+			/-----END CERTIFICATE-----/ { if (on) print b; on = 0; next }
+			on { gsub(/[ \t\r]/, ""); b = b $0 }' "$@"
+	}
+	pem_bodies "$ca" | sort -u >"$x/ca.bodies"
+	set -- /usr/local/share/ca-certificates/*.crt /usr/local/share/ca-certificates/*/*.crt
+	local_n=0
+	leaked=0
+	for f in "$@"; do
+		[ -f "$f" ] || continue
+		local_n=$((local_n + 1))
+		pem_bodies "$f" | sort -u | comm -12 - "$x/ca.bodies" | grep -q . && leaked=$((leaked + 1))
+	done
+	check "none of the build host's $local_n local CAs is in the image's CA bundle ($leaked are)" [ "$leaked" -eq 0 ]
+}
+
 # boot_stick TEST FIRMWARE: boot a copy of savior.img with a test swarm key.
 boot_stick() {
 	need_file "$MEDIA/savior.img" || return
@@ -403,7 +643,7 @@ boot_stick() {
 	[ "$fw" = bios ] || set -- -bios "$OVMF" "$@"
 	vm "$CUR" "$serial" "$@"
 	wait_boot "$serial" "$VM_PID" || return
-	check_report cfg=yes key=yes 'media~^/dev/sd[a-z]+1$' net=10.0.2.15 console=yes fb=yes
+	check_report cfg=yes key=yes 'media~^/dev/sd[a-z]+1$' net=10.0.2.15 console=yes fb=yes node=yes
 	gl=$(grep -a -o 'SaviorOS: boot medium ([^)]*) found by [a-z]*' "$serial" | tail -n 1)
 	info "GRUB: ${gl:-no boot medium line}"
 	if [ "$fw" = bios ]; then
@@ -413,7 +653,7 @@ boot_stick() {
 		check "GRUB found the stick" grep -a -q 'SaviorOS: boot medium' "$serial"
 	fi
 	check "/boot-options.cfg sourced by GRUB (boot log dumped)" wait_for "$serial" 'SAVIOR-LOG: ' 30 "$VM_PID"
-	check_respawn "$serial"
+	check_respawn "$serial" "$VM_PID"
 }
 
 t_boot_bios() { boot_stick boot-bios bios; }
@@ -435,6 +675,11 @@ t_baked_conf() {
 	MTOOLS_SKIP_CHECK=1 mtype -i "$img@@$MT_OFF" ::/boot/grub/grub.cfg >"$W/baked-grub.cfg" 2>/dev/null
 	check "grub.cfg loads savior-conf.cpio as a second initrd" \
 		grep -q -F 'initrd /boot/$arch/initrd /boot/savior-conf.cpio' "$W/baked-grub.cfg"
+	# The stick copy warns that commenting out a line keeps the baked value.
+	MTOOLS_SKIP_CHECK=1 mtype -i "$img@@$MT_OFF" ::/savior.conf >"$W/baked-stick.conf" 2>/dev/null
+	check "the stick's savior.conf says commenting out does not undo a built-in setting" \
+		grep -q -F 'does NOT undo a built-in setting' "$W/baked-stick.conf"
+	check "the stick's savior.conf holds the --conf settings" grep -q '^name = baked-node' "$W/baked-stick.conf"
 	MTOOLS_SKIP_CHECK=1 mdel -i "$img@@$MT_OFF" ::/savior.conf || { fail "cannot remove savior.conf"; return; }
 	boot_options "$img@@$MT_OFF"
 	serial=$LOGS/$CUR.serial
@@ -443,6 +688,7 @@ t_baked_conf() {
 	wait_boot "$serial" "$VM_PID" || return
 	check_report cfg=no key=yes 'media~^/dev/sd[a-z]+1$' net=10.0.2.15
 	check "S08config used /etc/savior/baked.conf" wait_for "$serial" 'SAVIOR-LOG: .*baked.conf' 30 "$VM_PID"
+	check_agent "$serial" "$VM_PID"
 }
 t_boot_uefi() { boot_stick boot-uefi uefi; }
 
@@ -454,8 +700,8 @@ t_boot_iso_bios() {
 		-device ide-cd,drive=cd,bootindex=0
 	wait_boot "$serial" "$VM_PID" || return
 	# The CD holds the commented savior.conf template: config found, no key.
-	check_report cfg=yes key=no 'media~^/dev/sr[0-9]+$' net=10.0.2.15 console=yes fb=yes
-	check_respawn "$serial"
+	check_report cfg=yes key=no 'media~^/dev/sr[0-9]+$' net=10.0.2.15 console=yes fb=yes node=yes
+	check_respawn "$serial" "$VM_PID"
 }
 
 t_boot_iso_uefi() {
@@ -474,8 +720,8 @@ t_boot_iso_uefi() {
 		-drive "if=none,id=cd,media=cdrom,readonly=on,format=raw,file=$MEDIA/savior.iso" \
 		-device ide-cd,drive=cd,bootindex=0 $(usb_stick_args "$conf")
 	wait_boot "$serial" "$VM_PID" || return
-	check_report cfg=yes key=yes 'media~^/dev/sd[a-z]+$' net=10.0.2.15 console=yes fb=yes
-	check_respawn "$serial"
+	check_report cfg=yes key=yes 'media~^/dev/sd[a-z]+$' net=10.0.2.15 console=yes fb=yes node=yes
+	check_respawn "$serial" "$VM_PID"
 }
 
 # pxe TEST FIRMWARE BOOTFILE
@@ -496,8 +742,8 @@ pxe() {
 	vm "$CUR" "$serial" "$@"
 	# GRUB's BIOS PXE stack fetches the payload slowly under TCG (minutes).
 	wait_boot "$serial" "$VM_PID" $((BOOT_TIMEOUT * 2)) || return
-	check_report cfg=no key=yes media=none net=10.0.2.15 console=yes fb=yes
-	check_respawn "$serial"
+	check_report cfg=no key=yes media=none net=10.0.2.15 console=yes fb=yes node=yes
+	check_respawn "$serial" "$VM_PID"
 }
 
 t_pxe_bios() { pxe pxe-bios bios boot/grub/i386-pc/core.0; }
@@ -513,7 +759,8 @@ t_screen() {
 	vm screen "$serial" -m "$MEM" -smp 1 -vga std -netdev user,id=n0 -device e1000,netdev=n0 $(usb_stick_args "$img" 0)
 	wait_boot "$serial" "$VM_PID" || return
 	check_report fb=yes
-	sleep 15
+	check_agent "$serial" "$VM_PID"
+	sleep 5
 	ppm=$LOGS/screen.ppm
 	if ! screendump screen "$ppm"; then
 		fail "screendump through the QEMU monitor failed"
@@ -604,11 +851,15 @@ t_swarm() {
 	CUR=swarm/hive
 	wait_boot "$LOGS/swarm-hive.serial" "$HIVE_PID" || { CUR=swarm; return; }
 	check_report 'net~^10\.77\.0\.1$' cfg=yes key=yes
+	check_agent "$LOGS/swarm-hive.serial" "$HIVE_PID"
 	for n in c1 c2 disp; do
 		CUR=swarm/$n
 		pid=$(awk -v n="$n" '$1 == n { print $2 }' "$W/swarm.pids")
 		# DHCP from the hive's udhcpd (dhcp_server = yes) on the LAN.
-		wait_boot "$LOGS/swarm-$n.serial" "$pid" && check_report 'net~^10\.77\.0\.[0-9]+$' key=yes
+		if wait_boot "$LOGS/swarm-$n.serial" "$pid"; then
+			check_report 'net~^10\.77\.0\.[0-9]+$' key=yes
+			check_agent "$LOGS/swarm-$n.serial" "$pid"
+		fi
 	done
 	CUR=swarm
 	sleep 10
@@ -643,11 +894,12 @@ t_swarm() {
 	fi
 	cp "$W/ctl.out" "$LOGS/swarm-nodes.json"
 
-	# A job: 4 tasks that write an output file each.
+	# A job: 4 tasks that write an output file each, with the number of CA
+	# certificates the sandbox sees (the runner binds /etc/ssl/certs).
 	cat >"$W/job.json" <<'EOF'
 {
   "name": "qemu-swarm-test",
-  "script": "echo \"task $SAVIOR_TASK_INDEX of $SAVIOR_TASK_COUNT\" > out.txt\nuname -m >> out.txt\n",
+  "script": "echo \"task $SAVIOR_TASK_INDEX of $SAVIOR_TASK_COUNT\" > out.txt\nuname -m >> out.txt\necho \"ca $(grep -c -e '-----BEGIN CERTIFICATE-----' /etc/ssl/certs/ca-certificates.crt 2>&1 | head -n 1)\" >> out.txt\n",
   "outputs": ["out.txt"],
   "count": 4,
   "resources": {"cores": 0.5, "mem_mb": 64, "disk_mb": 16},
@@ -668,23 +920,72 @@ EOF
 		[ -n "$f" ] && found=$((found + 1))
 	done
 	check "outputs of all 4 tasks fetched with the right contents ($found/4)" [ "$found" -eq 4 ]
+	# Mozilla's CA set has well over 100 certificates.
+	ca=$(grep -r -h -E '^ca [0-9]+$' "$W/outputs" 2>/dev/null | awk '$2 >= 100 { n++ } END { print n + 0 }')
+	check "all 4 tasks see the CA bundle /etc/ssl/certs/ca-certificates.crt ($ca/4)" [ "$ca" -eq 4 ]
+	[ "$ca" -eq 4 ] || info "the tasks said: $(grep -r -h '^ca ' "$W/outputs" 2>/dev/null | sort | uniq -c | tr -s ' \n' ' ')"
 
-	# The display node shows text; the screen changes and is not black.
+	# The display node: first a known black screen (mode color), then the
+	# text, which must match savior display render of the same spec pixel
+	# for pixel. (The status scene is not black and redraws by itself, so
+	# "the screen changed" alone would pass without the text.)
 	disp_id=$(jq -r '[.[] | select(.name == "disp")][0].id // empty' "$LOGS/swarm-nodes.json")
 	[ -n "$disp_id" ] || disp_id=disp
-	screendump disp "$LOGS/swarm-disp-before.ppm"
+	if ctl display "$disp_id" color --bg 000000; then
+		pass "display set to color #000000"
+	else
+		fail "ctl display color failed: $(tail -n 2 "$W/ctl.err" | tr '\n' ' ')"
+	fi
+	nz=-
+	t0=$(date +%s)
+	while [ $(($(date +%s) - t0)) -lt 90 ]; do
+		sleep 3
+		screendump disp "$LOGS/swarm-disp-before.ppm" || continue
+		# shellcheck disable=SC2046
+		set -- $(ppm_stats "$LOGS/swarm-disp-before.ppm")
+		nz=$3
+		[ "$nz" -eq 0 ] && break
+	done
+	check "the display node's screen turned all black ($nz non-zero bytes)" [ "$nz" = 0 ]
+	printf '{"mode": "text", "text": "HELLO SWARM"}\n' >"$W/text-spec.json"
 	if ctl display "$disp_id" text --text "HELLO SWARM"; then
 		pass "display set to text 'HELLO SWARM'"
 	else
 		fail "ctl display failed: $(tail -n 2 "$W/ctl.err" | tr '\n' ' ')"
 	fi
-	sleep 20
-	if screendump disp "$LOGS/swarm-disp.ppm"; then
+	ref=""
+	if command -v python3 >/dev/null 2>&1; then
+		ref=$W/text-ref.png
+	else
+		info "no python3: the screen is not compared with savior display render"
+	fi
+	pxdiff=-
+	rm -f "$LOGS/swarm-disp.ppm"
+	t0=$(date +%s)
+	while [ $(($(date +%s) - t0)) -lt 90 ]; do
+		sleep 3
+		screendump disp "$LOGS/swarm-disp.ppm" || continue
 		# shellcheck disable=SC2046
 		set -- $(ppm_stats "$LOGS/swarm-disp.ppm")
-		check "display screen has non-black pixels ($3 of $4 bytes)" [ "$3" -gt 0 ]
+		[ "$3" -gt 0 ] || continue
+		[ -n "$ref" ] || break
+		if [ ! -s "$ref" ]; then
+			"$CTL" display render --spec "$W/text-spec.json" --size "$1x$2" --out "$ref" >>"$TLOG" 2>&1 ||
+				{ fail "savior display render failed"; ref=""; break; }
+		fi
+		pxdiff=$(img_diff "$ref" "$LOGS/swarm-disp.ppm")
+		[ "$pxdiff" = 0 ] && break
+	done
+	if [ -s "$LOGS/swarm-disp.ppm" ]; then
+		# shellcheck disable=SC2046
+		set -- $(ppm_stats "$LOGS/swarm-disp.ppm")
+		check "the text screen is not black ($3 of $4 bytes non-zero, want >= 1%)" [ $(($3 * 100)) -ge "$4" ]
 		check "display screen changed after the text was set" \
 			differs "$LOGS/swarm-disp-before.ppm" "$LOGS/swarm-disp.ppm"
+		if [ -n "$ref" ]; then
+			cp "$ref" "$LOGS/swarm-disp-ref.png" 2>/dev/null
+			check "the screen shows exactly what savior display render draws for the spec ($pxdiff pixels differ)" [ "$pxdiff" = 0 ]
+		fi
 	else
 		fail "screendump of the display node failed"
 	fi
@@ -704,19 +1005,35 @@ EOF
 	check "still 4 nodes online, the original kept its ID ($n)" [ "$n" -eq 4 ]
 }
 
-# hive-pxe: a hive with netboot = yes (S65netboot: dnsmasq DHCP + TFTP,
-# generated grub.cfg) boots a diskless machine on the private LAN. The
-# netbooted node joins keyless (no swarm key over the network), shows up as
-# pending and is approved with savior ctl.
+# lan_setup: a fresh multicast LAN, hive API port and admin token.
+lan_setup() {
+	MCAST="230.$(rand_byte).$(rand_byte).$(rand_byte):$((20000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000))"
+	HIVE_PORT=$((40000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000))
+	ADMIN_TOKEN=$(od -An -N20 -tx1 /dev/urandom | tr -d ' \n')
+	info "LAN mcast=$MCAST, hive API on 127.0.0.1:$HIVE_PORT"
+}
+
+# stop_pid PID: stop one VM of the running test.
+stop_pid() {
+	kill "$1" 2>/dev/null
+	_n=0
+	while kill -0 "$1" 2>/dev/null && [ "$_n" -lt 20 ]; do
+		sleep 0.5
+		_n=$((_n + 1))
+	done
+	kill -9 "$1" 2>/dev/null
+}
+
+# hive-pxe: a hive with netboot = yes and dhcp_server = yes (S65netboot:
+# dnsmasq DHCP + TFTP, generated grub.cfg) boots a diskless machine on the
+# private LAN. The netbooted node joins keyless (no swarm key over the
+# network), shows up as pending and is approved with savior ctl.
 t_hive_pxe() {
 	need_file "$MEDIA/savior.img" || return
 	CTL=$OUT/savior
 	need_file "$CTL" || return
 	command -v jq >/dev/null 2>&1 || { fail "this test needs jq (apt install jq)"; return; }
-	MCAST="230.$(rand_byte).$(rand_byte).$(rand_byte):$((20000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000))"
-	HIVE_PORT=$((40000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000))
-	ADMIN_TOKEN=$(od -An -N20 -tx1 /dev/urandom | tr -d ' \n')
-	info "LAN mcast=$MCAST, hive API on 127.0.0.1:$HIVE_PORT"
+	lan_setup
 	stick_copy "$W/nbhive.img"
 	truncate -s +2G "$W/nbhive.img"
 	stick_conf "$W/nbhive.img@@$MT_OFF" "swarm_key = $KEY" "name = hive" "roles = hive" "net = static" \
@@ -730,38 +1047,44 @@ t_hive_pxe() {
 	CUR=hive-pxe/hive
 	wait_boot "$LOGS/hive-pxe-hive.serial" "$HIVE_PID" || { CUR=hive-pxe; return; }
 	CUR=hive-pxe
-	if wait_for "$LOGS/hive-pxe-hive.serial" 'serving netboot files|netboot: serving PXE' 240 "$HIVE_PID"; then
-		pass "the hive serves netboot files"
+	if wait_for "$LOGS/hive-pxe-hive.serial" 'SAVIOR-NETBOOT: ' 240 "$HIVE_PID"; then
+		info "$(grep -a 'SAVIOR-NETBOOT: ' "$LOGS/hive-pxe-hive.serial" | tail -n 1 | tr -d '\r')"
+		check "the hive serves PXE as the LAN's DHCP server (net = static, dhcp_server = yes)" \
+			grep -a -q -E 'SAVIOR-NETBOOT: mode=full .* bios=grub uefi=yes' "$LOGS/hive-pxe-hive.serial"
 	else
-		info "no netboot log line from the hive (checking the client anyway)"
+		fail "no SAVIOR-NETBOOT line from the hive within 240 s (checking the clients anyway)"
 	fi
 	# Diskless clients, BIOS then UEFI: PXE from the hive's dnsmasq.
-	for fw in bios uefi; do
-		if [ "$fw" = uefi ] && ! need_ovmf; then
-			continue
-		fi
-		pxe_client "$fw" || return
-	done
+	PXE_T=hive-pxe
+	PXE_MAC=52:54:00:78:00
+	PXE_NET='^10\.77\.0\.[0-9]+$'
+	pxe_client bios 1 bios || return
+	need_ovmf || return
+	pxe_client uefi 2 uefi
 }
 
-# pxe_client FIRMWARE: one diskless VM of t_hive_pxe; its node must join
-# keyless, be pending, and come online once approved.
+# pxe_client FIRMWARE N LABEL: diskless VM number N (MAC $PXE_MAC:1N, UUID
+# ${U}1N) on the LAN of test $PXE_T, serial console in
+# $LOGS/$PXE_T-client-LABEL.serial. Its address must match $PXE_NET, and
+# its node must join keyless, be pending, and come online once approved.
+# VM_PID stays the client's.
 pxe_client() {
-	serial=$LOGS/hive-pxe-client-$1.serial
 	fw=$1
-	n=1
-	[ "$fw" = bios ] || n=2
+	n=$2
+	label=$3
+	serial=$LOGS/$PXE_T-client-$label.serial
 	set -- -m "$MEM" -smp 1 -vga std -uuid "${U}1$n" \
 		-netdev "socket,id=lan,mcast=$MCAST,localaddr=127.0.0.1" \
-		-device "e1000,netdev=lan,mac=52:54:00:78:00:1$n,bootindex=0"
+		-device "e1000,netdev=lan,mac=$PXE_MAC:1$n,bootindex=0"
 	[ "$fw" = bios ] || set -- -bios "$OVMF" "$@"
-	vm "client-$fw" "$serial" "$@"
-	CUR=hive-pxe/$fw
+	vm "client-$label" "$serial" "$@"
+	CUR=$PXE_T/$label
 	if ! wait_boot "$serial" "$VM_PID" $((BOOT_TIMEOUT * 3)); then
-		CUR=hive-pxe
+		CUR=$PXE_T
 		return 1
 	fi
-	check_report media=none key=no 'net~^10\.77\.0\.[0-9]+$'
+	check_report media=none key=no "net~$PXE_NET"
+	check_agent "$serial" "$VM_PID"
 	t0=$(date +%s)
 	id=""
 	while [ $(($(date +%s) - t0)) -lt 300 ]; do
@@ -773,7 +1096,7 @@ pxe_client() {
 	done
 	if [ -z "$id" ]; then
 		fail "no pending (keyless) node on the hive within 300 s"
-		CUR=hive-pxe
+		CUR=$PXE_T
 		return 1
 	fi
 	pass "the netbooted node joined keyless and is pending approval ($id)"
@@ -789,7 +1112,327 @@ pxe_client() {
 		sleep 5
 	done
 	check "the approved node is online" [ "$ok" = yes ]
-	CUR=hive-pxe
+	CUR=$PXE_T
+}
+
+# router_vm KIND: the LAN's DHCP server at 10.79.0.254 for hive-pxe-proxy,
+# booted straight from the dev payload (no stick) with net = static and
+# dhcp_server = yes. KIND udhcpd: SaviorOS's own S35dhcpd (udhcpd, next-server
+# 0.0.0.0) hands out .20-.59. KIND dnsmasq: S35dhcpd is replaced (an extra
+# cpio after the initrd) by a dnsmasq DHCP server for .60-.99 whose replies
+# name the router as next-server, as OpenWrt's and Pi-hole's do. Sets
+# ROUTER_PID.
+router_vm() {
+	_initrd=$OUT/initrd
+	_range=10.79.0.20-10.79.0.59
+	if [ "$1" = dnsmasq ]; then
+		_range=10.79.0.60-10.79.0.99
+		rm -rf "$W/router-ov"
+		mkdir -p "$W/router-ov/etc/init.d"
+		cat >"$W/router-ov/etc/init.d/S35dhcpd" <<'EOF'
+#!/bin/sh
+# qemu-test: the LAN router's DHCP server, dnsmasq (siaddr = itself).
+. /usr/libexec/savior/lib.sh
+[ "${1:-}" = start ] || exit 0
+load_env
+iface=$(first_wired)
+dnsmasq --port=0 --interface="$iface" --bind-interfaces --dhcp-authoritative \
+	--dhcp-range="${SAVIOR_DHCP_RANGE%-*},${SAVIOR_DHCP_RANGE#*-},255.255.255.0,1h" \
+	--dhcp-leasefile="$RUN_DIR/router.leases" --pid-file="$RUN_DIR/router.pid" &&
+	log "router: dnsmasq serves DHCP $SAVIOR_DHCP_RANGE on $iface"
+EOF
+		chmod 0755 "$W/router-ov/etc" "$W/router-ov/etc/init.d" "$W/router-ov/etc/init.d/S35dhcpd"
+		(cd "$W/router-ov" && printf '%s\n' etc etc/init.d etc/init.d/S35dhcpd |
+			cpio -o -H newc -R 0:0 --quiet) >"$W/router-ov.cpio" || { fail "cpio failed"; return 1; }
+		# The kernel reads concatenated archives at 4-byte boundaries.
+		_initrd=$W/router-initrd
+		cp "$OUT/initrd" "$_initrd"
+		_pad=$(((4 - $(wc -c <"$_initrd") % 4) % 4))
+		[ "$_pad" -eq 0 ] || head -c "$_pad" /dev/zero >>"$_initrd"
+		cat "$W/router-ov.cpio" >>"$_initrd"
+	fi
+	_serial=$LOGS/$PXE_T-router-$1.serial
+	vm "router-$1" "$_serial" -m "$MEM" -smp 1 -vga std \
+		-netdev "socket,id=lan,mcast=$MCAST,localaddr=127.0.0.1" -device e1000,netdev=lan,mac=52:54:00:79:00:fe \
+		-kernel "$OUT/vmlinuz" -initrd "$_initrd" \
+		-append "consoleblank=0 quiet loglevel=3 console=ttyS0,115200 console=tty0 savior.media=none savior.net=static savior.ip=10.79.0.254/24 savior.dhcp_server=yes savior.dhcp_range=$_range savior.roles=compute savior.hive=127.0.0.1:9 savior_dumplog=1"
+	ROUTER_PID=$VM_PID
+	CUR=$PXE_T/router-$1
+	wait_boot "$_serial" "$ROUTER_PID"
+	_rc=$?
+	CUR=$PXE_T
+	return "$_rc"
+}
+
+# pxe_probe MAC IP USERCLASS: a PXE client on the LAN that answers ARP for
+# IP and never takes a lease: DHCPDISCOVER as a BIOS PXE ROM
+# (PXEClient:Arch:00000, with user class USERCLASS unless it is "none"),
+# then a boot server request (port 4011) for the first PXE menu item of the
+# proxy offer. Prints one "offer ..." line per plain DHCP offer and a last
+# line "proxy=SERVER menu=TYPE:TEXT file=BOOTFILE siaddr=NEXTSERVER".
+pxe_probe() {
+	python3 - "$MCAST" "$@" <<'PY'
+import os, socket, struct, sys, time
+grp, port = sys.argv[1].rsplit(":", 1)
+mac = bytes.fromhex(sys.argv[2].replace(":", ""))
+myip = socket.inet_aton(sys.argv[3])
+ucls = b"" if sys.argv[4] == "none" else sys.argv[4].encode()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind((grp, int(port)))
+s.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, socket.inet_aton(grp) + socket.inet_aton("127.0.0.1"))
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton("127.0.0.1"))
+s.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+s.settimeout(0.2)
+dst = (grp, int(port))
+xid = os.urandom(4)
+zero = b"\0" * 4
+
+def csum(b):
+    t = sum(struct.unpack("!10H", b))
+    while t >> 16:
+        t = (t & 0xFFFF) + (t >> 16)
+    return ~t & 0xFFFF
+
+def frame(dmac, src, dstip, sport, dport, payload):
+    udp = struct.pack("!HHHH", sport, dport, 8 + len(payload), 0) + payload
+    ip = struct.pack("!BBHHHBBH4s4s", 0x45, 0, 20 + len(udp), 0, 0, 64, 17, 0, src, dstip)
+    ip = ip[:10] + struct.pack("!H", csum(ip)) + ip[12:]
+    return dmac + mac + b"\x08\x00" + ip + udp
+
+def opt(code, data):
+    return bytes([code, len(data)]) + data
+
+def bootp(msgtype, ciaddr, extra=b""):
+    b = struct.pack("!BBBB4sHH4s4s4s4s16s64s128s", 1, 1, 6, 0, xid, 0,
+                    0x8000 if ciaddr == zero else 0, ciaddr, zero, zero, zero, mac, b"", b"")
+    o = b"\x63\x82\x53\x63" + opt(53, bytes([msgtype]))
+    o += opt(60, b"PXEClient:Arch:00000:UNDI:002001") + opt(93, b"\0\0") + opt(94, b"\1\2\1")
+    o += opt(97, b"\0" + mac + mac + b"\0\0\0\0") + opt(55, bytes([1, 3, 43, 54, 60, 66, 67]))
+    if ucls:
+        o += opt(77, ucls)
+    return b + o + extra + b"\xff"
+
+def options(b):
+    res, i = {}, 240
+    while i < len(b) and b[i] != 255:
+        if b[i] == 0:
+            i += 1
+            continue
+        res[b[i]] = b[i + 2:i + 2 + b[i + 1]]
+        i += 2 + b[i + 1]
+    return res
+
+def subopts(b):
+    res, i = {}, 0
+    while i + 1 < len(b) and b[i] != 255:
+        res[b[i]] = b[i + 2:i + 2 + b[i + 1]]
+        i += 2 + b[i + 1]
+    return res
+
+def replies(until, want):
+    # Answer ARP for our address; return the first BOOTP reply for our xid
+    # that want(ip_src, eth_src, bootp, options) accepts.
+    while time.time() < until:
+        try:
+            f = s.recv(2048)
+        except socket.timeout:
+            continue
+        if len(f) < 42 or f[6:12] == mac:
+            continue
+        et = f[12:14]
+        if et == b"\x08\x06" and f[20:22] == b"\0\1" and f[38:42] == myip:
+            arp = struct.pack("!HHBBH6s4s6s4s", 1, 0x0800, 6, 4, 2, mac, myip, f[22:28], f[28:32])
+            s.sendto(f[6:12] + mac + b"\x08\x06" + arp, dst)
+            continue
+        if et != b"\x08\x00" or f[23] != 17:
+            continue
+        ihl = (f[14] & 15) * 4
+        u = 14 + ihl
+        if struct.unpack("!H", f[u + 2:u + 4])[0] != 68:
+            continue
+        b = f[u + 8:]
+        if len(b) < 240 or b[0] != 2 or b[4:8] != xid:
+            continue
+        o = options(b)
+        if want(f[26:30], f[6:12], b, o):
+            return f[26:30], f[6:12], b, o
+    return None
+
+ip = socket.inet_ntoa
+proxy = None
+seen = set()
+
+def offer(src, emac, b, o):
+    global proxy
+    if o.get(53) != b"\x02":
+        return False
+    if o.get(60, b"").startswith(b"PXEClient"):
+        proxy = proxy or (src, emac, b, o)
+    elif o.get(54) not in seen:
+        seen.add(o.get(54))
+        print("offer server=%s yiaddr=%s siaddr=%s file=%r" % (ip(o.get(54, zero)), ip(b[16:20]), ip(b[20:24]), b[108:236].rstrip(b"\0").decode()))
+    return False
+
+end = time.time() + 30
+while proxy is None and time.time() < end:
+    s.sendto(frame(b"\xff" * 6, zero, b"\xff" * 4, 68, 67, bootp(1, zero)), dst)
+    # DHCP servers may check the address (ping, ARP) before they offer it:
+    # listen long enough for their offers too.
+    replies(time.time() + 5, offer)
+if proxy is None:
+    print("error: no proxy DHCP offer (PXEClient) within 30 s")
+    sys.exit(1)
+psrc, pmac, pb, po = proxy
+server = po.get(54, psrc)
+vend = subopts(po.get(43, b""))
+menu = vend.get(9, b"")
+if len(menu) < 3:
+    print("proxy=%s menu=none file=%r siaddr=%s" % (ip(server), pb[108:236].rstrip(b"\0").decode(), ip(pb[20:24])))
+    sys.exit(0)
+item = menu[0:2]
+text = menu[3:3 + menu[2]].decode(errors="replace")
+req = bootp(3, myip, opt(43, bytes([71, 4]) + item + b"\0\0\xff"))
+ack = None
+end = time.time() + 20
+while ack is None and time.time() < end:
+    s.sendto(frame(pmac, myip, server, 68, 4011, req), dst)
+    ack = replies(time.time() + 3, lambda src, emac, b, o: o.get(53) == b"\x05")
+if ack is None:
+    print("proxy=%s menu=%d:%s error: no boot server reply from %s:4011" % (ip(server), struct.unpack("!H", item)[0], text, ip(server)))
+    sys.exit(1)
+b = ack[2]
+print("proxy=%s menu=%d:%s file=%s siaddr=%s" % (ip(server), struct.unpack("!H", item)[0], text, b[108:236].rstrip(b"\0").decode(), ip(b[20:24])))
+PY
+}
+
+# probe_file OUTPUT: the file= value of pxe_probe's last line.
+probe_file() { printf '%s\n' "$1" | tail -n 1 | sed -n 's/.* file=\([^ ]*\).*/\1/p'; }
+# out_has REGEX: a line of $out (pxe_probe output) matches REGEX.
+out_has() { printf '%s\n' "$out" | grep -q -E -- "$1"; }
+
+# hive-pxe-proxy: netboot = yes next to the LAN's own DHCP server (the
+# default: S65netboot answers PXE as a proxy DHCP server, dhcp_server = no).
+# BOOT-01: GRUB's BIOS core.0 cannot boot from a plain PXE ROM there, so
+# such ROMs get iPXE (undionly.kpxe) and iPXE gets savior.ipxe, which points
+# next-server at the hive and chains core.0. QEMU's NIC ROMs are iPXE, so
+# the VMs take the savior.ipxe path; pxe_probe checks what a plain PXE ROM
+# is offered.
+t_hive_pxe_proxy() {
+	need_file "$MEDIA/savior.img" || return
+	need_file "$OUT/vmlinuz" || return
+	need_file "$OUT/initrd" || return
+	CTL=$OUT/savior
+	need_file "$CTL" || return
+	command -v jq >/dev/null 2>&1 || { fail "this test needs jq (apt install jq)"; return; }
+	command -v python3 >/dev/null 2>&1 || { fail "this test needs python3"; return; }
+	need_ovmf || return
+	PXE_T=hive-pxe-proxy
+	PXE_MAC=52:54:00:79:00
+	U=5a510000-0000-4000-8000-0000000002
+	lan_setup
+	NB_PORT=$((HIVE_PORT + 1))
+	MTOOLS_SKIP_CHECK=1 mcopy -n -i "$MEDIA/savior.img@@$MT_OFF" ::/boot/netboot/boot/ipxe/undionly.kpxe "$W/stick-undionly.kpxe" 2>/dev/null ||
+		fail "the stick has no /boot/netboot/boot/ipxe/undionly.kpxe (mkimage --ipxe; install ipxe)"
+
+	# The router first, so the hive's clients find a DHCP server.
+	router_vm udhcpd || return
+	stick_copy "$W/pxhive.img"
+	truncate -s +2G "$W/pxhive.img"
+	stick_conf "$W/pxhive.img@@$MT_OFF" "swarm_key = $KEY" "name = hive" "roles = hive" "net = static" \
+		"ip = 10.79.0.1/24" "dhcp_server = no" "netboot = yes" "admin_token = $ADMIN_TOKEN" ||
+		{ fail "stick setup"; return; }
+	boot_options "$W/pxhive.img@@$MT_OFF"
+	swarm_vm hive 52:54:00:79:00:01 "${U}01" "$W/pxhive.img" 1024 \
+		-netdev "user,id=up,hostfwd=tcp:127.0.0.1:$HIVE_PORT-:7700,hostfwd=tcp:127.0.0.1:$NB_PORT-:7702" \
+		-device e1000,netdev=up,mac=52:54:00:79:01:01
+	HIVE_PID=$VM_PID
+	hserial=$LOGS/$PXE_T-hive.serial
+	CUR=$PXE_T/hive
+	wait_boot "$hserial" "$HIVE_PID" || { CUR=$PXE_T; return; }
+	CUR=$PXE_T
+	if ! wait_for "$hserial" 'SAVIOR-NETBOOT: ' 240 "$HIVE_PID"; then
+		fail "no SAVIOR-NETBOOT line from the hive within 240 s"
+		return
+	fi
+	info "$(grep -a 'SAVIOR-NETBOOT: ' "$hserial" | tail -n 1 | tr -d '\r')"
+	check "the hive answers PXE as a proxy DHCP server, BIOS through iPXE (undionly.kpxe)" \
+		grep -a -q -E 'SAVIOR-NETBOOT: mode=proxy iface=[a-z0-9]+ addr=10\.79\.0\.1 bios=undionly uefi=yes' "$hserial"
+	if command -v curl >/dev/null 2>&1; then
+		# The hive's netboot HTTP server serves the same tree as TFTP.
+		curl -s -m 30 -o "$W/undionly.kpxe" "http://127.0.0.1:$NB_PORT/boot/ipxe/undionly.kpxe"
+		check "the hive serves the stick's undionly.kpxe" cmp -s "$W/undionly.kpxe" "$W/stick-undionly.kpxe"
+		curl -s -m 30 -o "$W/savior.ipxe" "http://127.0.0.1:$NB_PORT/boot/ipxe/savior.ipxe"
+		sed 's/^/        | /' "$W/savior.ipxe" >>"$TLOG"
+		check "savior.ipxe points next-server at the hive and chains core.0" \
+			grep -q -x -F 'set netX/next-server 10.79.0.1' "$W/savior.ipxe"
+		check "savior.ipxe chains tftp://10.79.0.1/boot/grub/i386-pc/core.0" \
+			grep -q -F 'chain tftp://10.79.0.1/boot/grub/i386-pc/core.0' "$W/savior.ipxe"
+	fi
+
+	# What PXE ROMs are offered. Plain ROMs must get iPXE, and iPXE (user
+	# class "iPXE", after undionly.kpxe or as the NIC ROM) the script,
+	# never iPXE again (no chain loop).
+	for uc in none iPXE; do
+		want=boot/ipxe/undionly.kpxe
+		[ "$uc" = none ] || want=boot/ipxe/savior.ipxe
+		out=$(pxe_probe 52:54:00:79:00:f0 10.79.0.240 "$uc" 2>&1)
+		printf '%s\n' "$out" | sed "s/^/      $CUR: probe ($uc): /" | tee -a "$TLOG"
+		check "a BIOS PXE client with user class $uc gets $want from the hive" \
+			[ "$(probe_file "$out")" = "$want" ]
+		check "... in the hive's proxy offer and boot server reply (next-server 10.79.0.1)" \
+			out_has '^proxy=10\.79\.0\.1 .* siaddr=10\.79\.0\.1$'
+	done
+
+	# Diskless VMs (iPXE NIC ROMs): BIOS runs savior.ipxe, UEFI the
+	# firmware's own PXE; addresses from the router's range.
+	PXE_NET='^10\.79\.0\.[2-5][0-9]$'
+	pxe_client bios 1 bios || return
+	c1=$VM_PID
+	pxe_client uefi 2 uefi || return
+	stop_pid "$c1"
+	stop_pid "$VM_PID"
+
+	# A router whose DHCP replies name itself as next-server (dnsmasq):
+	# GRUB must still find the hive (savior.ipxe sets next-server; GRUB's
+	# efinet takes the proxy offer's server).
+	stop_pid "$ROUTER_PID"
+	router_vm dnsmasq || return
+	out=$(pxe_probe 52:54:00:79:00:f1 10.79.0.241 iPXE 2>&1)
+	printf '%s\n' "$out" | sed "s/^/      $CUR: probe (iPXE): /" | tee -a "$TLOG"
+	check "the dnsmasq router's offers name itself as next-server" \
+		out_has '^offer server=10\.79\.0\.254 .*siaddr=10\.79\.0\.254 '
+	check "... and the hive still offers savior.ipxe" [ "$(probe_file "$out")" = boot/ipxe/savior.ipxe ]
+	PXE_NET='^10\.79\.0\.[6-9][0-9]$'
+	pxe_client bios 3 bios-siaddr || return
+	c1=$VM_PID
+	pxe_client uefi 4 uefi-siaddr || return
+	stop_pid "$c1"
+	stop_pid "$VM_PID"
+	stop_pid "$HIVE_PID"
+
+	# BOOT-03: dhcp_server = yes without net = static must not make the
+	# hive a second DHCP server on the router's LAN.
+	stick_copy "$W/pxhive2.img"
+	truncate -s +2G "$W/pxhive2.img"
+	stick_conf "$W/pxhive2.img@@$MT_OFF" "swarm_key = $KEY" "name = hive2" "roles = hive" \
+		"dhcp_server = yes" "netboot = yes" || { fail "stick setup"; return; }
+	boot_options "$W/pxhive2.img@@$MT_OFF"
+	swarm_vm hive2 52:54:00:79:00:02 "${U}02" "$W/pxhive2.img" 1024
+	h2=$VM_PID
+	CUR=$PXE_T/hive2
+	wait_boot "$LOGS/$PXE_T-hive2.serial" "$h2" || { CUR=$PXE_T; return; }
+	check_report 'net~^10\.79\.0\.[6-9][0-9]$'
+	check "the console says dhcp_server = yes needs net = static" \
+		wait_for "$LOGS/$PXE_T-hive2.serial" 'SAVIOR-LOG: .*dhcp_server = yes needs net = static' 60 "$h2"
+	if wait_for "$LOGS/$PXE_T-hive2.serial" 'SAVIOR-NETBOOT: ' 240 "$h2"; then
+		info "$(grep -a 'SAVIOR-NETBOOT: ' "$LOGS/$PXE_T-hive2.serial" | tail -n 1 | tr -d '\r')"
+		check "the hive answers PXE only as a proxy DHCP server" \
+			grep -a -q 'SAVIOR-NETBOOT: mode=proxy ' "$LOGS/$PXE_T-hive2.serial"
+	else
+		fail "no SAVIOR-NETBOOT line from the hive within 240 s"
+	fi
+	CUR=$PXE_T
 }
 
 # ---------------------------------------------------------------------------
@@ -799,6 +1442,7 @@ echo "qemu-test: $QEMU (TCG), media from $MEDIA, logs in $LOGS"
 for t in $TESTS; do
 	begin_test "$t"
 	case "$t" in
+	image) t_image ;;
 	boot-bios) t_boot_bios ;;
 	boot-uefi) t_boot_uefi ;;
 	boot-iso-bios) t_boot_iso_bios ;;
@@ -809,6 +1453,7 @@ for t in $TESTS; do
 	baked-conf) t_baked_conf ;;
 	swarm) t_swarm ;;
 	hive-pxe) t_hive_pxe ;;
+	hive-pxe-proxy) t_hive_pxe_proxy ;;
 	esac
 	end_test
 done
