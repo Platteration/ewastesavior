@@ -629,6 +629,10 @@ func ParseFile(r io.Reader, name string, c *Config) []string {
 	return warnings
 }
 
+// bootOnlyKeys are savior.* cmdline parameters used by the boot scripts
+// (e.g. savior.media for S08config), not configuration keys.
+var bootOnlyKeys = map[string]bool{"media": true}
+
 // ParseCmdline applies savior.<key>=<value> tokens from a kernel command line.
 func ParseCmdline(cmdline string, c *Config) []string {
 	var warnings []string
@@ -640,6 +644,9 @@ func ParseCmdline(cmdline string, c *Config) []string {
 		kv := strings.TrimPrefix(tok, CmdlinePrefix)
 		k, v, hasVal := strings.Cut(kv, "=")
 		k = strings.ToLower(k)
+		if bootOnlyKeys[k] {
+			continue
+		}
 		d, known := defIndex[k]
 		if !hasVal {
 			if known && d.Type == "bool" {

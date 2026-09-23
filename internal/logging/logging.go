@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 )
@@ -40,6 +41,11 @@ func Setup(level, file string) (*slog.Logger, io.Closer, error) {
 		}
 		w = io.MultiWriter(os.Stderr, rf)
 		closer = rf
+		// Keep Go panics and fatal errors: stderr may go to /dev/null.
+		if cf, err := os.OpenFile(file+".crash", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600); err == nil {
+			debug.SetCrashOutput(cf, debug.CrashOptions{})
+			cf.Close()
+		}
 	}
 	h := slog.NewTextHandler(w, &slog.HandlerOptions{Level: ParseLevel(level)})
 	return slog.New(h), closer, nil

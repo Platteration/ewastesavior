@@ -97,7 +97,7 @@ func TestListSourceSemantics(t *testing.T) {
 
 func TestCmdline(t *testing.T) {
 	c := Default()
-	w := ParseCmdline(`BOOT_IMAGE=/boot/vmlinuz quiet savior.roles=display savior.display_text=Hello%20World savior.console_shell "savior.name=lab-1" savior.nothing savior.hive=10.0.0.5:7700`, &c)
+	w := ParseCmdline(`BOOT_IMAGE=/boot/vmlinuz quiet savior.roles=display savior.display_text=Hello%20World savior.console_shell "savior.name=lab-1" savior.nothing savior.hive=10.0.0.5:7700 savior.media=UUID=1234-ABCD`, &c)
 	if !reflect.DeepEqual(c.Roles, []string{"display"}) || c.DisplayText != "Hello World" || !c.ConsoleShell || c.Name != "lab-1" || c.Hive != "10.0.0.5:7700" {
 		t.Fatalf("cmdline not applied: %+v", c)
 	}

@@ -42,8 +42,11 @@ func main() {
 
 func run(args []string, stdout, stderr io.Writer) int {
 	// Multi-call: a symlink named savior-<cmd> (e.g. savior-ctl) runs <cmd>.
+	// Other names (savior-sse2, savior-softfloat builds) are ordinary.
 	if base := filepath.Base(args[0]); strings.HasPrefix(base, "savior-") {
-		args = append([]string{args[0], strings.TrimPrefix(base, "savior-")}, args[1:]...)
+		if name := strings.TrimPrefix(base, "savior-"); isCommand(name) {
+			args = append([]string{args[0], name}, args[1:]...)
+		}
 	}
 	if len(args) < 2 {
 		usage(stderr)
@@ -66,6 +69,15 @@ func run(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stderr, "savior: unknown command %q\n\n", sub)
 	usage(stderr)
 	return 2
+}
+
+func isCommand(name string) bool {
+	for _, c := range commands {
+		if c.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func usage(w io.Writer) {
