@@ -52,16 +52,16 @@ func HasRole(roles []Role, r Role) bool {
 // agent start (see internal/hwinfo).
 type Inventory struct {
 	Hostname      string    `json:"hostname"`
-	Arch          string    `json:"arch"`        // GOARCH style: amd64, 386, arm64, arm
-	MachineArch   string    `json:"machine"`     // uname -m: x86_64, i686, ...
-	Kernel        string    `json:"kernel"`      // kernel release
-	OSVersion     string    `json:"os_version"`  // SaviorOS version (from /etc/savior-release) or ""
-	CPUModel      string    `json:"cpu_model"`   // "Intel(R) Pentium(R) M processor 1.60GHz"
-	CPUVendor     string    `json:"cpu_vendor"`  // GenuineIntel, AuthenticAMD, ...
-	CPUFlags      []string  `json:"cpu_flags"`   // subset of interest: lm pae nx sse sse2 sse3 ssse3 sse4_1 sse4_2 avx avx2 aes vmx svm hypervisor
-	Cores         int       `json:"cores"`       // online logical CPUs
+	Arch          string    `json:"arch"`       // GOARCH style: amd64, 386, arm64, arm
+	MachineArch   string    `json:"machine"`    // uname -m: x86_64, i686, ...
+	Kernel        string    `json:"kernel"`     // kernel release
+	OSVersion     string    `json:"os_version"` // SaviorOS version (from /etc/savior-release) or ""
+	CPUModel      string    `json:"cpu_model"`  // "Intel(R) Pentium(R) M processor 1.60GHz"
+	CPUVendor     string    `json:"cpu_vendor"` // GenuineIntel, AuthenticAMD, ...
+	CPUFlags      []string  `json:"cpu_flags"`  // subset of interest: lm pae nx sse sse2 sse3 ssse3 sse4_1 sse4_2 avx avx2 aes vmx svm hypervisor
+	Cores         int       `json:"cores"`      // online logical CPUs
 	PhysicalCores int       `json:"physical_cores"`
-	CPUMHz        int       `json:"cpu_mhz"`     // max frequency if known, else current
+	CPUMHz        int       `json:"cpu_mhz"` // max frequency if known, else current
 	MemTotalMB    int       `json:"mem_total_mb"`
 	SwapTotalMB   int       `json:"swap_total_mb"`
 	Disks         []Disk    `json:"disks,omitempty"`
@@ -92,7 +92,7 @@ type NIC struct {
 	Name     string   `json:"name"`
 	MAC      string   `json:"mac"`
 	Wireless bool     `json:"wireless"`
-	Bus      string   `json:"bus,omitempty"`       // pci, usb, virtual
+	Bus      string   `json:"bus,omitempty"`        // pci, usb, virtual
 	SpeedMb  int      `json:"speed_mbps,omitempty"` // link speed when up and known
 	Up       bool     `json:"up"`
 	Addrs    []string `json:"addrs,omitempty"` // CIDR strings
@@ -551,8 +551,8 @@ type NodePatch struct {
 
 // NodeAction requests a one-shot action on a node.
 type NodeAction struct {
-	Action   string `json:"action"`               // identify | reboot | poweroff
-	Seconds  int    `json:"seconds,omitempty"`    // identify duration (default 30)
+	Action  string `json:"action"`            // identify | reboot | poweroff
+	Seconds int    `json:"seconds,omitempty"` // identify duration (default 30)
 }
 
 // TaskCounts summarizes task states within a job.
