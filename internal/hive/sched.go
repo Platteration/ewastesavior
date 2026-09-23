@@ -208,7 +208,8 @@ func (s *Server) dispatchLocked(n *node, reqFree proto.Resources, max int, now t
 		} else {
 			// A reserved node receives only its task, once it fits and
 			// the node has let go of any earlier lease of it.
-			if _, old := n.held[t.ID]; !old && s.matchesLocked(n, &t.job.Spec) && fitsFree(n, free, t.job.Spec.Resources) {
+			if _, old := n.held[t.ID]; !old && !(s.storageLow && len(t.job.Spec.Outputs) > 0) &&
+				s.matchesLocked(n, &t.job.Spec) && fitsFree(n, free, t.job.Spec.Resources) {
 				s.removeRequeuedLocked(t)
 				take(t)
 			}
@@ -220,7 +221,7 @@ func (s *Server) dispatchLocked(n *node, reqFree proto.Resources, max int, now t
 		if len(out) >= max {
 			break
 		}
-		if j.Canceled || j.counts.Pending == 0 || !s.matchesLocked(n, &j.Spec) {
+		if j.Canceled || j.counts.Pending == 0 || !s.matchesLocked(n, &j.Spec) || s.storageLow && len(j.Spec.Outputs) > 0 {
 			continue
 		}
 		need := j.Spec.Resources
@@ -371,7 +372,13 @@ func (s *Server) fitsKnownNodeLocked(j *job) bool {
 }
 
 func (s *Server) jobWarningLocked(j *job) string {
-	if j.finished() || j.Canceled || s.fitsKnownNodeLocked(j) {
+	if j.finished() || j.Canceled {
+		return ""
+	}
+	if s.storageLow && len(j.Spec.Outputs) > 0 && j.counts.Pending > 0 {
+		return "the hive's storage is nearly full: tasks with outputs wait until space is freed (savior ctl gc, or delete old jobs)"
+	}
+	if s.fitsKnownNodeLocked(j) {
 		return ""
 	}
 	r := j.Spec.Resources
@@ -383,6 +390,9 @@ func (s *Server) jobWarningLocked(j *job) string {
 func (s *Server) waitReasonLocked(t *task, now time.Time) string {
 	if t.State != proto.TaskPending {
 		return ""
+	}
+	if s.storageLow && len(t.job.Spec.Outputs) > 0 {
+		return "waiting for free space on the hive"
 	}
 	if r := s.reservation; r != nil && r.taskID == t.ID {
 		name := r.nodeID

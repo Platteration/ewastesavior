@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -384,5 +385,57 @@ func TestOutputsZipIncomplete(t *testing.T) {
 		if _, zerr := zip.NewReader(bytes.NewReader(resp.body), int64(len(resp.body))); zerr == nil {
 			t.Fatalf("a short blob was served as a complete zip (%d)", resp.code)
 		}
+	}
+}
+
+func TestMinFreeDiskScales(t *testing.T) {
+	const mib = 1 << 20
+	for _, c := range []struct{ total, want int64 }{
+		{256 * mib, 256 * mib / 10},   // RAM-backed hive: 10%
+		{2048 * mib, 2048 * mib / 10}, // 2 GiB stick: 10% < 512 MiB
+		{8192 * mib, 512 * mib},       // 8 GiB: 512 MiB
+		{1 << 40, (1 << 40) / 20},     // 1 TiB: 5%
+	} {
+		if got := minFreeDisk(c.total); got != c.want {
+			t.Errorf("minFreeDisk(%d MiB) = %d MiB, want %d MiB", c.total/mib, got/mib, c.want/mib)
+		}
+	}
+}
+
+// With the hive's storage nearly full, jobs with outputs wait (with a
+// reason and a hive warning) instead of failing every upload; jobs without
+// outputs still run. They resume once space is free.
+func TestStorageLowHoldsJobsWithOutputs(t *testing.T) {
+	t.Parallel()
+	var free atomic.Int64
+	free.Store(10 << 20)
+	h := newHive(t, func(c *Config) {
+		c.tune.diskFree = func(string) (int64, int64, bool) { return free.Load(), 256 << 20, true }
+	})
+	n := h.newNode(nil)
+	n.register()
+	eventually(t, "storage warning", func() bool {
+		var info proto.HiveInfo
+		h.mustAdmin("GET", "info", nil, &info)
+		return len(info.Warnings) > 0 && strings.Contains(strings.Join(info.Warnings, "\n"), "storage is nearly full")
+	})
+	withOut := h.submit(scriptJob(1, func(s *proto.JobSpec) { s.Outputs = []string{"out.txt"}; s.Priority = 10 }))
+	plain := h.submit(scriptJob(1, nil))
+	got := n.claim(4)
+	if len(got) != 1 || got[0].JobID != plain.ID {
+		t.Fatalf("claimed %+v, want only the job without outputs", got)
+	}
+	if w := h.job(withOut.ID).Warning; !strings.Contains(w, "storage is nearly full") {
+		t.Fatalf("job warning %q", w)
+	}
+	free.Store(200 << 20)
+	eventually(t, "the job with outputs to be dispatched", func() bool {
+		got := n.claim(4)
+		return len(got) == 1 && got[0].JobID == withOut.ID
+	})
+	var info proto.HiveInfo
+	h.mustAdmin("GET", "info", nil, &info)
+	if strings.Contains(strings.Join(info.Warnings, "\n"), "storage") {
+		t.Errorf("warning kept after space was freed: %v", info.Warnings)
 	}
 }

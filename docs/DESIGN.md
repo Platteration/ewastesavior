@@ -423,7 +423,7 @@ capped at 1 MiB, except blob uploads and log chunks (256 KiB).
 | `POST /api/v1/tasks/{id}/log?lease=L&offset=N` | node | raw text → `{"next": N'}` (bytes before the hive's current offset are dropped, so retries are idempotent) |
 | `GET /api/v1/blobs/{sha256}` | node (scoped) or admin | bytes (Range supported) |
 | `GET /api/v1/blobs/{sha256}/render?cw=&ch=&x=&y=&w=&h=&pw=&ph=&fit=` | node (scoped) or admin | PNG: the image fitted into a canvas cw×ch, the rect x,y,w,h cropped from it, scaled to pw×ph pixels (11.5) |
-| `PUT /api/v1/blobs/{sha256}` | node (scoped) or admin | bytes → `BlobInfo` (hash verified; 413 above max; 507 when disk would drop below max(5%, 512 MiB) free) |
+| `PUT /api/v1/blobs/{sha256}` | node (scoped) or admin | bytes → `BlobInfo` (hash verified; 413 above max; 507 when disk would drop below max(5%, 512 MiB), capped at 10%, free. While free space is below that, jobs with outputs are not dispatched; the job and `HiveInfo.Warnings` say why) |
 | `GET /api/v1/stats` | node or admin | → `SwarmStats` |
 
 A node token for a node the hive no longer knows gets 401, and the node re-joins.
@@ -472,8 +472,10 @@ each interface's directed broadcast address. It answers `Probe` datagrams of
 at least `MinProbeSize` bytes, only from directly connected subnets and at most
 once per second per source, with a unicast beacon. The node collects beacons
 for 2 s (`discovery.Collect`), keeps those matching its swarm hint, and tries
-them in order. After a failed handshake it blacklists that address and hive_id
-for 5 minutes. If beacons are seen but none match, the link state is
+them in order. A hive that answered wrongly (swarm key, fingerprint, API
+version, refused registration) is skipped for 5 minutes. One that could not
+be reached (not listening yet, network error, 5xx) is skipped for 2 s,
+doubling up to 1 minute, until a join succeeds. If beacons are seen but none match, the link state is
 `key_mismatch`.
 
 The hive also watches for beacons with its own hint and another hive_id and

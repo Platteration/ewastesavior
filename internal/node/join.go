@@ -17,7 +17,15 @@ import (
 	"github.com/platteration/ewastesavior/internal/version"
 )
 
-const blacklistFor = 5 * time.Minute
+const (
+	// blacklistFor is how long a hive that answered wrongly (swarm key,
+	// fingerprint, version) is skipped.
+	blacklistFor = 5 * time.Minute
+	// unreachableFirst and unreachableMax bound the backoff from a hive that
+	// could not be reached at all (not listening yet, network down, 5xx).
+	unreachableFirst = 2 * time.Second
+	unreachableMax   = time.Minute
+)
 
 // join finds the hive and registers. It returns a client pinned to the
 // hive's certificate with a valid node token.
@@ -153,6 +161,24 @@ func (a *Agent) ban(base string) {
 	a.mu.Unlock()
 }
 
+// banUnreachable skips a hive that could not be reached for a short,
+// growing time. Unreachable says nothing about it being the wrong hive: a
+// hive machine's own node agent starts before the hive listens.
+func (a *Agent) banUnreachable(base string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.unreachable == nil {
+		a.unreachable = map[string]time.Duration{}
+	}
+	d := a.unreachable[base] * 2
+	if d == 0 {
+		d = unreachableFirst
+	}
+	d = min(d, unreachableMax)
+	a.unreachable[base] = d
+	a.blacklist[base] = time.Now().Add(d)
+}
+
 func hostOf(base string) string {
 	if u, err := url.Parse(base); err == nil {
 		return u.Host
@@ -178,7 +204,7 @@ func (a *Agent) handshake(ctx context.Context, base string) (*hiveClient, error)
 			return nil, err
 		}
 		a.setLink(proto.LinkUnreachable, addr, err.Error())
-		a.ban(base)
+		a.banUnreachable(base)
 		return nil, err
 	}
 	if hello.APIVersion != proto.APIVersion {
@@ -228,7 +254,7 @@ func (a *Agent) handshake(ctx context.Context, base string) (*hiveClient, error)
 			sleep(ctx, 60*time.Second)
 		default:
 			a.setLink(proto.LinkUnreachable, addr, err.Error())
-			a.ban(base)
+			a.banUnreachable(base)
 		}
 		return nil, err
 	}
@@ -245,6 +271,7 @@ func (a *Agent) handshake(ctx context.Context, base string) (*hiveClient, error)
 	a.log.Info("registered with hive", "hive", base, "fingerprint", fpSeen, "node_id", resp.NodeID, "name", resp.Name, "pending", resp.Pending)
 
 	a.mu.Lock()
+	delete(a.unreachable, base)
 	a.hc = hc
 	a.hiveAddr = addr
 	a.sessionGen++

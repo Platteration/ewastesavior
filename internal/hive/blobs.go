@@ -24,12 +24,38 @@ var (
 	errDiskFull     = errors.New("not enough free disk space")
 )
 
-// minFreeDisk is max(5%, 512 MiB) of the blob file system (DESIGN 7.1).
+// minFreeDisk is the space kept free on the blob file system (DESIGN 7.1):
+// max(5%, 512 MiB), but at most 10%, so a small data partition or a
+// RAM-backed hive can still store outputs.
 func minFreeDisk(total int64) int64 {
-	if m := total / 20; m > 512<<20 {
-		return m
+	return min(max(total/20, 512<<20), total/10)
+}
+
+// checkStorage updates the storage-low flag and warning from the blob file
+// system's free space. While it is low, jobs with outputs are not
+// dispatched: their uploads would fail.
+func (s *Server) checkStorage() {
+	free, total, ok := s.cfg.tune.diskFree(s.blobs.dir)
+	low := ok && free < minFreeDisk(total)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.setStorageLowLocked(low, free, total)
+}
+
+func (s *Server) setStorageLowLocked(low bool, free, total int64) {
+	if low == s.storageLow {
+		return
 	}
-	return 512 << 20
+	s.storageLow = low
+	if !low {
+		delete(s.warnings, "storage")
+		s.log.Info("hive storage has free space again", "free_bytes", free)
+		s.notifyLocked()
+		return
+	}
+	s.warnings["storage"] = fmt.Sprintf("the hive's storage is nearly full (%d MiB free of %d MiB): jobs with outputs wait; free space with 'savior ctl gc' or by deleting old jobs",
+		free>>20, total>>20)
+	s.log.Warn("hive storage nearly full; jobs with outputs wait", "free_bytes", free, "total_bytes", total)
 }
 
 // blobStore holds blob files at <dir>/<2 hex>/<sha256> (DESIGN 9).
@@ -434,6 +460,11 @@ func (s *Server) receiveBlob(w http.ResponseWriter, r *http.Request, want string
 		need = 0
 	}
 	if free, total, ok := s.cfg.tune.diskFree(s.blobs.dir); ok && free-need < minFreeDisk(total) {
+		if free < minFreeDisk(total) {
+			s.mu.Lock()
+			s.setStorageLowLocked(true, free, total)
+			s.mu.Unlock()
+		}
 		return proto.BlobInfo{}, http.StatusInsufficientStorage, errDiskFull
 	}
 	d := blobDeadline(r.ContentLength)

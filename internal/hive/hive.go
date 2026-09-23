@@ -274,6 +274,7 @@ type Server struct {
 	headKey       string
 	headSince     time.Time
 	warnings      map[string]string
+	storageLow    bool // blob storage below minFreeDisk: jobs with outputs wait
 	timeSynced    bool
 	timeSource    string
 	completed     int64

@@ -22,6 +22,7 @@ func (s *Server) loop(ctx context.Context) {
 		case <-t.C:
 		}
 		now := time.Now()
+		s.checkStorage()
 		s.tick(now)
 		s.writeStatusFile(now)
 		s.maybePersist()

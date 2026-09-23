@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -377,5 +379,50 @@ func TestRegisterRefusedIsNotUnreachable(t *testing.T) {
 	}
 	if _, banned := a.blacklisted(srv.URL); !banned {
 		t.Error("a hive that refuses our registration is retried at once")
+	}
+}
+
+func TestUnreachableHiveIsRetriedSoon(t *testing.T) {
+	// A hive that isn't listening yet (the hive machine's own node agent
+	// starts first) must be retried within seconds, not minutes.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := "https://" + l.Addr().String()
+	l.Close()
+
+	a := fakeAgent(nil, 0, nil)
+	a.opt.SysRoot = "../hwinfo/testdata/qemu"
+	a.id = hwinfo.Identity{NodeID: "lab-pc"}
+	a.secret = auth.NewSwarmSecret("unreachable-test-swarm-key-0123456789")
+	var waits []time.Duration
+	for range 7 {
+		if _, err := a.handshake(context.Background(), base); err == nil {
+			t.Fatal("handshake with a closed port succeeded")
+		}
+		until, banned := a.blacklisted(base)
+		if !banned {
+			t.Fatal("an unreachable hive is retried in a tight loop")
+		}
+		waits = append(waits, time.Until(until).Round(time.Second))
+		a.mu.Lock()
+		delete(a.blacklist, base) // as if the wait had passed
+		a.mu.Unlock()
+	}
+	if a.link != proto.LinkUnreachable {
+		t.Errorf("link %q, want %q", a.link, proto.LinkUnreachable)
+	}
+	want := []time.Duration{2, 4, 8, 16, 32, 60, 60}
+	for i := range want {
+		want[i] *= time.Second
+	}
+	if !slices.Equal(waits, want) {
+		t.Errorf("waits %v, want %v", waits, want)
+	}
+	// A hive that answers wrongly is still skipped for the long time.
+	a.ban(base)
+	if until, _ := a.blacklisted(base); time.Until(until) < blacklistFor-time.Second {
+		t.Errorf("ban lasts %v, want %v", time.Until(until), blacklistFor)
 	}
 }

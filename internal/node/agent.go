@@ -105,6 +105,7 @@ type Agent struct {
 	hiveSynced  bool
 	hbInterval  time.Duration
 	blacklist   map[string]time.Time
+	unreachable map[string]time.Duration // current backoff per unreachable hive
 	lastMetrics proto.Metrics
 	decision    power.Decision
 	displayRev  int64
