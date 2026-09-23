@@ -1,0 +1,10 @@
+config BR2_PACKAGE_SAVIOR_FIRMWARE
+	bool "savior-firmware"
+	help
+	  Installs exactly the firmware files listed in
+	  board/savior/firmware.list (Intel NIC and older Wi-Fi, Realtek
+	  NIC, Atheros and Ralink USB/PCI Wi-Fi, radeon R100 to SI) from
+	  the same linux-firmware release Buildroot's own linux-firmware
+	  package uses. WHENCE "Link:" entries are recreated.
+
+	  https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git

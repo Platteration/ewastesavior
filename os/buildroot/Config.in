@@ -1,0 +1,5 @@
+menu "SaviorOS"
+
+source "$BR2_EXTERNAL_SAVIOR_PATH/package/savior-firmware/Config.in"
+
+endmenu

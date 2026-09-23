@@ -1,0 +1,159 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go:
+    name: go (fmt, vet, race tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: gofmt
+        run: make fmt-check
+      - name: go vet
+        run: make vet
+      - name: go test -race
+        run: make test-race
+
+  cross:
+    name: build ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64 (GOAMD64=v1)
+            target: build-linux-amd64
+            dir: linux-amd64
+          - name: linux-386 (sse2 + softfloat)
+            target: build-linux-386
+            dir: linux-386
+          - name: darwin-arm64
+            target: cross CROSS_TARGETS=darwin/arm64
+            dir: darwin-arm64
+          - name: windows-amd64
+            target: cross CROSS_TARGETS=windows/amd64
+            dir: windows-amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git describe needs the tags
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: make ${{ matrix.target }}
+        run: make ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: savior-${{ matrix.dir }}
+          path: build/${{ matrix.dir }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  shell:
+    name: shell scripts (shellcheck, self-tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends shellcheck squashfs-tools xz-utils cpio curl
+      - name: make lint-sh
+        run: make lint-sh
+      - name: make test-scripts
+        run: make test-scripts
+
+  dev-image:
+    name: dev image + QEMU boot tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 ovmf busybox-static grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
+            mtools dosfstools xorriso cpio xz-utils zstd kmod squashfs-tools dropbear-bin dnsmasq-base \
+            e2fsprogs jq python3
+      - name: Enable KVM when the runner has it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+      - name: make dev-image
+        run: make dev-image
+      - name: make dev-test
+        run: make dev-test
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dev-test-logs
+          path: |
+            build/dev/**/*.log
+            build/dev/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  swarm:
+    name: QEMU swarm test
+    needs: dev-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 ovmf busybox-static grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
+            mtools dosfstools xorriso cpio xz-utils zstd kmod squashfs-tools dropbear-bin dnsmasq-base \
+            e2fsprogs jq python3
+      - name: Enable KVM when the runner has it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+      - name: make swarm-test
+        run: make swarm-test
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: swarm-test-logs
+          path: |
+            build/dev/**/*.log
+            build/dev/logs/
+          if-no-files-found: ignore
+          retention-days: 14

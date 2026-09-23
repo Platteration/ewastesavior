@@ -1,0 +1,85 @@
+# SaviorOS firmware allowlist (DESIGN 13.2), relative to the linux-firmware
+# tree. Used twice:
+#   * package/savior-firmware installs exactly these files from the
+#     linux-firmware release Buildroot pins (install-firmware.sh);
+#   * post-build.sh deletes anything else found in /lib/firmware (other
+#     packages' firmware), keeping wireless-regdb's regulatory.db.
+#
+# Syntax: one shell glob per line ("*" also matches "/"); "#" comments.
+#   pattern    must match at least one file or WHENCE "Link:" name
+#   ?pattern   optional: may match nothing (files upstream may drop or move)
+#   !pattern   exclude matches of the earlier patterns
+# Old names are fine: when upstream moves a file and leaves a WHENCE link
+# behind (e.g. iwlwifi-*.ucode -> intel/iwlwifi/...), the link is recreated
+# and its target installed.
+#
+# Deliberately absent: amdgpu, NVIDIA GSP, and anything for hardware newer
+# than this project targets. ipw2x00 and b43 firmware can't be redistributed:
+# users drop it into /firmware/ on the stick. ar3k (Atheros *Bluetooth*) is
+# not shipped either: SaviorOS has no Bluetooth stack. Beyond the DESIGN 13.2
+# list, rtlwifi 8192c and brcmsmac firmware are included because DESIGN 14
+# requires the rtl8192ce and brcmsmac drivers, which are useless without it.
+
+# --- Intel wired: e100 microcode
+e100/*
+
+# --- Intel Wi-Fi: iwlegacy (3945, 4965), iwlwifi dvm (1000-6000 series),
+# iwlwifi mvm 7260/7265/3160/3168. Only the newest API each kernel uses.
+iwlwifi-3945-2.ucode
+iwlwifi-4965-2.ucode
+iwlwifi-1000-5.ucode
+iwlwifi-100-5.ucode
+iwlwifi-105-6.ucode
+iwlwifi-135-6.ucode
+iwlwifi-2000-6.ucode
+iwlwifi-2030-6.ucode
+iwlwifi-5000-5.ucode
+iwlwifi-5150-2.ucode
+iwlwifi-6000-4.ucode
+iwlwifi-6000g2a-6.ucode
+iwlwifi-6000g2b-6.ucode
+iwlwifi-6050-5.ucode
+iwlwifi-3160-17.ucode
+iwlwifi-3168-29.ucode
+iwlwifi-7260-17.ucode
+iwlwifi-7265-17.ucode
+iwlwifi-7265D-29.ucode
+
+# --- Realtek wired (r8169 family)
+rtl_nic/*
+
+# --- Realtek Wi-Fi: rtl8192ce / rtl8192cu (rtl8187 needs none)
+rtlwifi/rtl8192c*fw*.bin
+
+# --- Atheros USB Wi-Fi: carl9170 (AR9170), ath9k_htc (AR9271, AR7010)
+carl9170-1.fw
+?ar9170*.fw
+ath9k_htc/htc_9271-1.4.0.fw
+ath9k_htc/htc_7010-1.4.0.fw
+
+# --- Ralink rt2x00 (rt61pci, rt73usb, rt2800pci, rt2800usb)
+rt2561.bin
+rt2561s.bin
+rt2661.bin
+rt73.bin
+rt2860.bin
+rt2870.bin
+rt3070.bin
+?rt3071.bin
+rt3090.bin
+?rt3290.bin
+
+# --- Broadcom brcmsmac (BCM4313, BCM43224, BCM43225)
+brcm/bcm43xx-0.fw
+brcm/bcm43xx_hdr-0.fw
+
+# --- AMD/ATI radeon, R100 to Southern Islands. Not CIK (radeon's GCN parts
+# are amdgpu territory) and no video decode/encode engines.
+radeon/*
+!radeon/[Bb][Oo][Nn][Aa][Ii][Rr][Ee]*
+!radeon/[Hh][Aa][Ww][Aa][Ii][Ii]*
+!radeon/[Kk][Aa][Vv][Ee][Rr][Ii]*
+!radeon/[Kk][Aa][Bb][Ii][Nn][Ii]*
+!radeon/[Mm][Uu][Ll][Ll][Ii][Nn][Ss]*
+!radeon/*_uvd.bin
+!radeon/*_vce.bin

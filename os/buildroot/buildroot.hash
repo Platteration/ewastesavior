@@ -1,0 +1,9 @@
+# Pinned SHA-256 of Buildroot release tarballs, checked by
+# scripts/fetch-buildroot.sh (format: sha256  <hex>  buildroot-<version>.tar.xz).
+#
+# A version without a line here is verified against the release's .sign
+# manifest instead, and fetch-buildroot.sh prints the line to add. Release
+# builds (tags) set BUILDROOT_REQUIRE_PIN=1 and refuse unpinned tarballs, so
+# pin BUILDROOT_VERSION (Makefile) here after checking the hash against the
+# signed manifest:
+#   https://buildroot.org/downloads/buildroot-<version>.tar.xz.sign

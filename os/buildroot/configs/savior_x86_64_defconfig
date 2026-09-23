@@ -1,0 +1,75 @@
+# SaviorOS x86_64 payload (docs/DESIGN.md 13.2, 14).
+#
+#   make -C <buildroot> O=<out> BR2_EXTERNAL=<repo>/os/buildroot savior_x86_64_defconfig
+#
+# (or simply "make image ARCH=x86_64" from the repository root). Every line
+# here is verified after olddefconfig by scripts/check-defconfig.sh, so keep
+# explicit values only. Keep in sync with savior_i686_defconfig: the two may
+# differ only in the "Target" block, the arch fragment and the script args.
+
+# --- Target ---------------------------------------------------------------------
+BR2_x86_64=y
+BR2_x86_x86_64=y
+
+# --- Build ----------------------------------------------------------------------
+BR2_CCACHE=y
+BR2_OPTIMIZE_S=y
+
+# --- Toolchain: internal, musl, headers from the kernel we build -------------------
+BR2_TOOLCHAIN_BUILDROOT=y
+BR2_TOOLCHAIN_BUILDROOT_MUSL=y
+BR2_KERNEL_HEADERS_AS_KERNEL=y
+BR2_PACKAGE_HOST_LINUX_HEADERS_CUSTOM_6_12=y
+
+# --- System -----------------------------------------------------------------------
+BR2_TARGET_GENERIC_HOSTNAME="savior"
+BR2_TARGET_GENERIC_ISSUE="SaviorOS"
+BR2_INIT_BUSYBOX=y
+BR2_ROOTFS_DEVICE_CREATION_DYNAMIC_MDEV=y
+# BR2_ROOTFS_MERGED_USR is not set
+# Root password locked; access is the console (console_shell) or SSH keys.
+# BR2_TARGET_ENABLE_ROOT_LOGIN is not set
+# The overlay's inittab defines the consoles.
+# BR2_TARGET_GENERIC_GETTY is not set
+# Networking is done by the overlay's S30network, not ifupdown.
+BR2_SYSTEM_DHCP=""
+BR2_ROOTFS_OVERLAY="$(BR2_EXTERNAL_SAVIOR_PATH)/../rootfs-overlay"
+BR2_ROOTFS_POST_BUILD_SCRIPT="$(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/post-build.sh"
+BR2_ROOTFS_POST_IMAGE_SCRIPT="$(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/post-image.sh"
+BR2_ROOTFS_POST_SCRIPT_ARGS="x86_64"
+
+# --- Kernel: 6.12 LTS, arch defconfig + SaviorOS fragments --------------------------
+BR2_LINUX_KERNEL=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION=y
+BR2_LINUX_KERNEL_CUSTOM_VERSION_VALUE="6.12.40"
+BR2_LINUX_KERNEL_USE_ARCH_DEFAULT_CONFIG=y
+BR2_LINUX_KERNEL_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/linux/common.config $(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/linux/x86_64.config $(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/linux/display.config $(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/linux/net.config $(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/linux/wifi.config $(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/linux/hardening.config"
+BR2_LINUX_KERNEL_BZIMAGE=y
+BR2_LINUX_KERNEL_NEEDS_HOST_OPENSSL=y
+BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
+
+# --- Packages -----------------------------------------------------------------------
+BR2_PACKAGE_BUSYBOX_CONFIG_FRAGMENT_FILES="$(BR2_EXTERNAL_SAVIOR_PATH)/board/savior/busybox.fragment"
+BR2_PACKAGE_E2FSPROGS=y
+BR2_PACKAGE_SAVIOR_FIRMWARE=y
+BR2_PACKAGE_WIRELESS_REGDB=y
+BR2_PACKAGE_CA_CERTIFICATES=y
+BR2_PACKAGE_DNSMASQ=y
+BR2_PACKAGE_DNSMASQ_TFTP=y
+BR2_PACKAGE_DNSMASQ_DHCP=y
+BR2_PACKAGE_DROPBEAR=y
+# BR2_PACKAGE_DROPBEAR_CLIENT is not set
+BR2_PACKAGE_IW=y
+BR2_PACKAGE_WPA_SUPPLICANT=y
+BR2_PACKAGE_WPA_SUPPLICANT_NL80211=y
+# S30network hashes the PSK with wpa_passphrase (stdin, not argv).
+BR2_PACKAGE_WPA_SUPPLICANT_PASSPHRASE=y
+
+# --- Payload: xz cpio initrd (boot media come from os/image/mkimage.sh) -----------------
+BR2_TARGET_ROOTFS_CPIO=y
+BR2_TARGET_ROOTFS_CPIO_XZ=y
+# BR2_TARGET_ROOTFS_INITRAMFS is not set
+# BR2_TARGET_ROOTFS_TAR is not set
+
+# --- Host tools used by post-build.sh -------------------------------------------------
+BR2_PACKAGE_HOST_SQUASHFS=y

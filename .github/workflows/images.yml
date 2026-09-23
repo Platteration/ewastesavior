@@ -1,0 +1,240 @@
+name: images
+
+# Production images: Buildroot payloads for x86_64 and i686, QEMU boot tests,
+# a universal image with both, and a GitHub release on v* tags.
+on:
+  workflow_dispatch:
+    inputs:
+      buildroot_version:
+        description: "Buildroot release (empty = the Makefile's BUILDROOT_VERSION)"
+        required: false
+        default: ""
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: images-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Tag builds only use a Buildroot tarball whose SHA-256 is pinned in
+  # os/buildroot/buildroot.hash.
+  BUILDROOT_REQUIRE_PIN: ${{ startsWith(github.ref, 'refs/tags/') && '1' || '0' }}
+  BUILDROOT_VERSION_INPUT: ${{ inputs.buildroot_version }}
+  # Line the rootfs overlay prints on the serial console once rcS is done
+  # (os/rootfs-overlay/usr/libexec/savior/boot-report)...
+  BOOT_MARKER: "SAVIOR-BOOT: rcS done"
+  # ...and its fields that must say yes: the node agent runs (on i686 that
+  # proves the SSE2/softfloat pick), and a framebuffer exists.
+  BOOT_EXPECT: --expect node=yes --expect fb=yes
+
+jobs:
+  buildroot:
+    name: buildroot ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, i686]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential bc bison flex cpio file rsync unzip wget curl python3 perl patch \
+            xz-utils squashfs-tools libelf-dev libssl-dev \
+            qemu-system-x86 ovmf ovmf-ia32 grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
+            mtools dosfstools xorriso
+      - name: Enable KVM when the runner has it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+      - name: Cache Buildroot downloads
+        uses: actions/cache@v4
+        with:
+          path: build/br-cache/dl
+          key: br-dl-${{ hashFiles('Makefile', 'os/buildroot/configs/*') }}
+          restore-keys: br-dl-
+      - name: Cache ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.buildroot-ccache
+          key: br-ccache-${{ matrix.arch }}-${{ github.sha }}
+          restore-keys: br-ccache-${{ matrix.arch }}-
+
+      # make image = fetch + verify Buildroot, load the defconfig,
+      # check-defconfig, build (post-build: binaries, init allowlist, modloop;
+      # post-image: budget), check-kconfig, mkimage.sh.
+      - name: make image ARCH=${{ matrix.arch }}
+        run: |
+          set --
+          if [ -n "$BUILDROOT_VERSION_INPUT" ]; then
+            case "$BUILDROOT_VERSION_INPUT" in
+            *[!0-9.]*) echo "buildroot_version must look like 2025.02.5" >&2; exit 1 ;;
+            esac
+            set -- "BUILDROOT_VERSION=$BUILDROOT_VERSION_INPUT"
+          fi
+          make image ARCH=${{ matrix.arch }} "$@"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### ${{ matrix.arch }}"
+            echo '```'
+            cat build/br-${{ matrix.arch }}/images/payload/${{ matrix.arch }}/budget.txt 2>/dev/null || echo "no budget.txt"
+            cat build/br-${{ matrix.arch }}/images/payload/${{ matrix.arch }}/savior-release 2>/dev/null || true
+            echo '```'
+            echo "Buildroot tarball (pin in os/buildroot/buildroot.hash):"
+            echo '```'
+            for f in build/br-cache/dl/buildroot-*.tar.xz; do
+              [ -f "$f" ] && echo "sha256  $(sha256sum "$f" | cut -d' ' -f1)  $(basename "$f")"
+            done
+            echo '```'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: QEMU x86_64 (USB stick, SeaBIOS)
+        if: matrix.arch == 'x86_64'
+        run: sh scripts/qemu-smoke.sh --image build/images/x86_64/savior-x86_64.img --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/x86_64-bios.log
+      - name: QEMU x86_64 (USB stick, OVMF x64)
+        if: matrix.arch == 'x86_64'
+        run: sh scripts/qemu-smoke.sh --image build/images/x86_64/savior-x86_64.img --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/x86_64-uefi.log
+      - name: QEMU x86_64 (ISO, SeaBIOS)
+        if: matrix.arch == 'x86_64'
+        run: sh scripts/qemu-smoke.sh --iso build/images/x86_64/savior-x86_64.iso --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/x86_64-iso.log
+      # TCG on purpose: under KVM an SSE2 instruction would still run.
+      - name: QEMU i686 (Pentium III, no PAE, no SSE2, 256 MB)
+        if: matrix.arch == 'i686'
+        run: >-
+          sh scripts/qemu-smoke.sh --arch i686 --image build/images/i686/savior-i686.img
+          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 1500
+          --log build/logs/i686-pentium3.log
+      - name: QEMU i686 (OVMF ia32)
+        if: matrix.arch == 'i686'
+        run: sh scripts/qemu-smoke.sh --arch i686 --image build/images/i686/savior-i686.img --firmware uefi32 --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 1500 --log build/logs/i686-uefi32.log
+
+      - name: Collect artifacts
+        run: |
+          d=dist/${{ matrix.arch }}
+          mkdir -p "$d/payload" "$d/media"
+          cp -R build/br-${{ matrix.arch }}/images/payload/${{ matrix.arch }}/. "$d/payload/"
+          cp build/images/${{ matrix.arch }}/savior-${{ matrix.arch }}.img build/images/${{ matrix.arch }}/savior-${{ matrix.arch }}.iso "$d/media/"
+          tar -C build/images/${{ matrix.arch }} -czf "$d/media/savior-${{ matrix.arch }}-netboot.tar.gz" netboot
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-${{ matrix.arch }}
+          path: |
+            build/logs/
+            build/br-${{ matrix.arch }}/build/build-time.log
+            build/br-${{ matrix.arch }}/.config
+          if-no-files-found: ignore
+          retention-days: 14
+
+  universal:
+    name: universal image
+    needs: buildroot
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install host packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 ovmf ovmf-ia32 grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
+            mtools dosfstools xorriso cpio xz-utils
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-x86_64
+          path: dist/x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-i686
+          path: dist/i686
+      - name: Verify payload checksums
+        run: |
+          (cd dist/x86_64/payload && sha256sum -c SHA256SUMS)
+          (cd dist/i686/payload && sha256sum -c SHA256SUMS)
+      - name: make universal-media
+        run: make universal-media X86_64_PAYLOAD=dist/x86_64/payload I686_PAYLOAD=dist/i686/payload
+      - name: QEMU universal (SeaBIOS, 64-bit CPU -> x86_64 payload)
+        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/universal-bios.log
+      - name: QEMU universal (OVMF x64)
+        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 900 --log build/logs/universal-uefi.log
+      # 32-bit UEFI on a 64-bit CPU: GRUB picks x86_64 (cpuid -l), booted in
+      # EFI mixed mode (DESIGN 13.1).
+      - name: QEMU universal (OVMF ia32, 64-bit CPU -> x86_64 via EFI_MIXED)
+        run: sh scripts/qemu-smoke.sh --image build/images/savior-universal.img --firmware uefi32 --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 1500 --log build/logs/universal-uefi32.log
+      - name: QEMU universal (Pentium III -> i686 payload)
+        run: >-
+          sh scripts/qemu-smoke.sh --arch i686 --image build/images/savior-universal.img
+          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT --timeout 1500
+          --log build/logs/universal-pentium3.log
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          cp build/images/savior-universal.img build/images/savior-universal.iso release/
+          tar -C build/images -czf release/savior-universal-netboot.tar.gz netboot
+          for a in x86_64 i686; do
+            cp dist/$a/media/savior-$a.img dist/$a/media/savior-$a.iso dist/$a/media/savior-$a-netboot.tar.gz release/
+          done
+          (cd release && sha256sum -- * >SHA256SUMS)
+          cat release/SHA256SUMS >>"$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-universal
+          path: build/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  release:
+    name: GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: universal
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+      - name: Verify checksums
+        run: cd release && sha256sum -c SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
