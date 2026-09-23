@@ -401,7 +401,7 @@ capped at 1 MiB, except blob uploads and log chunks (256 KiB).
 | Method + path | Auth | Request → Response |
 |---|---|---|
 | `GET /api/v1/hello` | none | → `Hello` |
-| `POST /api/v1/register` | proof (or keyless) | `RegisterRequest` → `RegisterResponse`; 409 `duplicate node id` if the ID is online with another BootID; 403 bad proof; 426 API mismatch |
+| `POST /api/v1/register` | proof (or keyless) | `RegisterRequest` → `RegisterResponse`; 409 `duplicate node id` if the ID is online with another BootID; 403 bad proof; 426 when `api_version` (0 = v1) differs |
 | `POST /api/v1/heartbeat` | node | `HeartbeatRequest` → `HeartbeatResponse` |
 | `POST /api/v1/claim` | node | `ClaimRequest` → `ClaimResponse` (long-poll ≤ 30 s) |
 | `POST /api/v1/tasks/{id}/report` | node | `TaskReport` → `{}`; 409 `stale lease` |
@@ -425,7 +425,7 @@ or bearer) or the admin token (bearer).
 | `POST logout`, `POST sessions/revoke` | → `{}` |
 | `POST pair` | → `PairCode` (admin only; the hive screen shows one too) |
 | `GET info` | → `HiveInfo` (includes `X-Savior-Client-Time` handling, 10.2) |
-| `GET node-config?hive=<addr>` | → `text/plain` savior.conf with `swarm_key`, `hive_fingerprint`, `hive` |
+| `GET node-config?hive=<addr>\|auto` | → `text/plain` savior.conf with `swarm_key`, `hive_fingerprint`, `hive` (default: the Host the request came in on) |
 | `GET nodes` / `GET nodes/{ref}` | → `[]NodeView` / `NodeView` (`ref` = ID or name) |
 | `PATCH nodes/{ref}` | `NodePatch` → `NodeView` (409 for duplicate names, display of wall members, mode=wall) |
 | `DELETE nodes/{ref}` | → `{}` (offline only) |
@@ -539,9 +539,11 @@ requirements together) gets `JobView.Warning`. It stays queued, since nodes may 
   `running_tasks` doesn't count as an interruption.
 * Hard cap: a task fails with "too many interruptions" when
   `Attempt ≥ 1 + retries + MaxInterruptions`.
-* **Quarantine:** a node with ≥ 3 node errors, or ≥ 5 failures on distinct
-  tasks that ran < 10 s, within 10 minutes is quarantined (no tasks,
-  `NodeView.Quarantine` reason) until `NodePatch.ClearQuarantine`.
+* **Quarantine:** a node is quarantined (no tasks, `NodeView.Quarantine`
+  reason) until `NodePatch.ClearQuarantine` when, within 10 minutes, it has
+  ≥ 3 node errors, or ≥ 5 distinct tasks failed on it within 10 s of starting
+  *and then succeeded on another node*. The second rule needs evidence against
+  the machine: a job that fails fast everywhere must not quarantine the swarm.
 * **Job state:** `queued` (nothing dispatched), `running`, `succeeded` (all
   succeeded), `failed` (all terminal, ≥1 failed), `canceled`.
 
@@ -644,8 +646,8 @@ restart every node starts `offline` until its first heartbeat.
 
 ### 10.1 Identity
 
-`hwinfo.Identity(root) (Identity, error)` returns the node ID, the identity
-MAC (if any) and all HWIDs. Source order for the ID:
+`hwinfo.GetIdentity(root) (Identity, error)` returns the node ID, the
+identity MAC (if any) and all HWIDs. Source order for the ID:
 
 1. PCI NICs, wired first, sorted by PCI address (basename of
    `/sys/class/net/X/device`), taking the first whose `addr_assign_type == 0`
@@ -657,6 +659,9 @@ MAC (if any) and all HWIDs. Source order for the ID:
 4. a USB NIC MAC;
 5. random (logged as unstable).
 
+A NIC is eligible only if `addr_assign_type` is readable and 0 and its MAC is
+unicast and globally administered. QEMU's default `52:54:00` MACs are locally
+administered, so VMs need `-uuid` to get a stable ID.
 `node_id = "n" + first 12 hex of SHA-256(source string)`. HWIDs lists every
 candidate (`mac:`, `uuid:`, `serial:`). `BootID = /proc/sys/kernel/random/boot_id`
 + ":" + a random agent-start nonce (a respawned agent is a new session).
@@ -685,14 +690,16 @@ task resources. When the power policy says no, free is forced to 0.
 
 ```go
 type Policy struct { RunOnBattery bool; BatteryMinPercent int; MaxTempC float64 }
-type Decision struct { Accept, Pause, Preempt, BlankDisplay bool; Reason string; since... }
-func Evaluate(p Policy, m proto.Metrics, prev Decision) Decision
+type Input struct { Metrics proto.Metrics; ExternalDisplay bool; MemBudgetMB int }
+type Decision struct { Accept, Pause, Preempt, BlankDisplay bool; Reason string; Since time.Time /* + hysteresis state */ }
+func Evaluate(p Policy, in Input, prev Decision) Decision
 ```
 * `limit = m.CPUTempLimitC` (hwinfo computes min(max_temp_c, sensor max, crit − 5)).
   Pause when `CPUTempC ≥ limit`, or when `ThrottleEvents` rose in 3
   consecutive samples. Resume at `limit − 10` with no new throttle events.
 * On battery and not `RunOnBattery`: Accept = false. On battery and below the
-  minimum: Preempt. A battery below 20% health counts as absent for Preempt.
+  minimum: Preempt, and work is accepted again only from minimum + 5% (or on
+  AC). A battery below 20% health counts as absent for Preempt.
 * `LidClosed` with no connected external connector sets BlankDisplay; compute
   is unaffected.
 * Memory pressure (`MemPressure ≥ 30`) or `SwapUsedMB > budget/2` sets Accept = false.
@@ -703,8 +710,9 @@ thermal zones. Readings ≤ 0 °C, ≥ 125 °C, or unchanged for 10 minutes are
 ignored, and drivetemp, GPU and Wi-Fi sensors are never used. On AMD k10temp,
 the limit uses `temp1_max` if present. `ThrottleEvents` is the sum of
 `/sys/devices/system/cpu/cpu*/thermal_throttle/*_throttle_count`.
-`OnBattery`: if any `Mains` supply exists, true only when all of them report
-`online=0`. Otherwise true only when a battery is `Discharging`. The percentage
+`OnBattery` requires a present system battery (type Battery, not
+scope=Device). Then, if any `Mains` supply exists, it's true only when all of
+them report `online=0`; otherwise only when a battery is `Discharging`. The percentage
 comes from `capacity`, else `energy_now/energy_full`, else `charge_now/charge_full`.
 Health = `energy_full/energy_full_design`.
 
@@ -797,7 +805,8 @@ The modes are those of `proto.DisplayModes`:
   flashing background, over the current scene, for N seconds. It also
   unblanks the screen, blinks the keyboard LEDs (`KDSETLED`) and beeps (`KIOCSOUND`).
 
-Rotation (0/90/180/270) is `Directives.DisplayRotate` and applies under every scene.
+Rotation (0/90/180/270, clockwise: with 90 the logical top-left is shown at
+the physical top-right) is `Directives.DisplayRotate` and applies under every scene.
 Lid closed (with no external display) or the idle timer (local default modes
 only) blanks the screen. Any `/dev/input/event*` activity or an identify
 wakes it.
@@ -841,8 +850,11 @@ func (c *Controller) Run(ctx context.Context) error
 ```
 * Frames render into preallocated buffers and are not re-rendered until
   `next` or a spec change. Clocks without seconds redraw once a minute.
-* Glyph masks are cached by (face, size, rune) within 4 MiB, and static
-  layers are cached too.
+* Fonts are the embedded Go fonts, read by a small bounds-checked TrueType
+  parser (x/image/font/opentype would pull in golang.org/x/text) and
+  rasterized with x/image/vector. Glyph masks are cached by (face, size,
+  rune) within 4 MiB, and static layers are cached too. Glyphs over 512 px
+  are drawn in tiles straight into the frame.
 * No float scalers on `GOARCH=386`. Scaling is integer: nearest neighbor for
   upscaling, a fixed-point box filter for downscaling. Each media item is
   scaled once to its final size.
@@ -1007,6 +1019,10 @@ background (`start-stop-daemon -b`) with progress on tty1.
 | `S50sshd` | dropbear (`-R`, ed25519) when `ssh_key` is set; background |
 | `S65netboot` | dnsmasq when `netboot=yes` (hive role): proxy-DHCP, or full DHCP when `dhcp_server=yes`; TFTP root `/run/savior/tftp` (symlinks to the stick's boot files + generated `grub.cfg` with `savior.hive=<ip>:7700 savior.hive_fingerprint=... savior.join=keyless savior.media=none`, never the key) |
 
+A hive writes its status panel (URLs, fingerprint, pairing code, nodes
+online, persistence) to `/run/savior/hive-status.json` (0600). The node's
+status scene and `savior console` read it.
+
 `/usr/libexec/savior/run <svc>` sources the env and execs
 `savior <svc> --config /run/savior/savior.conf --log-file /var/log/savior-<svc>.log`.
 For `hive` without the hive role it runs `exec sleep 2147483647`. For `node` it
@@ -1020,7 +1036,8 @@ On first start with the hive role and `hive_data=auto`, `savior storage init-dat
    appends partition 2 (type 0x83, 1 MiB aligned, to the end of the device) by
    writing the 16-byte entry itself, then `BLKRRPART`;
 3. formats it with `mke2fs -t ext4 -L SAVIOR-DATA` (or ext2 with busybox mke2fs);
-4. mounts it at `/var/lib/savior/data`.
+4. mounts it at `/var/lib/savior/data`. The hive keeps its state in
+   `/var/lib/savior/data/hive`.
 
 The FAT boot partition is never written at runtime. Without a data
 partition the hive runs from RAM with `Persistent=false`.
