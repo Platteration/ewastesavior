@@ -15,6 +15,7 @@ import (
 	_ "image/jpeg" // register decoder
 	_ "image/png"  // register decoder
 	"io"
+	"strings"
 
 	_ "golang.org/x/image/bmp"  // register decoder
 	_ "golang.org/x/image/webp" // register decoder
@@ -62,6 +63,11 @@ func DecodeLimited(r io.Reader, lim Limits) (image.Image, string, error) {
 		}
 	}
 	if err != nil {
+		// On 32-bit machines the PNG decoder itself refuses dimensions
+		// whose pixel buffer would overflow an int.
+		if strings.Contains(err.Error(), "dimension overflow") {
+			return nil, format, fmt.Errorf("%w: %v", ErrTooLarge, err)
+		}
 		return nil, "", fmt.Errorf("unrecognized image: %w", err)
 	}
 	if err := checkDims(cfg.Width, cfg.Height, lim); err != nil {

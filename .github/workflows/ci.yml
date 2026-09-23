@@ -27,6 +27,8 @@ jobs:
         run: make vet
       - name: go test -race
         run: make test-race
+      - name: go test (386, sse2 and softfloat)
+        run: make test-386
 
   cross:
     name: build ${{ matrix.name }}

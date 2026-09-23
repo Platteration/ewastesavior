@@ -44,7 +44,7 @@ BRMAKE ?= make
 BR_ENV = env -u ARCH -u MAKEFLAGS -u MFLAGS -u MAKELEVEL -u MAKEOVERRIDES BR2_DL_DIR=$(abspath $(BR_DL_DIR))
 BR_ARGS = -C $(BUILDROOT_SRC) O=$(abspath $(BR_OUT)) BR2_EXTERNAL=$(abspath os/buildroot)
 
-.PHONY: help build build-linux build-linux-amd64 build-linux-386 cross test test-race \
+.PHONY: help build build-linux build-linux-amd64 build-linux-386 cross test test-386 test-race \
 	vet fmt-check lint-sh test-scripts check dev-image dev-test swarm-test \
 	buildroot-src check-arch image universal-image universal-media clean distclean
 
@@ -57,6 +57,7 @@ help:
 	@echo "  cross             hive/ctl builds for $(CROSS_TARGETS) -> $(BUILD)/<os>-<arch>/"
 	@echo "  test              go test ./..."
 	@echo "  test-race         go test -race ./... (needs cgo; falls back to test)"
+	@echo "  test-386          go test ./... as GOARCH=386, sse2 and softfloat"
 	@echo "  vet               go vet ./..."
 	@echo "  fmt-check         fail if gofmt would change anything"
 	@echo "  lint-sh           shellcheck -s sh on every shell script in os/ and scripts/"
@@ -103,6 +104,12 @@ cross:
 
 test:
 	CGO_ENABLED=0 $(GO) test $(GOFLAGS) ./...
+
+# The 32-bit builds run on the oldest machines (softfloat: no SSE2); run the
+# tests as they are built. Needs a kernel that runs 386 binaries.
+test-386:
+	CGO_ENABLED=0 GOARCH=386 GO386=sse2 $(GO) test $(GOFLAGS) ./...
+	CGO_ENABLED=0 GOARCH=386 GO386=softfloat $(GO) test $(GOFLAGS) ./...
 
 test-race:
 	@if CGO_ENABLED=1 $(GO) test -race -count=1 ./internal/version >/dev/null 2>&1; then \
