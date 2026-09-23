@@ -51,6 +51,14 @@ func (r *Runner) init() error {
 	r.prepareCgroup() // best effort; sets the cgroup2 capability
 
 	r.probeCaps()
+	if os.Geteuid() == 0 && (r.mode == ModeNone || !r.caps[CapMountNS]) {
+		// Without a private root, task users reach the workdir through the
+		// host's directories, so every ancestor must be searchable.
+		if dir := unsearchableAncestor(r.sys.workPath); dir != "" {
+			return fmt.Errorf("runner: task users (uid %d+) cannot reach %s: %s is not world-searchable (chmod o+x it or use another WorkRoot)",
+				r.cfg.UIDBase, r.sys.workPath, dir)
+		}
+	}
 	r.log.Info("runner ready",
 		"sandbox", r.mode, "machine", r.sys.machine, "arch", r.sys.shimArch,
 		"caps", strings.Join(capList(r.caps), ","))
@@ -182,4 +190,17 @@ func (r *Runner) SetCPULimit(cores float64) error {
 // ends, is canceled (ctx) or preempted.
 func (r *Runner) Run(ctx context.Context, t proto.Task, logs io.Writer, progress func(proto.RunningTask)) proto.TaskReport {
 	return r.run(ctx, t, logs, progress)
+}
+
+// unsearchableAncestor returns the first proper ancestor of path that
+// others can't traverse (missing o+x), or "".
+func unsearchableAncestor(path string) string {
+	for dir := filepath.Dir(path); ; dir = filepath.Dir(dir) {
+		if st, err := os.Stat(dir); err == nil && st.Mode().Perm()&0o001 == 0 {
+			return dir
+		}
+		if dir == "/" || dir == "." {
+			return ""
+		}
+	}
 }

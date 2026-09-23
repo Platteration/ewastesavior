@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="no-referrer">
+<title>SaviorOS hive</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/app.css">
+<script type="module" src="/js/app.js"></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar" id="topbar" hidden>
+  <div class="brand"><img src="/favicon.svg" alt="" width="24" height="24"> <span>SaviorOS hive</span> <span class="muted" id="hive-version"></span></div>
+  <nav aria-label="Main">
+    <ul id="nav">
+      <li><a href="#/">Overview</a></li>
+      <li><a href="#/nodes">Nodes</a></li>
+      <li><a href="#/jobs">Jobs</a></li>
+      <li><a href="#/walls">Walls</a></li>
+      <li><a href="#/blobs">Blobs</a></li>
+      <li><a href="#/settings">Settings</a></li>
+    </ul>
+  </nav>
+  <button type="button" class="btn btn-small" id="logout">Sign out</button>
+</header>
+<main id="main" tabindex="-1">
+  <p id="boot" class="panel">Loading the dashboard&hellip; If this message stays, this browser is too old or has JavaScript turned off. Use a browser from 2018 or newer.</p>
+</main>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+</body>
+</html>

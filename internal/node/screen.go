@@ -195,20 +195,27 @@ func (a *Agent) writeStatus() {
 	}
 }
 
-// hivePanelFile is written by a hive running on this machine (roles=hive)
-// so the node's status screen can show how to reach it.
-const hivePanelFile = "/run/savior/hive-panel.json"
+// hivePanelFile is written by a hive running on this machine (roles=hive;
+// see hive.DefaultStatusFile) so the status screen and console can show how
+// to reach it.
+const hivePanelFile = "/run/savior/hive-status.json"
 
 func readHivePanel() *display.HivePanel {
 	b, err := os.ReadFile(hivePanelFile)
 	if err != nil {
 		return nil
 	}
-	var p display.HivePanel
+	var p struct {
+		URLs        []string `json:"urls"`
+		Fingerprint string   `json:"fingerprint"`
+		PairCode    string   `json:"pair_code"`
+		NodesOnline int      `json:"nodes_online"`
+		Persistent  bool     `json:"persistent"`
+	}
 	if json.Unmarshal(bytes.TrimSpace(b), &p) != nil {
 		return nil
 	}
-	return &p
+	return &display.HivePanel{URLs: p.URLs, Fingerprint: p.Fingerprint, PairCode: p.PairCode, NodesOnline: p.NodesOnline, Persistent: p.Persistent}
 }
 
 // localAddrs lists this machine's non-loopback addresses (CIDR).

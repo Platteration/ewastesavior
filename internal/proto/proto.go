@@ -157,7 +157,7 @@ type Metrics struct {
 	// else ACPI thermal zones). Implausible and stuck readings are ignored.
 	// 0 = unknown.
 	CPUTempC       float64 `json:"cpu_temp_c"`
-	CPUTempLimitC  float64 `json:"cpu_temp_limit_c"` // effective pause threshold (config vs sensor max/crit); 0 = unknown
+	CPUTempLimitC  float64 `json:"cpu_temp_limit_c"` // effective pause threshold: min(max_temp_c, sensor max/crit limits)
 	ThrottleEvents uint64  `json:"throttle_events"`  // cumulative core+package thermal throttle count
 	// OnBattery is true only when it's positively known: no Mains supply is
 	// online, or (with no Mains supply present) a battery is Discharging.
@@ -320,6 +320,7 @@ type RunningTask struct {
 // RegisterRequest is POSTed to /api/v1/register over a connection pinned to
 // the fingerprint the node saw on /hello.
 type RegisterRequest struct {
+	APIVersion    int               `json:"api_version"` // proto.APIVersion; the hive answers 426 on mismatch
 	NodeID        string            `json:"node_id"`
 	HWIDs         []string          `json:"hw_ids"`  // every identity candidate: "mac:001122334455", "uuid:...", "serial:..."
 	BootID        string            `json:"boot_id"` // /proc/sys/kernel/random/boot_id (+ agent start nonce)

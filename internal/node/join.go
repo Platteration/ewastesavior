@@ -281,6 +281,7 @@ func (a *Agent) registerRequest() *proto.RegisterRequest {
 		inv.Connectors = fresh.Connectors
 	}
 	return &proto.RegisterRequest{
+		APIVersion:    proto.APIVersion,
 		NodeID:        a.id.NodeID,
 		HWIDs:         a.id.HWIDs,
 		BootID:        a.bootID,
