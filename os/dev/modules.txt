@@ -1,0 +1,110 @@
+# os/dev/modules.txt - kernel modules of the SaviorOS dev image.
+#
+# The dev image uses the Ubuntu 24.04 generic kernel (os/dev/build.sh). These
+# modules, plus everything they depend on (modules.dep), go into
+# /lib/modloop.sqfs. Syntax, one module per line:
+#   name              required: the build fails if the kernel has neither a
+#                     module nor a built-in driver of that name
+#   optional: name    skipped (with a note) when the kernel lacks it
+#   a|b               the first of these names that exists (renamed drivers)
+# "-" and "_" are interchangeable. Modules the kernel has built in are fine
+# (they need no file). The production list is the Kconfig in
+# os/buildroot/board/savior/linux (DESIGN 14).
+
+# --- QEMU test machines: NICs, GPUs, RNG ---------------------------------
+e1000
+e1000e
+virtio_net
+8139too
+bochs
+cirrus-qemu|cirrus
+virtio-gpu
+optional: virtio-rng
+
+# --- boot media and disks -------------------------------------------------
+usb-storage
+uas
+xhci-pci
+ehci-pci
+uhci-hcd
+ohci-pci
+sr_mod
+cdrom
+ata_piix
+ata_generic
+ahci
+virtio_blk
+optional: virtio_scsi
+squashfs
+loop
+vfat
+nls_cp437
+nls_iso8859-1
+nls_utf8
+isofs
+
+# --- memory: zram swap ------------------------------------------------------
+zram
+lz4
+lz4_compress
+optional: zstd
+
+# --- keyboard, mouse, beeper ------------------------------------------------
+evdev
+psmouse
+usbhid
+hid-generic
+pcspkr
+
+# --- sensors, power, backlight ----------------------------------------------
+optional: coretemp
+optional: k8temp
+optional: k10temp
+optional: via-cputemp
+optional: video
+optional: acpi-cpufreq
+
+# --- real hardware (DESIGN 14 list), not needed in QEMU -------------------
+# Wired NICs.
+optional: r8169
+optional: e100
+optional: sky2
+optional: tg3
+optional: b44
+optional: forcedeth
+optional: via-rhine
+optional: sis900
+optional: atl1
+optional: atl1c
+optional: atl1e
+optional: alx
+optional: 8139cp
+# USB network adapters.
+optional: asix
+optional: ax88179_178a
+optional: r8152
+optional: cdc_ether
+# GPUs (large: i915, radeon and nouveau are about 3 MiB compressed together).
+optional: i915
+optional: radeon
+optional: nouveau
+optional: gma500_gfx
+optional: mgag200
+optional: ast
+# Wi-Fi. Firmware is not part of the dev image: put it into /firmware on
+# the stick.
+optional: iwl3945
+optional: iwl4965
+optional: iwlwifi
+optional: iwldvm
+optional: iwlmvm
+optional: ipw2100
+optional: ipw2200
+optional: ath5k
+optional: ath9k
+optional: rt2800pci
+optional: rt2800usb
+optional: rtl8187
+optional: rtl8192ce
+optional: brcmsmac
+optional: b43

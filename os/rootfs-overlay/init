@@ -1,0 +1,24 @@
+#!/bin/sh
+# /init - the first program the kernel runs from the SaviorOS initramfs.
+#
+# SaviorOS runs from the initramfs, which the kernel unpacks into its
+# initial "rootfs" mount. pivot_root(2) refuses to move that mount (EINVAL:
+# it has no parent), and the task sandbox needs pivot_root (DESIGN 6.5). So
+# bind-mount the rootfs onto /mnt, move that mount on top of /, chroot into
+# it and start BusyBox init there. Nothing is copied: the files stay where
+# the kernel unpacked them, the root is just a real mount now.
+#
+# If any step fails, BusyBox init starts on the plain rootfs (everything
+# but sandboxed tasks works).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+if [ "$$" = 1 ] && mount -o bind / /mnt 2>/dev/null; then
+	if cd /mnt && mount -o move . / 2>/dev/null; then
+		exec chroot . /sbin/init "$@"
+	fi
+	cd /
+	umount /mnt 2>/dev/null
+fi
+echo "savior: /init: cannot re-root the initramfs; task sandboxes will not work" >/dev/console 2>/dev/null
+exec /sbin/init "$@"
