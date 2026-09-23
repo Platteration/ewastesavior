@@ -1,0 +1,53 @@
+#!/bin/sh
+# S40time - NTP client (BusyBox ntpd) when the image has it and ntp != off.
+# ntpd daemonizes itself and keeps resolving the server names, so it can be
+# started before the network is up.
+set -u
+# shellcheck source=../../usr/libexec/savior/lib.sh
+. /usr/libexec/savior/lib.sh
+
+start() {
+	load_env
+	servers=${SAVIOR_NTP:-pool.ntp.org}
+	case "$servers" in off | OFF | none)
+		log "ntp: off"
+		return 0
+		;;
+	esac
+	if ! have ntpd; then
+		log "ntp: this image has no ntpd; the clock follows the hive"
+		return 0
+	fi
+	pidof ntpd >/dev/null 2>&1 && return 0
+	set --
+	# SAVIOR_NTP: one server per line.
+	for s in $servers; do
+		[ "$s" = off ] && continue
+		set -- "$@" -p "$s"
+	done
+	[ $# -gt 0 ] || return 0
+	if ntpd "$@"; then
+		log "ntp: ntpd started ($(echo "$servers" | tr '\n' ' '))"
+	else
+		log "ntp: ntpd failed to start"
+	fi
+}
+
+stop() {
+	killall ntpd 2>/dev/null
+	return 0
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+restart)
+	stop
+	start
+	;;
+*)
+	echo "usage: $0 start|stop|restart" >&2
+	exit 2
+	;;
+esac
+exit 0

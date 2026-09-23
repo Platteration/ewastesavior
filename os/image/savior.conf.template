@@ -1,0 +1,163 @@
+# savior.conf - SaviorOS settings for the machines booted from this stick.
+#
+# Edit this file on any computer (Notepad, TextEdit, nano...). One setting
+# per line: key = value. Lines starting with # are ignored: remove the #
+# in front of a setting to use it. Changes apply at the next boot.
+# Every key can also be given on the kernel command line as
+# savior.<key>=<value> (see README.txt).
+#
+# The hive can write a ready-made copy of this file for you:
+#     savior ctl node-config > savior.conf
+
+# ---------------------------------------------------------------------------
+# The settings most swarms need
+# ---------------------------------------------------------------------------
+
+# The shared secret of your swarm: the same on every machine and the hive.
+# At least 16 characters; "savior ctl genkey" makes a good one.
+#swarm_key =
+
+# The hive's certificate fingerprint (sha256:...). With it, machines only
+# talk to your hive. Shown on the hive's screen and by "savior ctl
+# node-config". Strongly recommended.
+#hive_fingerprint =
+
+# Where the hive is: auto (find it on the local network), a host name or
+# address, host:port, or https://host:port.
+#hive = auto
+
+# A name for this machine: letters, digits and dashes. Empty = savior-<id>.
+# Leave it empty on a stick used for many machines; rename them on the hive.
+#name =
+
+# What this machine does: auto (compute, plus display when it has a
+# screen), compute, display, hive (the coordinator). Comma-separated.
+#roles = auto
+
+# Wi-Fi (leave empty for a network cable). An empty wifi_psk means an open
+# network. wifi_country is the two-letter code of where you are.
+#wifi_ssid =
+#wifi_psk =
+#wifi_country = US
+
+# ---------------------------------------------------------------------------
+# Everything else (the defaults are fine for most people)
+# ---------------------------------------------------------------------------
+
+# --- Joining -------------------------------------------------------------
+
+# key = join with swarm_key; keyless = join without a key and wait until
+# an admin approves the machine on the hive (used by network boot).
+#join = key
+
+# Override the ID derived from the hardware (letters, digits, dashes).
+#node_id =
+
+# Labels for job requirements, key=value, comma-separated (room=lab2,...).
+#labels =
+
+# --- Network -------------------------------------------------------------
+
+# dhcp, static or off.
+#net = dhcp
+
+# Static addressing (net = static): address with prefix, gateway, DNS
+# servers (comma-separated).
+#ip = 10.77.0.1/24
+#gateway =
+#dns =
+
+# Hand out addresses on the first wired port (needs net = static). Range
+# as first-last; empty = .100-.200 of the static subnet.
+#dhcp_server = no
+#dhcp_range =
+
+# Let other machines boot SaviorOS over the network from this hive (PXE).
+#netboot = no
+
+# Time servers (comma-separated), or off.
+#ntp = pool.ntp.org
+
+# Time zone for clocks and logs, e.g. Europe/Berlin or America/Chicago.
+#timezone = UTC
+
+# --- Remote access -------------------------------------------------------
+
+# SSH public key allowed to log in as root (one per line; repeat the line
+# for more keys). No key = no SSH server.
+#ssh_key = ssh-ed25519 AAAA... you@laptop
+
+# Root shell on the second console (Alt+F2) without a password. Anyone at
+# the keyboard gets root, so only on machines you trust.
+#console_shell = no
+
+# --- Compute -------------------------------------------------------------
+
+# Share of the CPU cores and of the memory offered to jobs, in percent.
+#max_cpu_percent = 100
+#max_mem_percent = 75
+
+# Task isolation: strict (refuse jobs that cannot be fully isolated),
+# auto (use what the kernel offers) or none.
+#sandbox = strict
+
+# Where jobs keep their files: ram, a disk partition (/dev/sda2) or
+# LABEL=name. The partition must hold an ext2/3/4 filesystem, unless
+# scratch_wipe = yes, which FORMATS it and ERASES everything on it.
+#scratch = ram
+#scratch_wipe = no
+
+# --- Laptops, power and heat ---------------------------------------------
+
+# Keep taking jobs on battery; on battery below battery_min_percent,
+# running jobs are handed back to the hive.
+#run_on_battery = no
+#battery_min_percent = 40
+
+# Pause jobs above this CPU temperature (they resume 10 C lower).
+#max_temp_c = 85
+
+# CPU frequency governor: auto, ondemand, schedutil, performance,
+# powersave, conservative.
+#cpu_governor = auto
+
+# --- Screen --------------------------------------------------------------
+
+# What the screen shows until the hive says otherwise: status, off, text,
+# clock, test. display_text is used with display_mode = text.
+#display_mode = status
+#display_text =
+
+# Rotate the picture: 0, 90, 180 or 270.
+#display_rotate = 0
+
+# Framebuffer to use: auto or /dev/fbN.
+#display_device = auto
+
+# Blank the screen after this many idle minutes in the status and clock
+# modes (0 = never).
+#display_idle_off_min = 15
+
+# --- Hive (only with roles = hive) ---------------------------------------
+
+# Address and port of the hive's HTTPS service.
+#hive_listen = :7700
+
+# Where the hive keeps its state: auto = a SAVIOR-DATA partition created
+# on this stick on first start (or RAM when that is not possible).
+#hive_data = auto
+
+# Admin token (at least 32 characters). Empty = generated on first start.
+#admin_token =
+
+# open = machines with the swarm key join directly; approve = new machines
+# wait for an admin.
+#join_policy = open
+
+# Announce the hive on the local network so machines find it by themselves.
+#beacon = yes
+
+# --- Troubleshooting -----------------------------------------------------
+
+# debug, info, warn or error.
+#log_level = info

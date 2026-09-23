@@ -1,0 +1,14 @@
+# /etc/inittab - SaviorOS (BusyBox init). DESIGN 13.3.
+#
+# tty1: status screen (savior console), tty2: root shell (console_shell =
+# yes) or a notice, tty7: the display (opened by the node agent). The hive
+# entry sleeps unless this machine has the hive role. The savior services
+# go through /usr/libexec/savior/run, which keeps a crashing program from
+# being respawned in a tight loop.
+::sysinit:/etc/init.d/rcS
+tty1::respawn:/usr/libexec/savior/run console
+tty2::respawn:/usr/libexec/savior/tty2
+::respawn:/usr/libexec/savior/run node
+::respawn:/usr/libexec/savior/run hive
+::ctrlaltdel:/sbin/reboot
+::shutdown:/etc/init.d/rcK

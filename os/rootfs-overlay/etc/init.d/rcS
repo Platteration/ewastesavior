@@ -1,0 +1,51 @@
+#!/bin/sh
+# /etc/init.d/rcS - SaviorOS system start (BusyBox init "::sysinit").
+#
+# Runs the allowlisted /etc/init.d/S??* scripts in order with "start"
+# (DESIGN 13.3). Other S scripts are ignored (the Buildroot post-build also
+# deletes them). Every script handles its own errors; a failing script is
+# logged and the boot continues. Slow work (formatting, Wi-Fi, PXE, ...) is
+# put in the background by the scripts themselves, so only mounts, mdev,
+# config and network start block the boot.
+#
+# No "set -e": a boot script must never stop half-way.
+set -u
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+SCRIPTS="S00mounts S05mdev S08config S10system S20scratch S30network S35dhcpd S40time S50sshd S65netboot"
+
+# shellcheck source=../../usr/libexec/savior/lib.sh
+. /usr/libexec/savior/lib.sh
+
+echo "savior: starting SaviorOS"
+for name in $SCRIPTS; do
+	script=/etc/init.d/$name
+	if [ ! -x "$script" ]; then
+		log "$name: missing, skipped"
+		continue
+	fi
+	"$script" start
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		log "$name start failed (exit $rc), continuing"
+	fi
+	log "$name done"
+	# /proc and /dev exist from here on.
+	[ "$name" != S00mounts ] || serial_mark "SAVIOR-BOOT: rcS start up=$(uptime_s)"
+done
+
+for script in /etc/init.d/S??*; do
+	[ -e "$script" ] || continue
+	case " $SCRIPTS " in
+	*" ${script##*/} "*) ;;
+	*) log "ignored ${script##*/} (not in the rcS allowlist)" ;;
+	esac
+done
+
+log "boot scripts finished after $(uptime_s) s"
+# One machine-readable status line once the network and the console are up
+# (serial console and boot log; see /usr/libexec/savior/boot-report).
+daemonize boot-report "$LIBEXEC/boot-report"
+exit 0

@@ -1,0 +1,22 @@
+#!/bin/sh
+# /usr/libexec/savior/zcip.script - BusyBox zcip event handler: IPv4
+# link-local (169.254/16) address when no DHCP server answers.
+# zcip passes the event as $1 (init, config, deconfig) and sets interface
+# and ip in the environment.
+# shellcheck disable=SC2154 # interface and ip come from zcip
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+case "${1:-}" in
+init)
+	ip link set "$interface" up
+	;;
+config)
+	ip addr add "$ip/16" broadcast 169.254.255.255 dev "$interface" scope link
+	logger -t savior-dhcp -- "$interface: link-local $ip" 2>/dev/null || :
+	;;
+deconfig)
+	[ -n "${ip:-}" ] && ip addr del "$ip/16" dev "$interface" 2>/dev/null
+	;;
+esac
+exit 0

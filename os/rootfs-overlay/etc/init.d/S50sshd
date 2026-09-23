@@ -1,0 +1,110 @@
+#!/bin/sh
+# S50sshd - dropbear SSH server when ssh_key is set (root, key login only).
+#
+# The ed25519 host key is generated in RAM. On a hive with a SAVIOR-DATA
+# partition it is kept in /var/lib/savior/data/ssh so the key survives
+# reboots; the hive's data partition is mounted by the hive's run script
+# after rcS, so on a hive this script waits for it in the background.
+set -u
+# shellcheck source=../../usr/libexec/savior/lib.sh
+. /usr/libexec/savior/lib.sh
+
+KEYDIR=/etc/dropbear
+KEY=$KEYDIR/dropbear_ed25519_host_key
+DATA=/var/lib/savior/data
+PERSIST=$DATA/ssh
+PIDFILE=$RUN_DIR/dropbear.pid
+
+install_keys() {
+	mkdir -p /root/.ssh
+	chmod 0700 /root /root/.ssh
+	# SAVIOR_SSH_KEY: one public key per line.
+	printf '%s\n' "$SAVIOR_SSH_KEY" >/root/.ssh/authorized_keys.tmp &&
+		chmod 0600 /root/.ssh/authorized_keys.tmp &&
+		mv -f /root/.ssh/authorized_keys.tmp /root/.ssh/authorized_keys
+}
+
+host_key() {
+	mkdir -p "$KEYDIR"
+	chmod 0700 "$KEYDIR"
+	if is_mounted "$DATA"; then
+		mkdir -p "$PERSIST"
+		chmod 0700 "$PERSIST"
+		if [ -s "$PERSIST/dropbear_ed25519_host_key" ]; then
+			cp "$PERSIST/dropbear_ed25519_host_key" "$KEY"
+		fi
+	fi
+	if [ ! -s "$KEY" ]; then
+		dropbearkey -t ed25519 -f "$KEY" >/dev/null 2>&1 || {
+			log "sshd: dropbearkey failed"
+			return 1
+		}
+	fi
+	chmod 0600 "$KEY"
+	if is_mounted "$DATA" && [ ! -s "$PERSIST/dropbear_ed25519_host_key" ]; then
+		cp "$KEY" "$PERSIST/dropbear_ed25519_host_key" &&
+			log "sshd: host key saved in $PERSIST"
+	fi
+}
+
+run_dropbear() {
+	host_key || return 0
+	# -s/-g: no password logins at all; -R: generate other key types only
+	# if a client insists on them.
+	if dropbear -R -s -g -r "$KEY" -P "$PIDFILE"; then
+		log "sshd: dropbear listening on port 22"
+	else
+		log "sshd: dropbear failed to start"
+	fi
+}
+
+# wait_data: background job on a hive; up to 90 s for the data partition.
+wait_data() {
+	load_env
+	n=0
+	while ! is_mounted "$DATA" && [ "$n" -lt 90 ]; do
+		sleep 1
+		n=$((n + 1))
+	done
+	run_dropbear
+}
+
+start() {
+	load_env
+	if [ -z "${SAVIOR_SSH_KEY:-}" ]; then
+		log "sshd: no ssh_key, SSH server off"
+		return 0
+	fi
+	if ! have dropbear || ! have dropbearkey; then
+		say "ssh_key is set but this image has no dropbear"
+		return 0
+	fi
+	running dropbear && return 0
+	install_keys
+	if [ "${SAVIOR_ROLE_HIVE:-no}" = yes ] && [ "${SAVIOR_HIVE_DATA:-auto}" = auto ] &&
+		[ -e /etc/savior-release ] && ! is_mounted "$DATA"; then
+		daemonize sshd-wait /etc/init.d/S50sshd wait-data
+	else
+		run_dropbear
+	fi
+}
+
+stop() {
+	stop_job sshd-wait
+	stop_job dropbear
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+restart)
+	stop
+	start
+	;;
+wait-data) wait_data ;;
+*)
+	echo "usage: $0 start|stop|restart" >&2
+	exit 2
+	;;
+esac
+exit 0

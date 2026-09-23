@@ -1,0 +1,184 @@
+#!/bin/sh
+# S20scratch - task scratch space (DESIGN 5.3 scratch, scratch_wipe).
+#
+#   scratch = ram       nothing to do: the runner mounts a tmpfs per task
+#                       under /var/lib/savior/work.
+#   scratch = /dev/sdX2 or LABEL=name
+#                       mount that ext2/3/4 filesystem on /var/lib/savior/work.
+#                       Without one, scratch_wipe = yes formats it (ext4,
+#                       label SAVIOR-SCRATCH) in the background; the node agent
+#                       waits for /run/savior/scratch.pending to go away.
+#
+# Never touches the disk holding the SaviorOS stick or the hive data, a
+# mounted device, or a whole disk that has partitions. When the device is
+# unusable, the merged config is switched to scratch = ram so the node agent
+# accounts task disk space in RAM.
+set -u
+# shellcheck source=../../usr/libexec/savior/lib.sh
+. /usr/libexec/savior/lib.sh
+
+WORK=/var/lib/savior/work
+PENDING=$RUN_DIR/scratch.pending
+SAVIOR=/usr/bin/savior
+
+# use_ram REASON: fall back to RAM scratch and tell the node agent.
+use_ram() {
+	say "scratch: $1 - tasks use RAM instead"
+	if [ -f "$RUN_DIR/savior.conf" ]; then
+		sed -i 's|^scratch = .*|scratch = ram|' "$RUN_DIR/savior.conf"
+		sed -i "s|^SAVIOR_SCRATCH=.*|SAVIOR_SCRATCH='ram'|" "$RUN_DIR/env"
+	fi
+	rm -f "$PENDING"
+}
+
+# resolve SPEC: print the device node for /dev/X or LABEL=x, waiting up to
+# 10 s for slow (USB) disks.
+resolve() {
+	n=0
+	while [ "$n" -lt 20 ]; do
+		case "$1" in
+		LABEL=*)
+			label=${1#LABEL=}
+			dev=$("$SAVIOR" storage find-label "$label" 2>/dev/null) ||
+				dev=$(findfs "LABEL=$label" 2>/dev/null) || dev=""
+			;;
+		*) dev=$1 ;;
+		esac
+		if [ -n "$dev" ] && [ -b "$dev" ]; then
+			echo "$dev"
+			return 0
+		fi
+		sleep 0.5 2>/dev/null || sleep 1
+		n=$((n + 1))
+	done
+	return 1
+}
+
+# safe_device DEV: refuse devices SaviorOS must not touch.
+safe_device() {
+	disk=$(disk_of "$1")
+	for m in /media/savior /var/lib/savior/data; do
+		src=$(mount_source "$m") || continue
+		if [ "$(disk_of "$src")" = "$disk" ]; then
+			echo "$1 is on the same disk as $m"
+			return 1
+		fi
+	done
+	# The stick may have been pulled already; S08config recorded it.
+	if [ -r "$RUN_DIR/media" ]; then
+		read -r src _ <"$RUN_DIR/media"
+		if [ -n "$src" ] && [ "$(disk_of "$src")" = "$disk" ]; then
+			echo "$1 is on the SaviorOS stick"
+			return 1
+		fi
+	fi
+	if [ -x "$SAVIOR" ]; then
+		case "$("$SAVIOR" storage probe --field label "$1" 2>/dev/null)" in
+		SAVIOR | SAVIOR-DATA)
+			echo "$1 holds a SaviorOS boot or data filesystem"
+			return 1
+			;;
+		esac
+	fi
+	if awk -v d="$1" '$1 == d { f = 1 } END { exit !f }' /proc/mounts; then
+		echo "$1 is already mounted"
+		return 1
+	fi
+	if grep -q "^$1 " /proc/swaps 2>/dev/null; then
+		echo "$1 is in use as swap"
+		return 1
+	fi
+	return 0
+}
+
+has_partitions() {
+	name=${1##*/}
+	[ -e "/sys/class/block/$name/partition" ] && return 1
+	for p in "/sys/class/block/$name/$name"*; do
+		[ -e "$p/partition" ] && return 0
+	done
+	return 1
+}
+
+mount_work() {
+	for t in ext4 ext3 ext2; do
+		if mount -t "$t" -o nosuid,nodev,noatime "$1" "$WORK" 2>/dev/null; then
+			chmod 0711 "$WORK"
+			log "scratch: $1 mounted on $WORK"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# format DEV: runs in the background (daemonize).
+format() {
+	log "scratch: formatting $1 (ext4, label SAVIOR-SCRATCH)"
+	if mkfs_ext4 SAVIOR-SCRATCH "$1" 0 >"$RUN_DIR/scratch-mkfs.log" 2>&1 && mount_work "$1"; then
+		log "scratch: $1 ready"
+		rm -f "$PENDING"
+	else
+		log_file "$RUN_DIR/scratch-mkfs.log"
+		use_ram "formatting $1 failed"
+	fi
+	rm -f "$RUN_DIR/scratch-mkfs.log"
+}
+
+start() {
+	mkdir -p "$WORK"
+	chmod 0711 "$WORK"
+	load_env
+	spec=${SAVIOR_SCRATCH:-ram}
+	[ "$spec" = ram ] && return 0
+	if is_mounted "$WORK"; then
+		return 0
+	fi
+	dev=$(resolve "$spec") || {
+		use_ram "$spec not found"
+		return 0
+	}
+	if ! why=$(safe_device "$dev"); then
+		use_ram "refusing $dev: $why"
+		return 0
+	fi
+	fstype=""
+	[ -x "$SAVIOR" ] && fstype=$("$SAVIOR" storage probe --field type "$dev" 2>/dev/null)
+	case "$fstype" in
+	ext2 | ext3 | ext4 | "")
+		mount_work "$dev" && return 0
+		;;
+	esac
+	if ! is_yes "${SAVIOR_SCRATCH_WIPE:-no}"; then
+		use_ram "$dev has no usable ext2/3/4 filesystem (${fstype:-unknown}); set scratch_wipe = yes to format it (this erases it)"
+		return 0
+	fi
+	if has_partitions "$dev"; then
+		use_ram "$dev is a whole disk with partitions; name a partition (e.g. ${dev}1) instead"
+		return 0
+	fi
+	: >"$PENDING"
+	say "scratch: formatting $dev in the background (the node agent starts when it is done)"
+	daemonize scratch-format /etc/init.d/S20scratch format "$dev"
+}
+
+stop() {
+	stop_job scratch-format
+	if is_mounted "$WORK"; then
+		umount "$WORK" 2>/dev/null || log "scratch: could not unmount $WORK"
+	fi
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+restart)
+	stop
+	start
+	;;
+format) format "${2:?device}" ;;
+*)
+	echo "usage: $0 start|stop|restart" >&2
+	exit 2
+	;;
+esac
+exit 0

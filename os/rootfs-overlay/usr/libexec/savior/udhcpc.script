@@ -1,0 +1,91 @@
+#!/bin/sh
+# /usr/libexec/savior/udhcpc.script - BusyBox udhcpc event handler.
+#
+# udhcpc passes the event as $1 (deconfig, bound, renew, leasefail, nak)
+# and the lease in environment variables: interface, ip, mask (prefix
+# length), subnet (dotted mask), broadcast, router, dns, domain, lease.
+# shellcheck disable=SC2154 # interface, ip, ... come from udhcpc
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+RESOLV=/etc/resolv.conf
+STATE=/run/savior
+
+log() {
+	logger -t savior-dhcp -- "$*" 2>/dev/null || :
+}
+
+# mask2prefix A.B.C.D: count the one bits of a dotted netmask.
+mask2prefix() {
+	_n=0
+	_o=$IFS
+	IFS=.
+	# shellcheck disable=SC2086 # split on dots
+	set -- $1
+	IFS=$_o
+	for _b in "$@"; do
+		while [ "$_b" -gt 0 ]; do
+			_n=$((_n + (_b & 1)))
+			_b=$((_b >> 1))
+		done
+	done
+	echo "$_n"
+}
+
+# Wired routes win over Wi-Fi.
+metric=10
+[ -d "/sys/class/net/${interface:-}/wireless" ] && metric=20
+
+case "${1:-}" in
+deconfig)
+	ip -4 addr flush dev "$interface" 2>/dev/null
+	ip link set "$interface" up
+	rm -f "$STATE/lease.$interface"
+	;;
+
+bound | renew)
+	prefix=${mask:-}
+	[ -n "$prefix" ] || prefix=$(mask2prefix "${subnet:-255.255.255.0}")
+	old=$(cat "$STATE/lease.$interface" 2>/dev/null)
+	if [ "$1" = bound ] || [ "$old" != "$ip/$prefix" ]; then
+		ip -4 addr flush dev "$interface" 2>/dev/null
+		if [ -n "${broadcast:-}" ]; then
+			ip addr add "$ip/$prefix" broadcast "$broadcast" dev "$interface"
+		else
+			ip addr add "$ip/$prefix" dev "$interface"
+		fi
+		log "$interface: $ip/$prefix (lease ${lease:-?} s)"
+	fi
+	umask 022
+	echo "$ip/$prefix" >"$STATE/lease.$interface"
+
+	if [ -n "${router:-}" ]; then
+		while ip route del default dev "$interface" 2>/dev/null; do :; done
+		for r in $router; do
+			ip route add default via "$r" dev "$interface" metric "$metric" && break
+		done
+	fi
+
+	# net = static with dns set (DHCP only on a second NIC): keep that DNS.
+	static_dns=no
+	if grep -q "^SAVIOR_NET='static'" "$STATE/env" 2>/dev/null &&
+		! grep -q "^SAVIOR_DNS=''" "$STATE/env" 2>/dev/null; then
+		static_dns=yes
+	fi
+	if [ -n "${dns:-}" ] && [ "$static_dns" = no ]; then
+		tmp="$RESOLV.$$"
+		{
+			[ -n "${domain:-}" ] && echo "search $domain"
+			for s in $dns; do
+				echo "nameserver $s"
+			done
+		} >"$tmp"
+		chmod 0644 "$tmp"
+		mv -f "$tmp" "$RESOLV"
+	fi
+	;;
+
+leasefail | nak)
+	log "${interface:-?}: $1 ${message:-}"
+	;;
+esac
+exit 0

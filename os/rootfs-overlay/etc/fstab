@@ -1,0 +1,3 @@
+# /etc/fstab - intentionally empty. SaviorOS runs from RAM; the init scripts
+# mount everything (S00mounts: kernel filesystems, S08config: the stick,
+# S20scratch: task scratch, savior storage init-data: the hive data).

@@ -1,0 +1,20 @@
+# shellcheck shell=sh
+# /etc/profile - SaviorOS login shells (tty2 with console_shell = yes, SSH).
+export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+if [ -z "${HOME:-}" ] || [ "$HOME" = / ]; then
+	export HOME=/root
+fi
+umask 077
+PS1='\h:\w\$ '
+alias ll='ls -l'
+alias la='ls -la'
+
+case $- in
+*i*)
+	echo "SaviorOS $(cat /etc/savior-release 2>/dev/null)"
+	echo "  savior info              this machine's hardware"
+	echo "  savior config get KEY    effective setting (see /run/savior/savior.conf)"
+	echo "  logread, /var/log/       system and savior logs"
+	echo "  reboot, poweroff"
+	;;
+esac

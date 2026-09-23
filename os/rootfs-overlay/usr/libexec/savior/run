@@ -1,0 +1,125 @@
+#!/bin/sh
+# /usr/libexec/savior/run <node|hive|console> - start a savior service for
+# BusyBox init (inittab "respawn"). DESIGN 13.3.
+#
+#   hive:    without the hive role, sleep forever (init keeps the entry
+#            alive without restarting anything). With hive_data = auto on
+#            SaviorOS, create/mount the SAVIOR-DATA partition once per boot.
+#   node:    reset the console before and after the agent (a crashed agent
+#            may leave the VT in graphics mode) and wait while S20scratch
+#            formats the scratch disk.
+#   console: the tty1 status screen; stdin/stdout stay on the terminal.
+#
+# node and hive run as
+#   savior <svc> --config /run/savior/savior.conf --log-file /var/log/savior-<svc>.log
+#
+# BusyBox init respawns a service the moment it exits. So that a crashing
+# or not yet implemented agent cannot spin, this wrapper runs savior as a
+# child and, when it ran for less than 10 s, sleeps 5 s before returning.
+# Every start is counted in /run/savior/run-<svc>.starts.
+set -u
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+RUN_DIR=/run/savior
+SAVIOR=/usr/bin/savior
+svc=${1:-}
+
+case "$svc" in
+node | hive | console) ;;
+*)
+	echo "usage: $0 node|hive|console" >&2
+	exec sleep 60 # don't let init respawn us in a tight loop
+	;;
+esac
+
+if [ -r "$RUN_DIR/env" ]; then
+	# shellcheck source=/dev/null
+	. "$RUN_DIR/env"
+fi
+
+if [ "$svc" = hive ] && [ "${SAVIOR_ROLE_HIVE:-no}" != yes ]; then
+	exec sleep 2147483647
+fi
+
+log() {
+	logger -t "savior-run" -- "$*" 2>/dev/null || :
+}
+
+if [ ! -x "$SAVIOR" ]; then
+	log "$SAVIOR is missing"
+	exec sleep 2147483647
+fi
+
+# uptime_s: whole seconds since boot.
+uptime_s() {
+	_up=0
+	{ read -r _up _ </proc/uptime; } 2>/dev/null
+	echo "${_up%%.*}"
+}
+
+starts=$(cat "$RUN_DIR/run-$svc.starts" 2>/dev/null) || starts=0
+case "$starts" in '' | *[!0-9]*) starts=0 ;; esac
+starts=$((starts + 1))
+{ echo "$starts" >"$RUN_DIR/run-$svc.starts"; } 2>/dev/null
+
+if [ "$svc" = node ]; then
+	"$SAVIOR" display vt-reset >/dev/null 2>&1 || :
+	n=0
+	while [ -e "$RUN_DIR/scratch.pending" ] && [ "$n" -lt 1800 ]; do
+		sleep 2
+		n=$((n + 2))
+	done
+fi
+
+if [ "$svc" = hive ] && [ "${SAVIOR_HIVE_DATA:-auto}" = auto ] && [ -e /etc/savior-release ] &&
+	[ ! -e "$RUN_DIR/init-data.done" ]; then
+	: >"$RUN_DIR/init-data.done"
+	if out=$("$SAVIOR" storage init-data 2>&1); then
+		log "hive data: $(echo "$out" | tail -n 1)"
+	else
+		echo "$out" | while IFS= read -r l; do log "$l"; done
+	fi
+fi
+
+if [ -n "${SAVIOR_TIMEZONE:-}" ]; then
+	TZ=$SAVIOR_TIMEZONE
+	export TZ
+fi
+
+set -- "$svc"
+if [ "$svc" != console ]; then
+	[ -f "$RUN_DIR/savior.conf" ] && set -- "$@" --config "$RUN_DIR/savior.conf"
+	set -- "$@" --log-file "/var/log/savior-$svc.log"
+fi
+
+# stdout/stderr of node and hive: init hands us /dev/console, which is the
+# VT that shows the status screen. Keep it clean: use the serial console
+# when the kernel logs there (QEMU tests, serial cables), else discard (the
+# log file has it all). The console keeps its terminal.
+out=/dev/null
+case " $(cat /proc/cmdline 2>/dev/null) " in
+*" console=ttyS0"*)
+	if { : >/dev/ttyS0; } 2>/dev/null; then
+		out=/dev/ttyS0
+	fi
+	;;
+esac
+
+started=$(uptime_s)
+if [ "$svc" = console ]; then
+	"$SAVIOR" "$@"
+else
+	"$SAVIOR" "$@" </dev/null >"$out" 2>&1
+fi
+rc=$?
+ran=$(($(uptime_s) - started))
+[ "$svc" = node ] && { "$SAVIOR" display vt-reset >/dev/null 2>&1 || :; }
+if [ "$ran" -lt 10 ]; then
+	log "$svc exited with status $rc after ${ran} s (start $starts); restarting in 5 s"
+	sleep 5
+else
+	log "$svc exited with status $rc after ${ran} s (start $starts)"
+fi
+exit "$rc"

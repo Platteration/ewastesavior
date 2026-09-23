@@ -1,0 +1,53 @@
+#!/bin/sh
+# /etc/init.d/rcK - SaviorOS shutdown (BusyBox init "::shutdown").
+#
+# Stops the savior services first (so the hive can save its state), then
+# runs the allowlisted S scripts with "stop" in reverse order, and finally
+# unmounts the writable disks. BusyBox init sends SIGTERM/SIGKILL to
+# everything that is left afterwards.
+set -u
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+SCRIPTS="S00mounts S05mdev S08config S10system S20scratch S30network S35dhcpd S40time S50sshd S65netboot"
+
+# shellcheck source=../../usr/libexec/savior/lib.sh
+. /usr/libexec/savior/lib.sh
+
+say "shutting down"
+
+# 1. savior node/hive/console: SIGTERM, then wait up to 15 s.
+if have pidof && pidof savior >/dev/null 2>&1; then
+	killall -TERM savior 2>/dev/null
+	n=0
+	while pidof savior >/dev/null 2>&1 && [ "$n" -lt 150 ]; do
+		sleep 0.1 2>/dev/null || sleep 1
+		n=$((n + 1))
+	done
+	if pidof savior >/dev/null 2>&1; then
+		log "savior did not stop in time; killing it"
+		killall -KILL savior 2>/dev/null
+	fi
+fi
+
+# 2. Services, in reverse order.
+reverse=""
+for name in $SCRIPTS; do
+	reverse="$name $reverse"
+done
+for name in $reverse; do
+	script=/etc/init.d/$name
+	[ -x "$script" ] || continue
+	"$script" stop || log "$name stop failed"
+done
+
+# 3. Writable filesystems.
+sync
+for dir in /var/lib/savior/data /var/lib/savior/work; do
+	if is_mounted "$dir"; then
+		umount "$dir" 2>/dev/null || umount -r "$dir" 2>/dev/null || log "could not unmount $dir"
+	fi
+done
+sync
+exit 0

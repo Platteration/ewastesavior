@@ -1,0 +1,41 @@
+#!/bin/sh
+# /usr/libexec/savior/tty2 - what runs on tty2 (inittab "respawn").
+# With console_shell = yes: a root login shell. Otherwise a notice that
+# explains how to enable it, then sleep (init respawns this when it exits).
+set -u
+umask 077
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+SAVIOR_CONSOLE_SHELL=no
+if [ -r /run/savior/env ]; then
+	# shellcheck source=/dev/null
+	. /run/savior/env
+fi
+
+[ -r /etc/issue ] && cat /etc/issue
+case "$SAVIOR_CONSOLE_SHELL" in
+yes | y | true | 1 | on)
+	HOME=/root
+	export HOME
+	cd /root 2>/dev/null || cd /
+	echo "Root shell (console_shell = yes). Alt+F1: status screen, Alt+F7: display."
+	echo "Useful: savior info | savior config get <key> | logread | cat /var/log/savior-init.log"
+	echo
+	exec /bin/sh -l
+	;;
+esac
+
+cat <<'EOF'
+The root shell on this console is turned off.
+
+To turn it on, add this line to savior.conf on the SaviorOS stick and reboot:
+
+    console_shell = yes
+
+or pick "rescue shell" in the boot menu. Anyone at the keyboard then gets
+root on this machine, so only do this on machines you trust.
+
+Press Alt+F1 for the status screen.
+EOF
+exec sleep 2147483647

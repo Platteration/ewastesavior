@@ -1,0 +1,146 @@
+#!/bin/sh
+# S08config - find the config medium, mount it read-only on /media/savior,
+# point the firmware loader at its /firmware, and merge the configuration
+# into /run/savior/savior.conf and /run/savior/env (DESIGN 5.1, 13.3).
+#
+# /etc/savior/baked.conf is already in place when the bootloader loaded the
+# optional savior-conf.cpio; `savior config` reads it with the other files.
+set -u
+# shellcheck source=../../usr/libexec/savior/lib.sh
+. /usr/libexec/savior/lib.sh
+
+MEDIA=/media/savior
+SAVIOR=/usr/bin/savior
+
+# Wi-Fi drivers that may need firmware from the stick.
+WIFI_MODULES="iwl3945 iwl4965 iwlwifi ipw2100 ipw2200 b43 b43legacy brcmsmac brcmfmac
+ath5k ath9k ath9k_htc ath10k_pci carl9170 ar5523 rt2400pci rt2500pci rt2500usb rt61pci
+rt73usb rt2800pci rt2800usb rtl8180 rtl8187 rtl8192ce rtl8192cu rtl8192se rtl8192de
+rtl8xxxu r8712u zd1211rw p54pci p54usb mwl8k orinoco_usb at76c50x_usb"
+
+# reprobe_wifi: after firmware_class.path changed, retry Wi-Fi devices that
+# have no network interface yet: reload the module of a bound driver, or ask
+# the PCI core to probe an unbound wireless controller (class 0x0280).
+reprobe_wifi() {
+	reload=""
+	for dev in /sys/bus/pci/devices/* /sys/bus/usb/devices/*; do
+		[ -e "$dev/modalias" ] || continue
+		if [ -e "$dev/driver" ]; then
+			mod=$(readlink "$dev/driver/module" 2>/dev/null) || continue
+			mod=${mod##*/}
+			case " $(echo "$WIFI_MODULES" | tr '\n' ' ') " in
+			*" $mod "*) ;;
+			*) continue ;;
+			esac
+			[ -d "$dev/net" ] && continue
+			case " $reload " in *" $mod "*) ;; *) reload="$reload $mod" ;; esac
+		elif [ -e "$dev/class" ]; then
+			case "$(cat "$dev/class")" in
+			0x0280*)
+				log "probing wireless controller ${dev##*/} again"
+				echo "${dev##*/}" >/sys/bus/pci/drivers_probe 2>/dev/null
+				;;
+			esac
+		fi
+	done
+	for mod in $reload; do
+		log "reloading $mod to pick up firmware from the stick"
+		if ! modprobe -r "$mod" 2>/dev/null || ! modprobe "$mod" 2>/dev/null; then
+			log "reloading $mod failed"
+		fi
+	done
+}
+
+merge_config() {
+	tmp=$RUN_DIR/config.err
+	if ! "$SAVIOR" config dump --out "$RUN_DIR/savior.conf" 2>"$tmp"; then
+		say "could not merge the configuration; using defaults"
+	fi
+	# savior.media= is a boot-only key (read by find-media); drop its warning.
+	grep -v 'unknown key "media"' "$tmp" >"$tmp.f" 2>/dev/null
+	mv -f "$tmp.f" "$tmp"
+	log_file "$tmp"
+	if "$SAVIOR" config env --quiet --file "$RUN_DIR/savior.conf" --cmdline-file "" >"$RUN_DIR/env.tmp" 2>/dev/null; then
+		chmod 0600 "$RUN_DIR/env.tmp"
+		mv -f "$RUN_DIR/env.tmp" "$RUN_DIR/env"
+	else
+		rm -f "$RUN_DIR/env.tmp"
+		say "could not write $RUN_DIR/env"
+	fi
+}
+
+start() {
+	mkdir -p "$RUN_DIR" "$MEDIA"
+	chmod 0755 "$RUN_DIR"
+	if [ ! -x "$SAVIOR" ]; then
+		say "$SAVIOR is missing: SaviorOS cannot start its services"
+		return 1
+	fi
+	# Filesystem and codepage drivers (no-ops when built in).
+	for m in vfat isofs nls_cp437 nls_utf8 nls_iso8859_1; do
+		modprobe -q "$m" 2>/dev/null
+	done
+
+	[ -f /etc/savior/baked.conf ] && log "using built-in config /etc/savior/baked.conf"
+
+	found=""
+	if is_mounted "$MEDIA"; then
+		found=$(mount_source "$MEDIA")
+	else
+		echo "savior: looking for the SaviorOS stick..."
+		err=$RUN_DIR/find-media.err
+		if found=$("$SAVIOR" storage find-media --wait 20 --mount "$MEDIA" 2>"$err"); then
+			printf '%s\n' "$found" >"$RUN_DIR/media"
+		else
+			found=""
+		fi
+		log_file "$err"
+	fi
+
+	if [ -n "$found" ] && [ -d "$MEDIA/firmware" ] &&
+		[ -w /sys/module/firmware_class/parameters/path ]; then
+		printf '%s' "$MEDIA/firmware" >/sys/module/firmware_class/parameters/path
+		log "firmware search path: $MEDIA/firmware"
+		reprobe_wifi
+	fi
+
+	merge_config
+	load_env
+
+	if [ -z "$found" ]; then
+		say "no SaviorOS stick with savior.conf found - using defaults and the kernel command line"
+	else
+		log "config medium: $found"
+	fi
+	if [ -z "${SAVIOR_SWARM_KEY:-}" ] && [ "${SAVIOR_JOIN:-key}" = key ]; then
+		say "no swarm_key set: this machine cannot join a swarm."
+		say "Put 'swarm_key = ...' into savior.conf on the stick (see README.txt)."
+	fi
+	case "$found" in
+	*" vfat")
+		if [ "${SAVIOR_ROLE_HIVE:-no}" != yes ]; then
+			say "settings loaded; you can remove the stick now."
+		fi
+		;;
+	esac
+	return 0
+}
+
+stop() {
+	if is_mounted "$MEDIA"; then
+		umount "$MEDIA" 2>/dev/null || log "could not unmount $MEDIA"
+	fi
+}
+
+case "${1:-}" in
+start) start ;;
+stop) stop ;;
+restart)
+	# Re-merge the configuration; the medium stays mounted.
+	start
+	;;
+*)
+	echo "usage: $0 start|stop|restart" >&2
+	exit 2
+	;;
+esac

@@ -1,0 +1,60 @@
+#!/bin/sh
+# S05mdev - device nodes and drivers: mdev as the hotplug helper, a coldplug
+# pass over every modalias in /sys (DESIGN 13.3). Rules are in /etc/mdev.conf,
+# module options and the p4-clockmod blacklist in /etc/modprobe.d/savior.conf.
+# Firmware is loaded by the kernel directly (FW_LOADER_USER_HELPER is off).
+set -u
+# shellcheck source=../../usr/libexec/savior/lib.sh
+. /usr/libexec/savior/lib.sh
+
+start() {
+	# The kernel needs an absolute path (BusyBox ash's "command -v" may
+	# print just the applet name).
+	mdev_bin=""
+	for p in /sbin/mdev /bin/mdev /usr/sbin/mdev /usr/bin/mdev; do
+		if [ -x "$p" ]; then
+			mdev_bin=$p
+			break
+		fi
+	done
+	if [ -z "$mdev_bin" ]; then
+		say "mdev not found: no hotplug"
+		return 0
+	fi
+	# Serialize hotplug events (mdev waits for its sequence number).
+	[ -e /dev/mdev.seq ] || : >/dev/mdev.seq
+	if [ -w /proc/sys/kernel/hotplug ]; then
+		echo "$mdev_bin" >/proc/sys/kernel/hotplug
+	elif ! pidof mdev >/dev/null 2>&1; then
+		# Kernel without CONFIG_UEVENT_HELPER: netlink daemon mode.
+		"$mdev_bin" -d 2>/dev/null || log "no uevent helper and mdev -d failed: no hotplug"
+	fi
+	"$mdev_bin" -s || log "mdev -s failed"
+
+	# Coldplug: load drivers for every device that exists now. Devices that
+	# appear later (behind a freshly loaded USB host driver, for example)
+	# arrive as hotplug events and mdev loads their drivers via mdev.conf.
+	if have modprobe && [ -d "/lib/modules/$(uname -r)" ]; then
+		find /sys/devices -name modalias -type f -exec cat {} + 2>/dev/null |
+			sort -u | xargs -r modprobe -q -a 2>/dev/null
+		log "coldplug done ($(wc -l </proc/modules) modules loaded)"
+	else
+		log "no modules for kernel $(uname -r); using built-in drivers only"
+	fi
+
+	# USB sticks: scan right away (usb-storage may be built in, where the
+	# modprobe.d option does not apply).
+	if [ -w /sys/module/usb_storage/parameters/delay_use ]; then
+		echo 1 >/sys/module/usb_storage/parameters/delay_use 2>/dev/null
+	fi
+}
+
+case "${1:-}" in
+start | restart) start ;;
+stop) : ;;
+*)
+	echo "usage: $0 start|stop|restart" >&2
+	exit 2
+	;;
+esac
+exit 0

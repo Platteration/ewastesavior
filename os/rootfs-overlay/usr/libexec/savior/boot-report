@@ -1,0 +1,83 @@
+#!/bin/sh
+# /usr/libexec/savior/boot-report - one machine-readable boot status line.
+#
+# Started in the background at the end of rcS. Waits up to 40 s for an IPv4
+# address (unless net = off), for /dev/fb0 and for the first start of the
+# tty1 status screen, then logs, and prints on the serial console when the
+# kernel logs there (serial_mark in lib.sh):
+#
+#   SAVIOR-BOOT: rcS done up=<s> cfg=yes|no media=<dev>|none key=yes|no
+#                fb=yes|no net=<ipv4>|none console=yes|no node=yes|no
+#                ver=<version> t=net:<s>,fb:<s>,console:<s>
+#
+# cfg: /media/savior/savior.conf exists; media: the device S08config
+# mounted; key: a swarm key is configured (never the key itself); fb:
+# /dev/fb0 exists; console/node: /usr/libexec/savior/run has started
+# savior console / savior node; t: uptime when the address, /dev/fb0 and
+# the console were first seen ("-" = not within 40 s). Used by
+# os/dev/qemu-test.sh, which also sets savior_dumplog=1 (see the end).
+set -u
+# shellcheck source=lib.sh
+. /usr/libexec/savior/lib.sh
+
+# first_ipv4: the first global IPv4 address of a wired or wireless interface.
+first_ipv4() {
+	for _i in $(wired_ifaces) $(wireless_ifaces); do
+		_a=$(if_ipv4 "$_i")
+		if [ -n "$_a" ]; then
+			echo "${_a%% *}"
+			return 0
+		fi
+	done
+	return 1
+}
+
+load_env
+# When each condition was first seen (uptime), for the t= field.
+t_net=-
+t_fb=-
+t_con=-
+n=0
+while [ "$n" -lt 40 ]; do
+	if [ "$t_net" = - ] && { [ "${SAVIOR_NET:-dhcp}" = off ] || first_ipv4 >/dev/null; }; then
+		t_net=$(uptime_s)
+	fi
+	[ "$t_fb" != - ] || [ ! -c /dev/fb0 ] || t_fb=$(uptime_s)
+	[ "$t_con" != - ] || [ ! -e "$RUN_DIR/run-console.starts" ] || t_con=$(uptime_s)
+	[ "$t_net" != - ] && [ "$t_fb" != - ] && [ "$t_con" != - ] && break
+	sleep 1
+	n=$((n + 1))
+done
+load_env
+
+yn() { if "$@"; then echo yes; else echo no; fi; }
+media=none
+[ -r "$RUN_DIR/media" ] && read -r media _ <"$RUN_DIR/media"
+net=$(first_ipv4) || net=none
+ver=$(/usr/bin/savior version 2>/dev/null | awk '{ print $2 }')
+
+serial_mark "SAVIOR-BOOT: rcS done up=$(uptime_s)" \
+	"cfg=$(yn [ -r /media/savior/savior.conf ])" \
+	"media=${media:-none}" \
+	"key=$(yn [ -n "${SAVIOR_SWARM_KEY:-}" ])" \
+	"fb=$(yn [ -c /dev/fb0 ])" \
+	"net=$net" \
+	"console=$(yn [ -e "$RUN_DIR/run-console.starts" ])" \
+	"node=$(yn [ -e "$RUN_DIR/run-node.starts" ])" \
+	"ver=${ver:-unknown}" \
+	"t=net:$t_net,fb:$t_fb,console:$t_con"
+
+# Debugging (QEMU tests, serial cables): with savior_dumplog=1 on the kernel
+# command line, copy the boot log to the serial console as well.
+case " $(cat /proc/cmdline 2>/dev/null) " in
+*" savior_dumplog=1 "*)
+	sleep 5
+	{
+		sed 's/^/SAVIOR-LOG: /;s/$/\r/' "$BOOT_LOG"
+		if have logread; then
+			logread 2>/dev/null | grep -v 'savior-init' | sed 's/^/SAVIOR-SYSLOG: /;s/$/\r/'
+		fi
+	} >/dev/ttyS0 2>/dev/null
+	;;
+esac
+exit 0

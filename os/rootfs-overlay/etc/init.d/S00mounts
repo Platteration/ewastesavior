@@ -1,0 +1,137 @@
+#!/bin/sh
+# S00mounts - kernel filesystems, cgroup2, the module/firmware squashfs, the
+# 386 binary pick and the log daemon (DESIGN 13.3).
+set -u
+# shellcheck source=../../usr/libexec/savior/lib.sh
+. /usr/libexec/savior/lib.sh
+
+# mnt TYPE SOURCE TARGET OPTIONS: mount unless TARGET already is a mount point.
+mnt() {
+	is_mounted "$3" && return 0
+	mkdir -p "$3"
+	mount -t "$1" -o "$4" "$2" "$3" || log "mount $1 on $3 failed"
+}
+
+# enable_controllers DIR: enable cpu, memory, pids (and cpuset) for DIR's
+# children, one at a time so a missing controller doesn't block the others.
+enable_controllers() {
+	_avail=$(cat "$1/cgroup.controllers" 2>/dev/null) || return 0
+	for _c in cpu memory pids cpuset; do
+		case " $_avail " in
+		*" $_c "*)
+			echo "+$_c" >"$1/cgroup.subtree_control" 2>/dev/null ||
+				log "cgroup: cannot enable $_c in $1"
+			;;
+		*) [ "$_c" = cpuset ] || log "cgroup: controller $_c not available" ;;
+		esac
+	done
+}
+
+setup_cgroups() {
+	grep -qw cgroup2 /proc/filesystems 2>/dev/null || {
+		log "kernel has no cgroup2; tasks cannot run with sandbox=strict"
+		return 0
+	}
+	mnt cgroup2 cgroup2 /sys/fs/cgroup nosuid,nodev,noexec
+	is_mounted /sys/fs/cgroup || return 0
+	enable_controllers /sys/fs/cgroup
+	# The node agent stays in the root cgroup; task cgroups live below
+	# /sys/fs/cgroup/savior.
+	mkdir -p /sys/fs/cgroup/savior
+	enable_controllers /sys/fs/cgroup/savior
+}
+
+# setup_modloop: /lib/modloop.sqfs holds modules/ and firmware/; they stay
+# compressed in RAM and are bound over /lib/modules and /lib/firmware.
+setup_modloop() {
+	[ -f /lib/modloop.sqfs ] || return 0
+	ml=/run/modloop
+	if ! is_mounted "$ml"; then
+		mkdir -p "$ml"
+		mount -t squashfs -o ro,loop,nosuid,nodev /lib/modloop.sqfs "$ml" || {
+			say "cannot mount /lib/modloop.sqfs: no kernel modules or firmware"
+			return 0
+		}
+	fi
+	for d in modules firmware; do
+		[ -d "$ml/$d" ] || continue
+		is_mounted "/lib/$d" && continue
+		mkdir -p "/lib/$d"
+		mount -o bind "$ml/$d" "/lib/$d" || log "bind $ml/$d on /lib/$d failed"
+	done
+}
+
+# pick_binary: 386 images carry savior-sse2 and savior-softfloat; keep the
+# one this CPU can run as /usr/bin/savior (DESIGN 3).
+pick_binary() {
+	[ -e /usr/bin/savior-sse2 ] || [ -e /usr/bin/savior-softfloat ] || return 0
+	# savior is a multi-call binary that treats the name "savior-<cmd>" as
+	# "savior <cmd>", so run it through a link named plain "savior". The
+	# softfloat build runs on every i686 CPU.
+	helper=/usr/bin/savior-softfloat
+	[ -x "$helper" ] || helper=/usr/bin/savior-sse2
+	tmpd=$RUN_DIR/pick
+	mkdir -p "$tmpd"
+	ln -sf "$helper" "$tmpd/savior"
+	if out=$("$tmpd/savior" storage pick-binary --dir /usr/bin 2>&1); then
+		log "savior binary: $out"
+	else
+		log "savior storage pick-binary failed ($out); picking in the shell"
+		keep=softfloat
+		if grep -qw sse2 /proc/cpuinfo && [ -e /usr/bin/savior-sse2 ]; then
+			keep=sse2
+		fi
+		[ -e "/usr/bin/savior-$keep" ] || keep=sse2
+		mv -f "/usr/bin/savior-$keep" /usr/bin/savior &&
+			rm -f /usr/bin/savior-sse2 /usr/bin/savior-softfloat
+		log "savior binary: $keep build"
+	fi
+	rm -rf "$tmpd"
+}
+
+start_syslog() {
+	have syslogd || return 0
+	pidof syslogd >/dev/null 2>&1 && return 0
+	# A 256 KiB ring buffer in RAM (read it with logread); plain file with
+	# rotation when the kernel lacks SysV shared memory.
+	syslogd -C256 2>/dev/null || syslogd -s 256 -b 1 -O /var/log/messages 2>/dev/null ||
+		log "syslogd failed to start"
+}
+
+start() {
+	[ -e /proc/self ] || mount -t proc -o nosuid,nodev,noexec proc /proc
+	mnt sysfs sysfs /sys nosuid,nodev,noexec
+	mnt devtmpfs devtmpfs /dev nosuid,mode=0755
+	mnt devpts devpts /dev/pts nosuid,noexec,gid=5,mode=0620,ptmxmode=0666
+	mnt tmpfs shm /dev/shm nosuid,nodev,noexec,mode=1777
+	mnt tmpfs run /run nosuid,nodev,noexec,mode=0755
+	mnt tmpfs tmp /tmp nosuid,nodev,noexec,mode=1777
+	[ -e /dev/fd ] || ln -s /proc/self/fd /dev/fd
+	[ -e /dev/stdin ] || ln -s /proc/self/fd/0 /dev/stdin
+	[ -e /dev/stdout ] || ln -s /proc/self/fd/1 /dev/stdout
+	[ -e /dev/stderr ] || ln -s /proc/self/fd/2 /dev/stderr
+
+	mkdir -p "$RUN_DIR" /var/log /var/lib/savior/work /var/lib/savior/data /media/savior /root /mnt
+	chmod 0755 "$RUN_DIR" /var /var/lib /var/lib/savior
+	chmod 0711 /var/lib/savior/work
+	chmod 0700 /var/lib/savior/data /media /media/savior /root
+	: >>"$BOOT_LOG"
+	hostname savior 2>/dev/null
+
+	setup_cgroups
+	setup_modloop
+	pick_binary
+	start_syslog
+	log "mounts done"
+}
+
+case "${1:-}" in
+start) start ;;
+stop) : ;; # rcK unmounts the writable filesystems
+restart) start ;;
+*)
+	echo "usage: $0 start|stop|restart" >&2
+	exit 2
+	;;
+esac
+exit 0
