@@ -140,6 +140,7 @@ type tuning struct {
 	maxBlob         int64
 	setClock        func(time.Time) error
 	canSetClock     func() bool
+	ntpSynced       func() (synced, ok bool)
 	diskFree        func(path string) (free, total int64, ok bool)
 	clockRaised     bool // Main raised the clock to the build time
 }
@@ -207,6 +208,9 @@ func (c *Config) setDefaults() {
 	}
 	if t.setClock == nil {
 		t.setClock = setSystemClock
+	}
+	if t.ntpSynced == nil {
+		t.ntpSynced = ntpSynced
 	}
 	if t.canSetClock == nil {
 		t.canSetClock = canSetSystemClock

@@ -122,6 +122,9 @@ func TestHiveInfoAndClientTime(t *testing.T) {
 	h := newHive(t, func(c *Config) {
 		c.tune.canSetClock = func() bool { return true }
 		c.tune.setClock = func(t time.Time) error { set.Store(t); return nil }
+		// Whatever the test host's clock is, this hive's is not synced
+		// (the loop re-reads it; CI runners are NTP-synced).
+		c.tune.ntpSynced = func() (bool, bool) { return false, true }
 	})
 	h.s.mu.Lock()
 	h.s.timeSynced, h.s.timeSource = false, proto.TimeRTC

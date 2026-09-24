@@ -18,7 +18,7 @@ const maxClientClockSkew = 60 * time.Second
 func (s *Server) initClock() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if synced, ok := ntpSynced(); ok && synced {
+	if synced, ok := s.cfg.tune.ntpSynced(); ok && synced {
 		s.timeSynced, s.timeSource = true, proto.TimeNTP
 		return
 	}
@@ -30,7 +30,7 @@ func (s *Server) initClock() {
 
 // checkNTPLocked re-reads the kernel sync state (called from the loop).
 func (s *Server) checkNTPLocked() {
-	if synced, ok := ntpSynced(); ok && synced && s.timeSource != proto.TimeNTP {
+	if synced, ok := s.cfg.tune.ntpSynced(); ok && synced && s.timeSource != proto.TimeNTP {
 		s.timeSynced, s.timeSource = true, proto.TimeNTP
 		s.log.Info("system clock is NTP-synchronized")
 	}
