@@ -244,11 +244,29 @@ func (c *Client) DeleteJob(ctx context.Context, jobID string) error {
 // the offset to continue from. With wait > 0 the hive holds the request
 // (up to 25 s) until new data arrives.
 func (c *Client) Logs(ctx context.Context, taskID string, offset int64, wait time.Duration) ([]byte, int64, error) {
+	r, err := c.ReadLog(ctx, taskID, offset, wait)
+	return r.Data, r.Next, err
+}
+
+// LogRead is one read of a task log.
+type LogRead struct {
+	Data []byte
+	Next int64 // offset to continue from
+	// Attempt is the attempt whose log stream Data and Next belong to, or
+	// -1 when the hive doesn't say (older hives). Every attempt starts a new
+	// stream at offset 0.
+	Attempt int
+}
+
+// ReadLog is Logs with the attempt the data belongs to.
+func (c *Client) ReadLog(ctx context.Context, taskID string, offset int64, wait time.Duration) (LogRead, error) {
+	r := LogRead{Next: offset, Attempt: -1}
 	if err := checkRef("task", taskID); err != nil {
-		return nil, offset, err
+		return r, err
 	}
 	if offset < 0 {
 		offset = 0
+		r.Next = 0
 	}
 	waitS := int((wait + time.Second - 1) / time.Second)
 	if waitS > 25 {
@@ -259,28 +277,36 @@ func (c *Client) Logs(ctx context.Context, taskID string, offset int64, wait tim
 		q.Set("wait_s", strconv.Itoa(waitS))
 	}
 	if err := c.ensureSession(ctx); err != nil {
-		return nil, offset, err
+		return r, err
 	}
 	ctx, cancel := context.WithTimeout(ctx, c.timeout+time.Duration(waitS)*time.Second)
 	defer cancel()
 	resp, err := c.do(ctx, apiRequest{method: http.MethodGet, path: adminPath("tasks", taskID, "log"), query: q})
 	if err != nil {
-		return nil, offset, err
+		return r, err
 	}
 	defer drainClose(resp.Body)
 	data, err := io.ReadAll(&capReader{r: resp.Body, left: maxLogResponse})
 	if err != nil {
-		return nil, offset, fmt.Errorf("read log: %w", err)
+		return r, fmt.Errorf("read log: %w", err)
 	}
 	next := offset + int64(len(data))
 	if h := resp.Header.Get(LogOffsetHeader); h != "" {
 		n, err := strconv.ParseInt(h, 10, 64)
 		if err != nil || n < 0 {
-			return nil, offset, fmt.Errorf("the hive sent an invalid %s header", LogOffsetHeader)
+			return r, fmt.Errorf("the hive sent an invalid %s header", LogOffsetHeader)
 		}
 		next = n
 	}
-	return data, next, nil
+	if h := resp.Header.Get(LogAttemptHeader); h != "" {
+		n, err := strconv.Atoi(h)
+		if err != nil || n < 0 {
+			return r, fmt.Errorf("the hive sent an invalid %s header", LogAttemptHeader)
+		}
+		r.Attempt = n
+	}
+	r.Data, r.Next = data, next
+	return r, nil
 }
 
 // Outputs lists a job's output files.

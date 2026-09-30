@@ -27,6 +27,7 @@ import (
 const (
 	ClientTimeHeader = "X-Savior-Client-Time" // the operator's clock (DESIGN 9)
 	LogOffsetHeader  = "X-Savior-Log-Offset"  // next offset of a task log read
+	LogAttemptHeader = "X-Savior-Log-Attempt" // attempt whose log a read returned
 )
 
 const (

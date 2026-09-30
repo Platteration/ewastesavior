@@ -12,6 +12,11 @@ import (
 // overflow.
 const maxLogOffset = 1 << 50
 
+// logAttemptHd names the attempt whose log a GET tasks/{id}/log response
+// holds. Every dispatch starts a new stream at offset 0 (DESIGN 8.5), so a
+// follower that sees the attempt change must start over from offset 0.
+const logAttemptHd = "X-Savior-Log-Attempt"
+
 // logRing keeps the most recent output of one assignment in memory. Offsets
 // count every byte the node ever sent for the lease (DESIGN 8.5).
 type logRing struct {
@@ -147,7 +152,11 @@ func (s *Server) handleLogAppend(w http.ResponseWriter, r *http.Request, tok str
 	}
 }
 
-// handleTaskLog serves GET tasks/{id}/log?offset=N&wait_s=W.
+// handleTaskLog serves GET tasks/{id}/log?offset=N&wait_s=W. Responses
+// carry the next offset and the attempt the bytes belong to. An offset past
+// the end of the current attempt's stream (a follower still on an earlier
+// attempt) is answered at once, with the smaller next offset, instead of
+// waiting until the new stream grows past it.
 func (s *Server) handleTaskLog(w http.ResponseWriter, r *http.Request, _ adminCtx) {
 	id := r.PathValue("id")
 	q := r.URL.Query()
@@ -182,15 +191,16 @@ func (s *Server) handleTaskLog(w http.ResponseWriter, r *http.Request, _ adminCt
 			writeErr(w, http.StatusNotFound, "no such task")
 			return
 		}
+		attempt := t.Attempt
 		if t.active() {
 			if t.log == nil {
 				t.log = newLogRing()
 			}
 			data, next := t.log.read(off, logRingSize)
 			remaining := time.Until(deadline)
-			if len(data) > 0 || remaining <= 0 {
+			if len(data) > 0 || remaining <= 0 || off > t.log.total {
 				s.mu.Unlock()
-				writeLog(w, data, next)
+				writeLog(w, data, next, attempt)
 				return
 			}
 			wake := t.log.wake
@@ -217,29 +227,30 @@ func (s *Server) handleTaskLog(w http.ResponseWriter, r *http.Request, _ adminCt
 			off = base
 		}
 		if off >= end {
-			writeLog(w, nil, end)
+			writeLog(w, nil, end, attempt)
 			return
 		}
 		if tail != nil {
-			writeLog(w, tail[off-base:], end)
+			writeLog(w, tail[off-base:], end, attempt)
 			return
 		}
 		f, err := os.Open(path)
 		if err != nil {
-			writeLog(w, nil, end)
+			writeLog(w, nil, end, attempt)
 			return
 		}
 		defer f.Close()
 		buf := make([]byte, end-off)
 		k, _ := f.ReadAt(buf, off-base)
-		writeLog(w, buf[:k], off+int64(k))
+		writeLog(w, buf[:k], off+int64(k), attempt)
 		return
 	}
 }
 
-func writeLog(w http.ResponseWriter, data []byte, next int64) {
+func writeLog(w http.ResponseWriter, data []byte, next int64, attempt int) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set(logOffsetHd, strconv.FormatInt(next, 10))
+	w.Header().Set(logAttemptHd, strconv.Itoa(attempt))
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(data)
 }

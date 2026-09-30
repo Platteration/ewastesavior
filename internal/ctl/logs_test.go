@@ -115,3 +115,70 @@ func TestSanitizeWriterSplitRunes(t *testing.T) {
 		t.Errorf("truncated rune: %q", buf.String())
 	}
 }
+
+// A retried task starts a new log stream at offset 0. When the new attempt
+// has already written more than the old offset, the hive answers the stale
+// offset with the new attempt's bytes after it; ctl must notice the attempt
+// change and print the new attempt from its start (SPEC-RUNTIME-04).
+func TestLogsFollowAcrossAttempts(t *testing.T) {
+	h := newFakeHive(t)
+	e := loggedIn(t, h)
+	first := "A1 line 1\nA1 line 2\n"
+	second := "A2 line 1\nA2 line 2\nA2 line 3\nA2 line 4\n"
+	h.mu.Lock()
+	h.logs["t1"] = []byte(first)
+	h.logRetry["t1"] = []byte(second)
+	h.logAttempt["t1"] = 1
+	h.taskState["t1"] = proto.TaskRunning
+	h.mu.Unlock()
+
+	code, stdout, stderr := e.run("logs", "-f", "t1")
+	if code != 0 {
+		t.Fatalf("code %d, stderr %s", code, stderr)
+	}
+	if stdout != first+second {
+		t.Fatalf("stdout = %q, want both attempts in full: %q", stdout, first+second)
+	}
+	if !strings.Contains(stderr, "--- log restarted (attempt 2) ---") {
+		t.Errorf("stderr %q lacks the restart notice", stderr)
+	}
+}
+
+// An older hive sends no attempt header; a shorter stream still means a
+// new attempt.
+func TestLogsFollowAcrossAttemptsOldHive(t *testing.T) {
+	h := newFakeHive(t)
+	e := loggedIn(t, h)
+	first := "attempt one wrote a long line\n"
+	second := "short\n"
+	h.mu.Lock()
+	h.logs["t1"] = []byte(first)
+	h.logRetry["t1"] = []byte(second)
+	h.taskState["t1"] = proto.TaskRunning
+	h.mu.Unlock()
+
+	code, stdout, stderr := e.run("logs", "-f", "t1")
+	if code != 0 || stdout != first+second {
+		t.Fatalf("code %d stdout %q stderr %q", code, stdout, stderr)
+	}
+	if !strings.Contains(stderr, "--- log restarted (new attempt) ---") {
+		t.Errorf("stderr %q lacks the restart notice", stderr)
+	}
+}
+
+// Within one attempt a shorter stream means the hive lost bytes (it
+// restarted); ctl keeps its offset instead of printing the log again.
+func TestLogsFollowSameAttemptShorter(t *testing.T) {
+	h := newFakeHive(t)
+	e := loggedIn(t, h)
+	h.mu.Lock()
+	h.logs["t1"] = []byte("0123456789")
+	h.logAttempt["t1"] = 3
+	h.taskState["t1"] = proto.TaskSucceeded
+	h.logLose["t1"] = 4
+	h.mu.Unlock()
+	code, stdout, stderr := e.run("logs", "--offset", "8", "t1")
+	if code != 0 || stdout != "" || stderr != "" {
+		t.Fatalf("code %d stdout %q stderr %q", code, stdout, stderr)
+	}
+}

@@ -85,6 +85,78 @@ export function mount(el) {
   return el;
 }
 
+// sameNode reports whether a and b render the same (tags, attributes, text).
+export function sameNode(a, b) {
+  if (a.nodeType !== b.nodeType) return false;
+  if (a.nodeType !== 1) return a.nodeType !== 3 || a.data === b.data;
+  if (a.tagName !== b.tagName) return false;
+  const names = a.getAttributeNames();
+  if (names.length !== b.getAttributeNames().length) return false;
+  for (const k of names) {
+    if (a.getAttribute(k) !== b.getAttribute(k)) return false;
+  }
+  if (a.value !== b.value || a.checked !== b.checked) return false;
+  return sameList(a.childNodes, b.childNodes);
+}
+
+function sameList(xs, ys) {
+  if (xs.length !== ys.length) return false;
+  for (let i = 0; i < xs.length; i++) {
+    if (!sameNode(xs[i], ys[i])) return false;
+  }
+  return true;
+}
+
+// focusPath is the child-index path from root to el.
+function focusPath(root, el) {
+  const path = [];
+  for (let n = el; n && n !== root; n = n.parentNode) {
+    path.unshift(Array.prototype.indexOf.call(n.parentNode.childNodes, n));
+  }
+  return path;
+}
+
+// remount is mount for refreshes: it skips content that renders the same,
+// moves keyboard focus to the new element with the focused one's data-key
+// (else to the same place) and keeps .table-wrap scroll positions.
+export function remount(el) {
+  const frag = document.createDocumentFragment();
+  for (let i = 1; i < arguments.length; i++) append(frag, arguments[i]);
+  if (sameList(el.childNodes, frag.childNodes)) return el;
+  const active = document.activeElement;
+  let key = null;
+  let path = null;
+  let tag = '';
+  if (active && active !== el && el.contains(active)) {
+    key = active.getAttribute('data-key');
+    path = focusPath(el, active);
+    tag = active.tagName;
+  }
+  const scroll = Array.prototype.map.call(el.querySelectorAll('.table-wrap'), (w) => w.scrollLeft);
+  clear(el);
+  el.appendChild(frag);
+  const wraps = el.querySelectorAll('.table-wrap');
+  for (let i = 0; i < wraps.length && i < scroll.length; i++) {
+    if (scroll[i]) wraps[i].scrollLeft = scroll[i];
+  }
+  if (path) {
+    let target = null;
+    if (key != null) {
+      const keyed = el.querySelectorAll('[data-key]');
+      for (let i = 0; i < keyed.length && !target; i++) {
+        if (keyed[i].getAttribute('data-key') === key) target = keyed[i];
+      }
+    }
+    if (!target) {
+      target = el;
+      for (let i = 0; i < path.length && target; i++) target = target.childNodes[path[i]] || null;
+      if (target && target.tagName !== tag) target = null;
+    }
+    if (target && target.focus) target.focus({preventScroll: true});
+  }
+  return el;
+}
+
 // setText sets an element's text.
 export function setText(el, s) {
   el.textContent = s == null ? '' : String(s);
@@ -185,8 +257,9 @@ export function badge(text, kind, title) {
 }
 
 // table renders a table inside a horizontally scrollable wrapper. heads are
-// strings or nodes; rows are arrays of cells or {cells, cls, onClick}.
-export function table(heads, rows, empty) {
+// strings or nodes; rows are arrays of cells or {cells, cls, onClick}. A
+// label makes the wrapper a focusable region (arrow keys scroll it).
+export function table(heads, rows, empty, label) {
   const tbody = h('tbody');
   for (const r of rows) {
     const cells = Array.isArray(r) ? r : r.cells;
@@ -204,7 +277,7 @@ export function table(heads, rows, empty) {
   if (!rows.length && empty) {
     tbody.appendChild(h('tr', null, h('td', {colSpan: heads.length, class: 'empty'}, empty)));
   }
-  return h('div', {class: 'table-wrap'},
+  return h('div', {class: 'table-wrap', role: label ? 'region' : null, 'aria-label': label || null, tabIndex: label ? 0 : null},
     h('table', null, h('thead', null, h('tr', null, heads.map(function (x) {
       return x && x.nodeType ? x : h('th', {scope: 'col'}, x);
     }))), tbody));
@@ -264,20 +337,20 @@ export function sleep(ms, signal) {
 
 // copyable renders a value in <code> with a copy button.
 export function copyable(text, label) {
+  label = label || 'value';
   return h('span', {class: 'copyable'}, h('code', null, text),
-    btn('Copy', function () { return copyText(text); }, 'btn-small', {'aria-label': 'Copy ' + (label || 'value')}));
+    btn('Copy', function () { return copyText(text); }, 'btn-small', {'aria-label': 'Copy ' + label, 'data-key': 'copy:' + label}));
 }
 
-// memo returns a renderer that replaces el's children only when the data it
-// shows has changed, so periodic refreshes keep focus, scroll position,
-// selection and <details> state.
+// memo returns a renderer that remounts el only when the data it shows has
+// changed, so periodic refreshes keep focus, selection and <details> state.
 export function memo(el) {
   let last = null;
   return function (data, render) {
     const s = JSON.stringify(data);
     if (s !== last) {
       last = s;
-      mount(el, render(data));
+      remount(el, render(data));
     }
   };
 }

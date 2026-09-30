@@ -32,7 +32,7 @@ export async function render(root, ctx) {
       h('dl', {class: 'cli'}, CTL_HELP.map((c) => [h('dt', null, h('code', null, c[0])), h('dd', null, c[1])])),
       h('p', {class: 'hint'}, 'ctl signs in with a proof of the admin token, so the token itself never crosses the network.')),
     panel('Sessions',
-      h('p', null, 'Browser sessions last 12 hours.'),
+      h('p', null, 'Browser sessions last 12 hours and end when the hive restarts. A page that was open then asks for a new pairing code and keeps what you had typed.'),
       h('div', {class: 'btn-row'},
         btn('Sign out', () => ctx.signOut()),
         btn('Sign out everywhere', async () => {

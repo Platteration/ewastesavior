@@ -1,6 +1,6 @@
 // Jobs: list, submit form (simple or raw JSON) and job detail with tasks.
 
-import {h, mount, table, badge, btn, kv, panel, banner, field, select, check, toast, reportError, copyable} from './dom.js';
+import {h, mount, remount, table, badge, btn, kv, panel, banner, field, select, check, toast, reportError, copyable} from './dom.js';
 import * as api from './api.js';
 import * as fmt from './fmt.js';
 import {LIMITS, splitArgs, parseKV, validLabelKey, validEnvKey, validOutputPattern, validRelPath, inputName, fileName} from './model.js';
@@ -46,7 +46,7 @@ function jobRow(j, ctx) {
   return {
     cells: [
       String(j.seq),
-      h('a', {href: '#/jobs/' + api.enc(j.id)}, j.name || j.id),
+      h('a', {href: '#/jobs/' + api.enc(j.id), 'data-key': 'j:' + j.id}, j.name || j.id),
       stateBadge(j.state),
       h('td', {class: 'progress-cell'}, countsBar(j.counts, j.count), h('span', {class: 'hint'}, countsText(j.counts, j.count))),
       h('td', {class: 'opt'}, String(j.priority || 0)),
@@ -74,7 +74,7 @@ export async function list(root, ctx) {
   });
   const heads = ['#', 'Name', 'State', 'Progress', h('th', {scope: 'col', class: 'opt'}, 'Priority'), h('th', {scope: 'col', class: 'opt'}, 'Submitted'), ''];
   const draw = () => {
-    mount(box, table(heads, jobs.map((j) => jobRow(j, ctx)), listFilter ? 'No jobs in this state.' : 'No jobs yet.'));
+    remount(box, table(heads, jobs.map((j) => jobRow(j, ctx)), listFilter ? 'No jobs in this state.' : 'No jobs yet.', 'Jobs'));
     moreBtn.hidden = !more;
   };
   // A refresh re-reads the newest page and merges it, keeping older pages.
@@ -365,7 +365,8 @@ export async function detail(root, ctx, id) {
   } catch (e) {
     if (e.name === 'AbortError' || e.handled) throw e;
   }
-  const nodeLink = (nid) => (nid ? h('a', {href: '#/nodes/' + api.enc(nid)}, nodeNames[nid] || nid) : '—');
+  // key tells refreshes which link had focus (a node can appear in many rows).
+  const nodeLink = (nid, key) => (nid ? h('a', {href: '#/nodes/' + api.enc(nid), 'data-key': key}, nodeNames[nid] || nid) : '—');
 
   const head = h('div');
   const bCancel = btn('Cancel job', async () => {
@@ -403,14 +404,14 @@ export async function detail(root, ctx, id) {
     bNext.hidden = !nextOffset;
     tInfo.textContent = (tasks.length ? 'Showing ' + (offset + 1) + '–' + (offset + tasks.length) + ' of ' + page.total + '. ' : '') +
       (page.undispatched ? fmt.plural(page.undispatched, 'task') + ' not dispatched yet.' : '');
-    mount(tBox, table(['#', 'State', 'Node', h('th', {scope: 'col', class: 'opt'}, 'Attempt'), 'Exit', h('th', {scope: 'col', class: 'opt'}, 'Run time'), 'Details', h('th', {scope: 'col', class: 'opt'}, 'Outputs')],
+    remount(tBox, table(['#', 'State', 'Node', h('th', {scope: 'col', class: 'opt'}, 'Attempt'), 'Exit', h('th', {scope: 'col', class: 'opt'}, 'Run time'), 'Details', h('th', {scope: 'col', class: 'opt'}, 'Outputs')],
       tasks.map((t) => ({
-        cells: [h('a', {href: '#/tasks/' + api.enc(t.id)}, String(t.index)), stateBadge(t.state), nodeLink(t.node),
+        cells: [h('a', {href: '#/tasks/' + api.enc(t.id), 'data-key': 't:' + t.id}, String(t.index)), stateBadge(t.state), nodeLink(t.node, 'node:' + t.id),
           h('td', {class: 'opt'}, attemptText(t)),
           t.exit_code == null ? '' : String(t.exit_code), h('td', {class: 'opt'}, t.run_s ? fmt.dur(t.run_s) : ''),
           h('span', {class: 'clip', title: taskInfo(t) || null}, taskInfo(t)), h('td', {class: 'opt'}, String((t.outputs || []).length))],
         onClick: () => ctx.go('#/tasks/' + api.enc(t.id)),
-      })), tState ? 'No tasks in this state.' : 'No tasks have been dispatched yet.'));
+      })), tState ? 'No tasks in this state.' : 'No tasks have been dispatched yet.', 'Tasks'));
   };
   stSel.addEventListener('change', () => {
     tState = stSel.value;
@@ -432,7 +433,7 @@ export async function detail(root, ctx, id) {
   const drawHead = () => {
     ctx.title(job.name || job.id);
     const dur = !fmt.zeroTime(job.started_at) ? ((fmt.zeroTime(job.finished_at) ? Date.now() : new Date(job.finished_at).getTime()) - new Date(job.started_at).getTime()) / 1000 : 0;
-    mount(head,
+    remount(head,
       h('div', {class: 'page-head'}, h('h1', null, job.name || 'Job ' + job.id), h('span', {class: 'badges'}, stateBadge(job.state))),
       job.warning ? banner('warn', job.warning) : null,
       countsBar(job.counts, job.count), h('p', {class: 'hint'}, countsText(job.counts, job.count)),

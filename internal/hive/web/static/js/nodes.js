@@ -1,6 +1,6 @@
 // Nodes: sortable list and per-node detail with actions and display editor.
 
-import {h, mount, table, badge, btn, kv, panel, banner, field, select, toast, copyable, memo} from './dom.js';
+import {h, mount, remount, table, badge, btn, kv, panel, banner, field, select, toast, copyable, memo} from './dom.js';
 import * as api from './api.js';
 import * as fmt from './fmt.js';
 import {validNodeName, validLabelKey, parseKV, kvText, LIMITS, DISPLAY_MODES} from './model.js';
@@ -25,9 +25,27 @@ function stateBadge(n) {
   return badge(s, kind, n.status.reason || null);
 }
 
-// statusBadge is "offline", or the online node's own state.
+// blocker is why the hive gives a node no tasks: pending or quarantined.
+function blocker(n) {
+  if (!n.approved) return 'pending';
+  if (n.quarantine) return 'quarantined';
+  return '';
+}
+
+// statusBadge is the blocker, else "offline", else the node's own state,
+// so a node that gets no tasks never looks idle in the list.
 function statusBadge(n) {
+  const b = blocker(n);
+  if (b === 'pending') return badge('pending', 'warn', 'Waiting for admin approval');
+  if (b === 'quarantined') return badge('quarantined', 'bad', n.quarantine);
   return online(n) ? stateBadge(n) : liveBadge(n);
+}
+
+// statusOrder sorts nodes that need the admin first, offline ones last.
+function statusOrder(n) {
+  const b = blocker(n);
+  if (b) return '0' + b;
+  return online(n) ? '1' + ((n.status && n.status.state) || '') : '2';
 }
 
 // cpuName drops trademark noise from a CPU model string.
@@ -52,10 +70,11 @@ function displayText(n) {
   return (d ? MODE_LABELS[d] || d : '—') + (n.display_rotate ? ' ↻' + n.display_rotate + '°' : '');
 }
 
-function flags(n) {
+// flags are the node's notes. skip names one already shown elsewhere.
+function flags(n, skip) {
   const out = [];
-  if (!n.approved) out.push(badge('pending', 'warn', 'Waiting for admin approval'));
-  if (n.quarantine) out.push(badge('quarantined', 'bad', n.quarantine));
+  if (!n.approved && skip !== 'pending') out.push(badge('pending', 'warn', 'Waiting for admin approval'));
+  if (n.quarantine && skip !== 'quarantined') out.push(badge('quarantined', 'bad', n.quarantine));
   if (n.drain) out.push(badge('draining', 'warn'));
   if (n.reserved_for) out.push(badge('reserved', 'info', 'Reserved for task ' + n.reserved_for));
   const w = n.warnings || [];
@@ -65,19 +84,23 @@ function flags(n) {
   return out;
 }
 
+// Node list columns. Notes follows Status; "opt" columns are hidden on
+// phones, "opt-md" ones below 1000 px (so 800x600 fits).
 const COLS = [
   {key: 'code', label: 'Code', val: (n) => n.short_code, cell: (n) => h('code', null, n.short_code)},
-  {key: 'name', label: 'Name', cls: 'nowrap', val: (n) => n.name, cell: (n) => h('a', {href: '#/nodes/' + api.enc(n.id)}, n.name)},
-  {key: 'status', label: 'Status', val: (n) => (online(n) ? '0' + ((n.status && n.status.state) || '') : '1'), cell: statusBadge},
-  {key: 'roles', label: 'Roles', opt: true, val: (n) => (n.roles || []).join(', '), cell: (n) => (n.roles || []).join(', ')},
-  {key: 'cpu', label: 'CPU', opt: true, val: (n) => inv(n).cores || 0,
+  {key: 'name', label: 'Name', cls: 'nowrap', val: (n) => n.name,
+    cell: (n) => h('a', {href: '#/nodes/' + api.enc(n.id), 'data-key': 'n:' + n.id}, n.name)},
+  {key: 'status', label: 'Status', val: statusOrder, cell: statusBadge},
+  {key: 'flags', label: 'Notes', val: (n) => flags(n).length,
+    cell: (n) => [blocker(n) && !online(n) ? liveBadge(n) : null, flags(n, blocker(n))]},
+  {key: 'roles', label: 'Roles', opt: 'opt-md', val: (n) => (n.roles || []).join(', '), cell: (n) => (n.roles || []).join(', ')},
+  {key: 'cpu', label: 'CPU', opt: 'opt-md', val: (n) => inv(n).cores || 0,
     cell: (n) => [String(inv(n).cores || '?') + ' × ', h('span', {class: 'muted clip', title: inv(n).cpu_model || null}, cpuName(inv(n).cpu_model))]},
   {key: 'mem', label: 'Memory', cls: 'nowrap', val: (n) => inv(n).mem_total_mb || 0, cell: (n) => fmt.mb(inv(n).mem_total_mb)},
   {key: 'temp', label: 'Temp', cls: 'nowrap', val: (n) => m(n).cpu_temp_c || -1, cell: tempText},
-  {key: 'battery', label: 'Battery', opt: true, cls: 'nowrap', val: (n) => (inv(n).has_battery ? m(n).battery_percent : -1), cell: batteryText},
+  {key: 'battery', label: 'Battery', opt: 'opt', cls: 'nowrap', val: (n) => (inv(n).has_battery ? m(n).battery_percent : -1), cell: batteryText},
   {key: 'tasks', label: 'Tasks', val: (n) => (n.running_tasks || []).length, cell: (n) => String((n.running_tasks || []).length)},
-  {key: 'display', label: 'Display', opt: true, val: displayText, cell: displayText},
-  {key: 'flags', label: 'Notes', val: (n) => flags(n).length, cell: flags},
+  {key: 'display', label: 'Display', opt: 'opt-md', val: displayText, cell: displayText},
 ];
 
 function searchText(n) {
@@ -99,8 +122,8 @@ export async function list(root, ctx) {
   const box = h('div');
   const heads = () => COLS.map((c) => {
     const active = sortState.key === c.key;
-    return h('th', {scope: 'col', class: c.opt ? 'opt' : null, 'aria-sort': active ? (sortState.dir > 0 ? 'ascending' : 'descending') : null},
-      h('button', {type: 'button', class: 'sort', on: {click: () => {
+    return h('th', {scope: 'col', class: c.opt || null, 'aria-sort': active ? (sortState.dir > 0 ? 'ascending' : 'descending') : null},
+      h('button', {type: 'button', class: 'sort', 'data-key': 'sort:' + c.key, on: {click: () => {
         sortState.dir = active ? -sortState.dir : 1;
         sortState.key = c.key;
         draw();
@@ -109,7 +132,7 @@ export async function list(root, ctx) {
   const draw = () => {
     const q = filterText.trim().toLowerCase();
     const col = COLS.filter((c) => c.key === sortState.key)[0] || COLS[2];
-    const cls = (c) => [c.opt ? 'opt' : '', c.cls || ''].join(' ').trim() || null;
+    const cls = (c) => [c.opt || '', c.cls || ''].join(' ').trim() || null;
     const shown = nodes.filter((n) => !q || searchText(n).indexOf(q) >= 0);
     shown.sort((a, b) => {
       const va = col.val(a);
@@ -119,11 +142,11 @@ export async function list(root, ctx) {
     });
     const on = nodes.filter(online).length;
     summary.textContent = fmt.plural(nodes.length, 'node') + ' · ' + on + ' online' + (q ? ' · ' + shown.length + ' shown' : '');
-    mount(box, table(heads(), shown.map((n) => ({
+    remount(box, table(heads(), shown.map((n) => ({
       cells: COLS.map((c) => h('td', {class: cls(c)}, c.cell(n))),
       cls: online(n) ? null : 'dim',
       onClick: () => ctx.go('#/nodes/' + api.enc(n.id)),
-    })), q ? 'No nodes match the filter.' : 'No nodes yet. See "Add a machine" on the Overview page.'));
+    })), q ? 'No nodes match the filter.' : 'No nodes yet. See "Add a machine" on the Overview page.', 'Nodes'));
   };
   filter.addEventListener('input', () => {
     filterText = filter.value;
@@ -199,11 +222,11 @@ function statusPanel(n) {
 
 function tasksPanel(n) {
   const rt = (n.status && n.status.running_tasks) || [];
-  const link = (id) => h('a', {href: '#/tasks/' + api.enc(id)}, id);
+  const link = (id, k) => h('a', {href: '#/tasks/' + api.enc(id), 'data-key': k + id}, id);
   return panel('Tasks on this node',
     table(['Task', 'Phase', 'Run time', 'Transferred'],
-      rt.map((t) => [link(t.id), t.phase, fmt.dur(t.run_s), fmt.bytes(t.xfer_bytes)]), 'No running tasks.'),
-    (n.running_tasks || []).length ? h('p', {class: 'muted'}, 'Assigned by the hive: ', (n.running_tasks || []).map((id, k) => [k ? ', ' : '', link(id)])) : null);
+      rt.map((t) => [link(t.id, 't:'), t.phase, fmt.dur(t.run_s), fmt.bytes(t.xfer_bytes)]), 'No running tasks.'),
+    (n.running_tasks || []).length ? h('p', {class: 'muted'}, 'Assigned by the hive: ', (n.running_tasks || []).map((id, k) => [k ? ', ' : '', link(id, 'a:')])) : null);
 }
 
 function displayStatePanel(n) {
@@ -263,9 +286,13 @@ function inventoryPanel(i) {
 }
 
 export async function detail(root, ctx, id) {
-  const path = '/admin/nodes/' + api.enc(id);
+  let path = '/admin/nodes/' + api.enc(id);
   const sig = {signal: ctx.signal};
   let node = await api.get(path, sig);
+  // The URL may use a name or short code: from here on use the ID, which a
+  // rename doesn't change (replaceState fires no hashchange).
+  path = '/admin/nodes/' + api.enc(node.id);
+  if (id !== node.id) window.history.replaceState(null, '', '#/nodes/' + api.enc(node.id));
   const refresh = async () => {
     node = await api.get(path, sig);
     draw();

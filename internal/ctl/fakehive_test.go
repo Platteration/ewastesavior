@@ -59,13 +59,23 @@ type fakeHive struct {
 	pollsToEnd int
 	failedTask proto.TaskView
 
-	blobs      map[string][]byte
-	blobPuts   map[string]int // bodies actually read per sha
-	corrupt    map[string]bool
-	walls      map[string]proto.WallSpec
-	logs       map[string][]byte
-	logChunk   int
-	logReqs    []logReq
+	blobs    map[string][]byte
+	blobPuts map[string]int // bodies actually read per sha
+	corrupt  map[string]bool
+	walls    map[string]proto.WallSpec
+	logs     map[string][]byte
+	logChunk int
+	logReqs  []logReq
+	// logRetry holds the log of a task's next attempt: once the current
+	// attempt's log has been served to its end, the task moves on to it (a
+	// new stream from offset 0) instead of finishing.
+	logRetry map[string][]byte
+	// logAttempt is sent as X-Savior-Log-Attempt; tasks without an entry
+	// get no header, like an older hive.
+	logAttempt map[string]int
+	// logLose, when > 0, drops that many bytes from the end of the
+	// served stream once (the hive restarted and lost its ring).
+	logLose    map[string]int
 	taskState  map[string]proto.TaskState
 	outputs    map[string][]proto.OutputEntry
 	anyOutputs []proto.OutputEntry // for jobs without their own entry
@@ -106,6 +116,9 @@ func newFakeHive(t *testing.T) *fakeHive {
 		corrupt:    map[string]bool{},
 		walls:      map[string]proto.WallSpec{},
 		logs:       map[string][]byte{},
+		logRetry:   map[string][]byte{},
+		logAttempt: map[string]int{},
+		logLose:    map[string]int{},
 		taskState:  map[string]proto.TaskState{},
 		outputs:    map[string][]proto.OutputEntry{},
 	}
@@ -590,6 +603,10 @@ func (h *fakeHive) handleLog(w http.ResponseWriter, r *http.Request) {
 	}
 	h.mu.Lock()
 	h.logReqs = append(h.logReqs, logReq{offset: off, waitS: r.URL.Query().Get("wait_s")})
+	if n := h.logLose[id]; n > 0 {
+		h.logs[id] = h.logs[id][:len(h.logs[id])-n]
+		delete(h.logLose, id)
+	}
 	data := h.logs[id]
 	chunk := h.logChunk
 	end := int64(len(data))
@@ -601,15 +618,26 @@ func (h *fakeHive) handleLog(w http.ResponseWriter, r *http.Request) {
 		part = part[:chunk]
 	}
 	next := off + int64(len(part))
+	attempt, hasAttempt := h.logAttempt[id]
 	if next == end {
-		// Everything was served: the task finishes.
-		if st, ok := h.taskState[id]; ok && !st.Terminal() {
+		if retry, ok := h.logRetry[id]; ok {
+			// Everything was served: the next attempt starts.
+			delete(h.logRetry, id)
+			h.logs[id] = retry
+			if hasAttempt {
+				h.logAttempt[id] = attempt + 1
+			}
+		} else if st, ok := h.taskState[id]; ok && !st.Terminal() {
+			// Everything was served: the task finishes.
 			h.taskState[id] = proto.TaskSucceeded
 		}
 	}
 	h.mu.Unlock()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set(LogOffsetHeader, strconv.FormatInt(next, 10))
+	if hasAttempt {
+		w.Header().Set(LogAttemptHeader, strconv.Itoa(attempt))
+	}
 	_, _ = w.Write(part)
 }
 

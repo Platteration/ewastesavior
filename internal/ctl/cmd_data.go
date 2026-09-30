@@ -48,27 +48,45 @@ func cmdLogs(a *app, ctx context.Context, args []string) int {
 
 // followLog copies a task log to out from offset. Without follow it stops
 // when the hive has no more data; with follow it long-polls until the task
-// is terminal and drained.
+// is terminal and drained. A retried task's log restarts at offset 0 with
+// every attempt: when the hive reports a new attempt, the new attempt's log
+// is printed from its start after a notice on stderr.
 func (a *app) followLog(ctx context.Context, c *Client, taskID string, off int64, follow bool, out io.Writer) error {
 	const wait = 25 * time.Second
+	attempt := -1 // the attempt being printed, once the hive has named it
 	for {
 		w := time.Duration(0)
 		if follow {
 			w = wait
 		}
 		start := time.Now()
-		data, next, err := c.Logs(ctx, taskID, off, w)
+		r, err := c.ReadLog(ctx, taskID, off, w)
 		if err != nil {
 			return err
 		}
+		data, next := r.Data, r.Next
 		switch {
-		case next < off:
-			// A new attempt started a new log stream.
+		case r.Attempt >= 0 && attempt >= 0 && r.Attempt != attempt:
+			// A new attempt started a new log stream. Whatever this read
+			// returned came from the old offset in the new stream.
+			fmt.Fprintf(a.stderr, "--- log restarted (attempt %d) ---\n", r.Attempt)
+			attempt, off = r.Attempt, 0
+			continue
+		case r.Attempt >= 0 && next < off:
+			// Same attempt, but the hive has fewer bytes than were printed
+			// (it restarted and lost its in-memory log): wait for more.
+			attempt = r.Attempt
+			data, next = nil, off
+		case r.Attempt < 0 && next < off:
+			// An older hive: a shorter stream means a new attempt.
 			fmt.Fprintf(a.stderr, "--- log restarted (new attempt) ---\n")
 			off = 0
 			continue
 		case next-int64(len(data)) > off:
 			fmt.Fprintf(a.stderr, "--- %d bytes no longer available ---\n", next-int64(len(data))-off)
+		}
+		if r.Attempt >= 0 {
+			attempt = r.Attempt
 		}
 		if len(data) > 0 {
 			if _, err := out.Write(data); err != nil {
@@ -87,17 +105,11 @@ func (a *app) followLog(ctx context.Context, c *Client, taskID string, off int64
 			return err
 		}
 		if t.State.Terminal() {
-			// One last read picks up anything written just before the end.
-			data, next, err := c.Logs(ctx, taskID, off, 0)
-			if err != nil {
-				return err
-			}
-			if next >= off && len(data) > 0 {
-				if _, err := out.Write(data); err != nil {
-					return err
-				}
-			}
-			return nil
+			// Drain without waiting: this picks up anything written just
+			// before the end, and a final attempt that started after the
+			// last read.
+			follow = false
+			continue
 		}
 		if time.Since(start) < time.Second {
 			// The hive answered at once without data; don't spin.

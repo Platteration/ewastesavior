@@ -1,6 +1,9 @@
 // Unit tests for the dashboard's pure modules and DOM builder, run by
 // TestJSUnit (node testdata/unit.mjs). The DOM is a small stub: enough to
-// check that h() only ever creates text nodes and vets URLs.
+// check that h() only ever creates text nodes and vets URLs, that remount
+// keeps focus, and to drive the task log viewer against scripted hive
+// responses. The dashboard in a real browser against a real hive is tested
+// by e2e_test.go (make test-web-e2e).
 
 import assert from 'node:assert/strict';
 
@@ -12,9 +15,41 @@ class StubNode {
     this.parentNode = null;
   }
   appendChild(c) {
+    if (c.nodeType === 11) {
+      // A fragment moves its children.
+      for (const k of c.childNodes.slice()) this.appendChild(k);
+      c.childNodes = [];
+      return c;
+    }
+    if (c.parentNode) c.parentNode.removeChild(c);
     c.parentNode = this;
     this.childNodes.push(c);
     return c;
+  }
+  contains(n) {
+    for (; n; n = n.parentNode) {
+      if (n === this) return true;
+    }
+    return false;
+  }
+  get lastChild() {
+    return this.childNodes[this.childNodes.length - 1] || null;
+  }
+  // querySelectorAll supports ".class" and "[attribute]".
+  querySelectorAll(sel) {
+    const out = [];
+    const match = sel.charAt(0) === '.'
+      ? (e) => e.className.split(' ').indexOf(sel.slice(1)) >= 0
+      : (e) => e.getAttribute(sel.slice(1, -1)) !== null;
+    const walk = (n) => {
+      for (const c of n.childNodes) {
+        if (c.nodeType !== 1) continue;
+        if (match(c)) out.push(c);
+        walk(c);
+      }
+    };
+    walk(this);
+    return out;
   }
   removeChild(c) {
     this.childNodes = this.childNodes.filter((x) => x !== c);
@@ -53,7 +88,15 @@ class StubElement extends StubNode {
     this.attributes[k] = String(v);
   }
   getAttribute(k) {
+    if (k === 'class') return this.className ? this.className : null;
     return k in this.attributes ? this.attributes[k] : null;
+  }
+  getAttributeNames() {
+    return Object.keys(this.attributes).concat(this.className ? ['class'] : []);
+  }
+  focus(opts) {
+    document.activeElement = this;
+    this.focusOpts = opts;
   }
   addEventListener(type, fn) {
     (this.listeners[type] = this.listeners[type] || []).push(fn);
@@ -73,13 +116,16 @@ const toastBox = new StubElement('div');
 globalThis.document = {
   createElement: (t) => new StubElement(t),
   createTextNode: (d) => new StubText(d),
+  createDocumentFragment: () => new StubNode(11),
   getElementById: (id) => (id === 'toasts' ? toastBox : null),
+  activeElement: null,
 };
 
 const model = await import('../static/js/model.js');
 const fmt = await import('../static/js/fmt.js');
 const api = await import('../static/js/api.js');
 const dom = await import('../static/js/dom.js');
+const tasks = await import('../static/js/tasks.js');
 
 let checks = 0;
 const eq = (got, want, msg) => {
@@ -447,6 +493,144 @@ ok(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(api.clientTime()), 'client time is R
   render({v: 1}, r);
   render({v: 2}, r);
   eq([renders, box.textContent], [2, '2'], 'memo re-renders only on change');
+}
+
+// --- dom: remount keeps focus and scrolling (WEB-2, WEB-3) ------------------
+{
+  const row = (id, extra) => dom.h('tr', null, dom.h('td', null, dom.h('a', {href: '#/nodes/' + id, 'data-key': 'n:' + id}, id)),
+    dom.h('td', null, extra || ''));
+  const tbl = (ids, extra) => dom.h('div', {class: 'table-wrap'}, dom.h('table', null, dom.h('tbody', null, ids.map((id) => row(id, extra)))));
+  ok(dom.sameNode(tbl(['a', 'b']), tbl(['a', 'b'])), 'same tree');
+  no(dom.sameNode(tbl(['a', 'b']), tbl(['b', 'a'])), 'reordered tree');
+  no(dom.sameNode(tbl(['a']), tbl(['a'], '1')), 'text differs');
+  no(dom.sameNode(dom.h('span', {class: 'x'}), dom.h('span', {class: 'y'})), 'class differs');
+  no(dom.sameNode(dom.h('a', {'data-key': 'x'}), dom.h('a', {'data-key': 'y'})), 'attribute differs');
+
+  const box = dom.h('div');
+  dom.mount(box, tbl(['a', 'b', 'c']));
+  const wrap = box.childNodes[0];
+  wrap.scrollLeft = 120;
+  const oldB = box.querySelectorAll('[data-key]')[1];
+  oldB.focus();
+  dom.remount(box, tbl(['a', 'b', 'c']));
+  ok(box.childNodes[0] === wrap, 'unchanged content is left alone');
+  eq(document.activeElement, oldB, 'focus untouched when nothing changed');
+
+  // A refresh that changes and re-sorts the rows: focus follows the key.
+  dom.remount(box, tbl(['c', 'b', 'a'], 'new'));
+  ok(box.childNodes[0] !== wrap, 'changed content is replaced');
+  const now = document.activeElement;
+  ok(now !== oldB && box.contains(now), 'focus moved into the new table');
+  eq(now.getAttribute('data-key'), 'n:b', 'focus kept on the same node link');
+  eq(now.focusOpts, {preventScroll: true}, 'focus without scrolling');
+  eq(box.childNodes[0].scrollLeft, 120, 'horizontal scroll kept');
+
+  // The focused row is gone: the link at the same place takes focus.
+  box.querySelectorAll('[data-key]')[1].focus();
+  dom.remount(box, tbl(['c', 'a'], 'new'));
+  eq(document.activeElement.getAttribute('data-key'), 'n:a', 'focus falls back to the same place');
+
+  // Without a data-key: the element of the same kind at the same place.
+  const panelOf = (t) => dom.h('div', null, dom.h('p', null, t), dom.h('span', null, dom.btn('Copy', null)));
+  dom.mount(box, panelOf('one'));
+  const b1 = box.querySelectorAll('.btn')[0];
+  b1.focus();
+  dom.remount(box, panelOf('two'));
+  const b2 = document.activeElement;
+  ok(b2 !== b1 && box.contains(b2) && b2.tagName === 'BUTTON', 'focus kept by position');
+
+  // Focus outside the container isn't touched.
+  const outside = dom.h('button');
+  outside.focus();
+  dom.remount(box, panelOf('three'));
+  eq(document.activeElement, outside, 'focus elsewhere untouched');
+
+  // A labelled table is a focusable, named region; an unlabelled one isn't.
+  const lt = dom.table(['A'], [['1']], '', 'Nodes');
+  eq([lt.attributes.role, lt.attributes['aria-label'], lt.tabIndex], ['region', 'Nodes', 0], 'labelled table region');
+  const ut = dom.table(['A'], [['1']], '');
+  eq([ut.attributes.role, ut.tabIndex], [undefined, undefined], 'plain table wrapper');
+  eq(dom.copyable('n1', 'node ID').childNodes[1].attributes['data-key'], 'copy:node ID', 'copy button has a key');
+}
+
+// --- tasks: the log viewer across attempts (WEB-1, SPEC-RUNTIME-04) --------
+{
+  // runViewer drives logViewer against scripted responses. steps[i] is
+  // [expected offset, attempt header ('' = none), body, next offset, task
+  // view after this response].
+  const runViewer = async (steps, first) => {
+    let t = first;
+    const seen = [];
+    let i = 0;
+    globalThis.fetch = async (url) => {
+      const u = new URL(url, 'https://hive.test');
+      seen.push(Number(u.searchParams.get('offset')));
+      const s = steps[i++];
+      if (!s) throw new Error('unexpected log request at offset ' + u.searchParams.get('offset'));
+      const headers = {'X-Savior-Log-Offset': String(s[3])};
+      if (s[1] !== '') headers['X-Savior-Log-Attempt'] = String(s[1]);
+      if (s[4]) t = s[4];
+      return new Response(s[2], {status: 200, headers: headers});
+    };
+    const ctl = new AbortController();
+    const terminal = (x) => x === 'succeeded' || x === 'failed' || x === 'canceled';
+    const v = tasks.logViewer('t1', {signal: ctl.signal}, () => terminal(t.state), () => t.attempt);
+    await Promise.race([v.run(), new Promise((resolve, reject) => setTimeout(() => reject(new Error('log viewer did not finish')), 5000))]);
+    ctl.abort();
+    delete globalThis.fetch;
+    return {text: v.el.childNodes[1].textContent, status: v.el.childNodes[0].childNodes[2].textContent, offsets: seen, left: steps.length - i};
+  };
+  const line = (s, n) => Array.from({length: n}, (_, k) => s + '-' + (k + 1) + '\n').join('');
+
+  // The audit's reproduction: attempt 1 wrote 222 bytes, attempt 2 (the
+  // final one) 102. The viewer used to keep offset 222, show only attempt
+  // 1 and say "End of log.".
+  const a1 = line('FIRST-ATTEMPT-LINE-padding-padding', 6);
+  const a2 = line('SECOND-ATTEMPT', 6);
+  let r = await runViewer([
+    [0, 1, a1, a1.length, null],
+    [a1.length, 2, '', a2.length, {state: 'failed', attempt: 2}],
+    [0, 2, a2, a2.length, null],
+    [a2.length, 2, '', a2.length, null],
+  ], {state: 'running', attempt: 1});
+  eq(r.offsets, [0, a1.length, 0, a2.length], 'shorter retry: offsets');
+  eq(r.text, a1 + '--- attempt 2 ---\n' + a2, 'shorter retry: both attempts shown');
+  eq([r.status, r.left], ['End of log.', 0], 'shorter retry: end after the final attempt');
+
+  // A longer retry: the stale offset returns attempt 2's tail, which must
+  // be dropped and attempt 2 read from its start.
+  const b2 = 'A2 line 1\nA2 line 2\n';
+  r = await runViewer([
+    [0, 1, 'A1', 2, null],
+    [2, 2, b2.slice(2), b2.length, null],
+    [0, 2, b2, b2.length, {state: 'succeeded', attempt: 2}],
+    [b2.length, 2, '', b2.length, null],
+  ], {state: 'running', attempt: 1});
+  eq(r.text, 'A1\n--- attempt 2 ---\n' + b2, 'longer retry: attempt 2 from its start');
+  eq(r.status, 'End of log.', 'longer retry: end');
+
+  // An older hive without the attempt header: the task view's attempt and
+  // a shorter stream tell the viewer.
+  r = await runViewer([
+    [0, '', 'LONG FIRST LINE\n', 16, null],
+    [16, '', '', 5, {state: 'failed', attempt: 2}],
+    [0, '', 'short', 5, null],
+    [5, '', '', 5, null],
+  ], {state: 'running', attempt: 1});
+  eq(r.text, 'LONG FIRST LINE\n--- attempt 2 ---\nshort', 'old hive: new attempt shown');
+  eq(r.status, 'End of log.', 'old hive: end');
+
+  // Opened on a retried task: the log starts at its attempt's marker. A
+  // task view that says "done" while the log is still an older attempt's
+  // doesn't end the viewer.
+  r = await runViewer([
+    [0, 2, '', 0, {state: 'running', attempt: 3}],
+    [0, 3, 'third\n', 6, {state: 'failed', attempt: 3}],
+    [6, 3, '', 6, null],
+  ], {state: 'failed', attempt: 3});
+  eq(r.text, '--- attempt 2 ---\n--- attempt 3 ---\nthird\n', 'marker for later attempts');
+  eq(r.offsets, [0, 0, 6], 'a new attempt read from offset 0 is kept');
+  eq(r.status, 'End of log.', 'ends on the final attempt');
 }
 
 console.log('dashboard unit tests: ' + checks + ' checks passed');

@@ -204,3 +204,82 @@ func TestLogTailRemovedWithJob(t *testing.T) {
 		t.Fatalf("tail file left behind by the deleted job: %v", err)
 	}
 }
+
+// A follower still at the end of attempt 1 must learn at once that attempt
+// 2 started a new stream (SPEC-RUNTIME-04, WEB-1): the hive used to hold
+// the request until attempt 2 passed the stale offset and then return only
+// the bytes after it, so the start of attempt 2 was silently skipped.
+func TestTaskLogAcrossAttempts(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	n := h.newNode(nil)
+	n.register()
+	h.submit(scriptJob(1, nil))
+	tk := n.claim(1)[0]
+	post := func(tk proto.Task, off int64, data string) {
+		t.Helper()
+		if code, raw := n.api("POST", "tasks/"+tk.ID+"/log?lease="+tk.Lease+"&offset="+strconv.FormatInt(off, 10), data, nil); code != 200 {
+			t.Fatalf("log append: %d %s", code, raw)
+		}
+	}
+	read := func(off int64, wait int) (string, int64, string, time.Duration) {
+		t.Helper()
+		start := time.Now()
+		resp, err := adminGet(h, "tasks/"+tk.ID+"/log?offset="+strconv.FormatInt(off, 10)+"&wait_s="+strconv.Itoa(wait))
+		if err != nil || resp.code != 200 {
+			t.Fatalf("read log: %v %d", err, resp.code)
+		}
+		next, _ := strconv.ParseInt(resp.hdr.Get(logOffsetHd), 10, 64)
+		return string(resp.body), next, resp.hdr.Get(logAttemptHd), time.Since(start)
+	}
+
+	first := "attempt 1 wrote this long line\n"
+	post(tk, 0, first)
+	if body, next, att, _ := read(0, 0); body != first || next != int64(len(first)) || att != "1" {
+		t.Fatalf("attempt 1: %q next %d attempt %q", body, next, att)
+	}
+	// Preempted: requeued without using up a retry, then dispatched again.
+	if code := n.report(tk, proto.TaskReport{State: proto.TaskPreempted}); code != 200 {
+		t.Fatalf("preempt: %d", code)
+	}
+	h.s.io.flush()
+	// Between attempts the finished attempt's log is served, still labelled 1.
+	if body, next, att, _ := read(0, 0); body != first || next != int64(len(first)) || att != "1" {
+		t.Fatalf("between attempts: %q next %d attempt %q", body, next, att)
+	}
+	again := n.claim(1)
+	if len(again) != 1 || again[0].ID != tk.ID {
+		t.Fatalf("attempt 2 not dispatched: %+v", again)
+	}
+	tk2 := again[0]
+
+	// A follower at attempt 1's end offset is answered at once, not after
+	// wait_s, with the new stream's (smaller) offset and the new attempt.
+	body, next, att, took := read(int64(len(first)), 10)
+	if body != "" || next != 0 || att != "2" || took > 5*time.Second {
+		t.Fatalf("stale offset on attempt 2: %q next %d attempt %q after %v", body, next, att, took)
+	}
+	second := "attempt 2 output, which is longer than the first one\n"
+	post(tk2, 0, second)
+	// Reading attempt 2 at the old offset returns its tail labelled with
+	// attempt 2, so a client can tell that it must start over.
+	if body, next, att, _ := read(int64(len(first)), 0); body != second[len(first):] || next != int64(len(second)) || att != "2" {
+		t.Fatalf("attempt 2 at old offset: %q next %d attempt %q", body, next, att)
+	}
+	if body, next, att, _ := read(0, 0); body != second || next != int64(len(second)) || att != "2" {
+		t.Fatalf("attempt 2 from 0: %q next %d attempt %q", body, next, att)
+	}
+	// A current offset of a running attempt still long-polls.
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		post(tk2, int64(len(second)), "more\n")
+	}()
+	if body, _, att, took := read(int64(len(second)), 10); body != "more\n" || att != "2" || took > 5*time.Second {
+		t.Fatalf("long poll on attempt 2: %q attempt %q after %v", body, att, took)
+	}
+	n.succeed(tk2)
+	h.s.io.flush()
+	if body, next, att, _ := read(0, 5); body != second+"more\n" || next != int64(len(second)+5) || att != "2" {
+		t.Fatalf("finished: %q next %d attempt %q", body, next, att)
+	}
+}
