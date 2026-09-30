@@ -154,6 +154,11 @@
 # wait for an admin.
 #join_policy = open
 
+# Accept machines that join without the swarm key (join = keyless, e.g.
+# netbooted from your own PXE server); they wait for an admin's approval.
+# netboot = yes turns this on. Only on a network you trust.
+#keyless_join = no
+
 # Announce the hive on the local network so machines find it by themselves.
 #beacon = yes
 

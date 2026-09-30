@@ -504,9 +504,9 @@ and "chain tftp://<this server>/boot/grub/i386-pc/core.0".
 Netbooted nodes have no stick to read savior.conf from: put savior.<key>=<value>
 settings into savior_cmdline in boot/grub/grub.cfg, ideally
 savior.hive=<address> savior.hive_fingerprint=sha256:... savior.join=keyless
-(nodes then wait for approval on the hive). A swarm key on the kernel
-command line is readable by anyone on the LAN. A hive with netboot = yes
-does all of this by itself.
+(nodes then wait for approval on the hive, which needs keyless_join = yes or
+netboot = yes). A swarm key on the kernel command line is readable by anyone
+on the LAN. A hive with netboot = yes does all of this by itself.
 EOF
 }
 

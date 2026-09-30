@@ -168,6 +168,11 @@ last. The exit status is non-zero if anything failed. The logs go to
 `build/dev/qemu-work/`. QEMU processes are killed on exit, including on
 Ctrl-C.
 
+`make release-e2e-dev` runs `scripts/release-e2e.sh`, the images workflow's
+end-to-end test of the release media, on the dev image: the stick with the
+hive role, then the netboot tree. It needs python3, curl, jq, openssh-client
+and mtools.
+
 ### How the harness sees inside the guest
 
 At the end of boot, `/usr/libexec/savior/boot-report`, started in the

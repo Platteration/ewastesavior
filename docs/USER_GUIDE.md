@@ -41,7 +41,10 @@ or put `roles = auto, hive` in its `savior.conf`. The hive's screen shows its
 URLs, fingerprint and a pairing code. On first start it creates an ext4
 `SAVIOR-DATA` partition in the stick's free space to keep its state across
 reboots. Use a stick of 2 GB or more. If there's no free space, the hive runs
-from RAM and warns you that its state is lost on reboot.
+from RAM and warns you that its state is lost on reboot. That includes its
+certificate: after each reboot the hive has a new fingerprint, so sticks
+with `hive_fingerprint` need a fresh savior.conf, and nodes without the pin
+must be restarted.
 
 ## 3. Prepare boot sticks
 
@@ -95,7 +98,9 @@ Open `https://<hive-address>:7700/` in a browser. The browser warns about the
 self-signed certificate. Compare the fingerprint it shows with the one on
 the hive's screen, then continue. Log in with the **pairing code** from the
 hive's screen or from `savior ctl pair`. You never type the admin token
-into a browser.
+into a browser. A browser session lasts 12 hours and ends when the hive
+restarts or someone uses *Sign out everywhere*. The page you were on then
+asks for a new pairing code and keeps what you had typed.
 
 ## 6. Use the CLI
 
@@ -137,6 +142,10 @@ savior ctl outputs <job-id> -o results/
 savior ctl cancel <job-id>
 ```
 
+`logs -f` follows a task through retries: when a new attempt starts, it
+prints `--- log restarted (attempt N) ---` on stderr and then that attempt's
+output from the start.
+
 **Placement:** `--arch amd64` (or `386`), `--label room=lab`, `--node lab-3`,
 `--min-mem 1024` and `--cpu-flags sse2` restrict where tasks run. A task that
 fits no node waits and shows a warning. When you ship programs with
@@ -145,11 +154,18 @@ architecture: a 64-bit SaviorOS node can't run 32-bit programs, and a 32-bit
 machine can't run 64-bit ones. To run on both, ship both builds and pick one
 in a script by `uname -m`; `--arch any` turns the automatic limit off. A
 command that isn't found exits with 127, and one that can't run on the
-machine exits with 126. Both count as a failed attempt.
+machine exits with 126. Both count as a failed attempt. Small machines offer
+little memory, and task scratch is in RAM, so a task's `--mem` plus `--disk`
+must fit what the node offers (`savior ctl node <id> --json`,
+`status.total.mem_mb`). A 256 MB machine with a screen offers a few tens of
+MB (about 50 MB at the DESIGN 13.2 target): use tasks like
+`--mem 32 --disk 16`; the defaults (128 MB + 64 MB) never fit there.
 
 **Retries:** failed tasks are retried (`--retries`, default 1). If a machine
-disappears, is unplugged or overheats, its tasks move to another node without
-using up a retry. If tasks keep failing on one machine but succeed
+disappears or is unplugged, or a laptop's battery runs low, its tasks move to
+another node without using up a retry. On a machine that overheats, tasks
+are paused where they are and continue when it has cooled down; the pause
+doesn't count toward their timeout. If tasks keep failing on one machine but succeed
 elsewhere, that machine is quarantined (`savior ctl unquarantine` clears it).
 
 **Isolation:** by default jobs run only on fully sandboxed nodes (all SaviorOS
@@ -211,4 +227,8 @@ machines boot through iPXE, which the stick carries. With
 network's DHCP server too, which suits an isolated switch. Without the
 static address it stays a proxy and says so on its screen. Netbooted machines never receive the swarm
 key. They join *keyless* and wait until you approve them in the dashboard.
+If you serve PXE yourself (the `netboot` tree from mkimage on your own TFTP
+server), set `keyless_join = yes` on the hive, or run
+`savior hive --keyless-join`, so netbooted machines can join. Without it, a
+hive refuses every machine that has no swarm key.
 Only use netboot on a network you trust.

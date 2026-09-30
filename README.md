@@ -97,9 +97,11 @@ Requirements: Go 1.24+, GNU make, and for images the tools listed in
 ```sh
 make build        # host binary in build/savior
 make test         # unit and integration tests
+make test-web-e2e # dashboard in headless Chromium (needs Node.js 22+ and playwright-core)
 make dev-image    # bootable test image from Ubuntu packages
 make dev-test     # boot it in QEMU (BIOS, UEFI, ISO, PXE, display)
 make swarm-test   # multi-VM swarm end-to-end test
+make netboot-test # machines netboot from a hive in QEMU (full DHCP, and behind a router)
 ```
 
 ## License
@@ -109,6 +111,13 @@ by the authors.
 
 The boot images also contain third-party software under its own licenses,
 among them the Linux kernel and firmware, BusyBox, GRUB, iPXE, dnsmasq and
-dropbear (mostly GPL). Anyone distributing images must also provide their
-licenses and corresponding source; for Buildroot images, `make legal-info`
-in the Buildroot output directory collects both.
+dropbear (mostly GPL). Each GitHub release publishes their licenses and
+corresponding source next to the images. `savior-<arch>-legal-info.tar` is
+Buildroot's legal-info for that payload: license texts, sources and patches
+of every package, plus the kernel and BusyBox configurations.
+`make legal-info ARCH=<arch>` builds it after `make image`.
+`savior-host-sources.tar` holds the Ubuntu source packages of the GRUB and
+iPXE builds on the media, with the exact versions. The linux-firmware
+licenses also ship inside the images, in `/lib/firmware/WHENCE` and the
+`LICENCE.*` files next to the blobs. Anyone redistributing modified images
+must provide the same.

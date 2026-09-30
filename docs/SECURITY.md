@@ -24,7 +24,8 @@ configs. It always includes the hive's fingerprint pin, which removes the
 * The swarm key is stretched with PBKDF2 (200,000 rounds) and never sent.
   Node and hive each send a proof: an HMAC over fresh nonces, the node ID,
   and the certificate fingerprint the node actually saw.
-* After the first contact the node pins that certificate. The proof is only
+* After the first contact the node pins that certificate until it restarts,
+  including when it re-joins. The proof is only
   sent over pinned connections, so a man in the middle never receives a
   proof bound to its own certificate, and can't replay one either.
 * The LAN beacon carries only a 32-bit hint derived from the stretched key.
@@ -81,8 +82,14 @@ disabled, `dmesg` is restricted, and CPU vulnerability mitigations stay on.
 * Anyone who can reach port 7700 can attempt to join or log in, so rate
   limits are the defense against guessing. Use a swarm key from `savior ctl
   genkey` (160 bits), not a memorable phrase.
-* Netboot is unauthenticated by nature. Netbooted nodes join keyless and
-  need approval, but use netboot only on networks you trust.
+* Netboot is unauthenticated by nature. Netbooted nodes join keyless, which
+  a hive allows only with `netboot = yes` or `keyless_join = yes`. A keyless
+  node needs an admin's approval the first time. Once approved, a machine
+  reporting the same node ID is re-approved automatically, because a keyless
+  node proves nothing but the IDs it reports. Anyone on the LAN who learns
+  that ID can join in its place while it is offline, so use netboot and
+  `keyless_join` only on networks you trust. Keyless clients can never use or
+  take over a node that joined with the swarm key.
 * Secure Boot isn't supported yet.
 
 ## Reporting problems

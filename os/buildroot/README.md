@@ -126,9 +126,11 @@ idempotent and does the following:
 * It asserts that root has no usable password.
 * It strips documentation, headers and static libraries, plus the e2fsprogs
   tools a node never runs (it keeps `mke2fs` and `e2fsck`).
-* It prunes the firmware to `firmware.list` (keeping `regulatory.db`) as it
-  moves it into the modloop, so a changed list also applies to incremental
-  rebuilds.
+* It prunes the firmware to `firmware.list` (keeping `regulatory.db` and the
+  licenses: `WHENCE` and the top-level `LICENCE*`, `LICENSE*`, `GPL-*` and
+  `COPYING*` files) as it moves it into the modloop, so a changed list also
+  applies to incremental rebuilds. The build fails when firmware would ship
+  without `WHENCE`.
 * It moves `/lib/modules` and `/lib/firmware` into `/lib/modloop.sqfs`: xz,
   BCJ x86, 1 MiB blocks, all files owned by root, reproducible with
   `SOURCE_DATE_EPOCH`. The squashfs has two top-level directories, `modules/`
@@ -195,6 +197,12 @@ follows the pinned Buildroot release. It installs only the files that match
   engines. radeon is told to leave CIK GPUs alone (see the board overlay
   above).
 
+The licenses travel with the blobs. install-firmware.sh writes
+`/lib/firmware/WHENCE` with upstream WHENCE's header and every section that
+lists an installed file or link; some licenses, such as Realtek's, are
+spelled out only there. It also installs every license file those sections
+name (`LICENCE.iwlwifi_firmware`, `LICENSE.radeon`, `GPL-2`, ...).
+
 Old names that upstream now lists as WHENCE `Link:` entries still work. This
 approach avoids depending on the per-driver `BR2_PACKAGE_LINUX_FIRMWARE_*`
 options, which change between releases. If a required pattern matches
@@ -225,19 +233,36 @@ release. The images workflow's job summary prints the hash.
   post-build and post-image against fake Buildroot trees (including a
   kernel bump on an existing tree and busybox's setuid bit), flash-usb.sh
   against a fake sysfs, qemu-smoke.sh with the images workflow's
-  expectations against a fake QEMU, and S50sshd in a chroot.
-* `scripts/qemu-smoke.sh`: boots a payload directory, USB image or ISO under
-  SeaBIOS, OVMF x64 or OVMF ia32, and waits for the boot marker on the serial
-  console. CI boots the i686 image on `-cpu pentium3,-pae -m 256` under TCG,
+  expectations against a fake QEMU, qemu-smoke.sh's release-e2e options
+  against a fake QEMU and mcopy, a check that every option images.yml passes
+  exists, legal-info.sh with fake dpkg-query and apt-get, and S50sshd in a
+  chroot.
+* `scripts/qemu-smoke.sh`: boots a payload directory, USB image, ISO or
+  netboot tree (`--netboot`, from QEMU's TFTP server) under SeaBIOS, OVMF x64
+  or OVMF ia32, and waits for the boot marker on the serial console.
+  `--conf`, `--grow` and `--append` change a private copy of the stick,
+  `--hostfwd` and `--monitor` expose the VM, and `--keep-running` leaves it
+  running for `release-e2e.sh`. CI boots the i686 image on `-cpu pentium3,-pae -m 256` under TCG,
   because under KVM an SSE2 instruction would still run. Every boot must show
   `node=yes fb=yes net=10.0.2.x` and a real `ver=` on the `SAVIOR-BOOT` line,
   then `agent=up` and the payload's `arch=` on the `SAVIOR-AGENT` line that
   boot-report prints once `savior node` has run for 10 s without a restart.
   On the Pentium III that proves the SSE2/softfloat pick.
+* `scripts/release-e2e.sh`: the release media end to end against a hive on
+  this host (join, a sandboxed job with isolation probes, the display
+  compared with `savior display render`, an `ssh_key` login, and optionally
+  a hive-role boot with SAVIOR-DATA). `make release-e2e-dev` runs it on the
+  dev image.
+* `scripts/legal-info.sh` (`make legal-info ARCH=...`): packs and checks
+  Buildroot's legal-info, and fetches the Ubuntu source packages of GRUB and
+  iPXE for the release.
 * `.github/workflows/images.yml` runs all of this for both architectures,
   checks that the netboot trees contain iPXE (`undionly.kpxe` from the
-  host's `ipxe` package), builds the universal image, and publishes a
-  GitHub release on `v*` tags.
+  host's `ipxe` package), builds the universal image, boots every ISO and
+  the universal netboot tree, runs release-e2e.sh on the x86_64 and i686
+  sticks and the universal netboot tree, and publishes a GitHub release on
+  `v*` tags with the legal-info archives and host sources next to the
+  images.
 
 ## Changing things
 

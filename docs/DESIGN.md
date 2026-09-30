@@ -131,7 +131,8 @@ Logging: `log/slog` text to stderr, or with `--log-file PATH` to a
 size-rotated file (1 MiB, one `.1` backup) plus stderr. `--log-level`/`log_level`.
 
 Long-running commands (`node`, `hive`) call `debug.SetMemoryLimit`
-(node: 25% of MemTotal, min 48 MiB) and on Linux as root set their own
+(node: 25% of MemTotal, min 48 MiB; hive: 25% of MemTotal, min 64 MiB,
+unless GOMEMLIMIT is set) and on Linux as root set their own
 `oom_score_adj` to -900. At start, if the system clock is before
 `version.BuildTime`, they raise it to BuildTime (dead CMOS batteries).
 
@@ -169,18 +170,18 @@ and repeated lines within one source append.
 |---|---|---|---|
 | `name` | str | "" | Node name, `[A-Za-z0-9-]`. The hive lowercases it and falls back to the default name `savior-<last 6 hex of identity>` if invalid or already taken. An admin rename wins. |
 | `node_id` | str | "" | Override the hardware-derived node ID (`[a-z0-9-]`). |
-| `roles` | list | `auto` | `auto`, `compute`, `display`, `hive`. `auto` = compute + display when any `/sys/class/drm/card*` or `/sys/class/graphics/fb*` exists (checked continuously; a display that appears later enables the role). |
+| `roles` | list | `auto` | `auto`, `compute`, `display`, `hive`. `auto` = compute + display when any `/sys/class/drm/card*` or `/sys/class/graphics/fb*` exists (checked continuously: the agent looks every 5 s, and a display that appears later enables the role; the node then registers again with it). |
 | `labels` | list | "" | `key=value` config labels (admin labels override them key by key). |
 | `hive` | str | `auto` | `auto`, `host`, `host:port`, `https://host:port`. |
 | `swarm_key` | str | "" | Shared join secret, min 16 chars (warning below 24). `savior ctl genkey` makes 32 base32 chars. |
 | `hive_fingerprint` | str | "" | `sha256:<hex>` pin of the hive certificate. Strongly recommended; without it the swarm key alone decides who is "the hive". |
-| `join` | str | `key` | `key` = join with the swarm key; `keyless` = join without a key and wait for admin approval (netboot). |
+| `join` | str | `key` | `key` = join with the swarm key; `keyless` = join without a key and wait for admin approval (netboot; needs `hive_fingerprint`, and a hive with `keyless_join` or `netboot`). |
 | `net` | str | `dhcp` | `dhcp`, `static`, `off`. With `dhcp` and no lease after 30 s, IPv4 link-local (169.254/16) is used if the image has `zcip`. |
 | `ip`, `gateway`, `dns` | | | Static addressing (`ip` in CIDR). |
 | `wifi_ssid`, `wifi_psk`, `wifi_country` | | "", "", `US` | Wi-Fi (WPA2-PSK or open). |
 | `dhcp_server` | bool | no | Serve DHCP on the first wired interface (needs `net=static` and `ip`). With `netboot=yes` dnsmasq does DHCP+PXE instead; without a static `ip` the hive answers only as a proxy DHCP server and says so on the console. |
 | `dhcp_range` | str | "" | `first-last`; empty = .100-.200 of the static subnet. |
-| `netboot` | bool | no | Serve PXE boot (hive role). |
+| `netboot` | bool | no | Serve PXE boot (hive role). Implies `keyless_join = yes`. |
 | `ntp` | list | `pool.ntp.org` | NTP servers or `off`. |
 | `ssh_key` | list | "" | Root SSH keys (dropbear). No keys = no SSH server. |
 | `console_shell` | bool | no | Root shell on tty2 without password. |
@@ -201,7 +202,8 @@ and repeated lines within one source append.
 | `hive_listen` | str | `:7700` | Hive HTTPS listen address. |
 | `hive_data` | str | `auto` | Hive state dir. `auto` on SaviorOS = the `SAVIOR-DATA` ext4 partition (created on first use, 13.4), else RAM (with a warning). Elsewhere, `$XDG_DATA_HOME/savior/hive` or `~/.local/share/savior/hive`. |
 | `admin_token` | str | "" | Admin token (min 32 chars). Empty = generated and stored in `<hive_data>/admin_token` (0600). |
-| `join_policy` | str | `open` | `open`: key-proven nodes join directly. `approve`: new nodes are pending until an admin approves them. Keyless nodes always need approval. |
+| `join_policy` | str | `open` | `open`: key-proven nodes join directly. `approve`: new nodes are pending until an admin approves them. Keyless nodes (only with `keyless_join`) always need an admin's approval; only the same approved keyless record is re-approved (6.2). |
+| `keyless_join` | bool | no | Hive: accept nodes that join without the swarm key (`join = keyless`); they are pending until an admin approves them (6.2). `netboot = yes` implies it; `savior hive --keyless-join` sets it. Trusted LAN only. |
 | `beacon` | bool | yes | Hive announces itself. |
 | `log_level` | str | `info` | |
 | `timezone` | str | `UTC` | IANA zone (tzdata is embedded). |
@@ -261,14 +263,32 @@ node                                          hive
  5 verify hive_proof with FP_seen; keep the pin for the process lifetime
 ```
 
+Step 5: a node without `hive_fingerprint` pins FP_seen of the first hive
+whose `hive_proof` verifies for the rest of the process. Later joins (after a
+401 or a lost hive) require that certificate, and beacons of its swarm that
+announce another fingerprint are skipped (link state `fingerprint_mismatch`).
+Restarting the node re-pins. A hive without a data partition (13.4) gets a
+new certificate on every reboot, so its unpinned nodes must be restarted too.
+
 `Hello.Time` is display-only. Nodes adjust their clock only from
 `RegisterResponse`/`HeartbeatResponse` after `hive_proof` has been verified
-(10.2). Keyless join (`join=keyless`, used by netboot): the node sends
-`proof=""`. The hive accepts it only if `hive_fingerprint` is pinned on the
-node side (checked by the node) and places the node in `pending` (no tasks,
-no blobs, status screen only) until an admin approves it. A keyless node whose
-HWIDs match a previously approved record is re-approved automatically. This
-is documented as trusted-LAN only.
+(10.2).
+
+Keyless join (`join=keyless`, used by netboot): the node sends `proof=""`.
+The hive accepts it only when keyless joins are enabled (`keyless_join = yes`,
+implied by `netboot = yes`; otherwise 403 before any record is created), and
+the node only joins keyless with `hive_fingerprint` pinned (checked by the
+node). A keyless client proves nothing about itself: its node ID and HWIDs
+are self-reported, and MACs are visible on the LAN. The hive therefore places
+it in `pending` (no tasks, no blobs, status screen only) until an admin
+approves it. It never lets a keyless client use a record that joined with the
+swarm key: that node ID gets 403, and key-joined records are never taken over
+by HWID match. The only automatic re-approval is for the same node ID whose
+record itself joined keyless, was approved and was not revoked (a netbooted
+machine rebooting). A new ID, even one taking over an offline keyless record
+by HWID, waits for approval. Anyone on the LAN who knows an approved keyless
+node's ID can join as it while it is offline, so keyless joins are
+trusted-LAN only.
 
 Tokens live only in hive memory. After a hive restart nodes get 401 and
 re-register (with their running tasks, 8.6).
@@ -404,7 +424,8 @@ Kernel and sysctl hardening (both images; `S10system`): `user.max_user_namespace
 Files: `S08config` mounts the stick `ro,nosuid,nodev,noexec,uid=0,gid=0,fmask=0177,dmask=0077`
 (vfat) or with 0700 dirs (ext4/iso9660 mount options as supported). rcS and
 all services run with `umask 077`. `/run/savior/*` and logs are 0600, except
-`status.json`, which is 0644.
+`status.json`, which is 0644 and holds no secrets (the hive panel's pairing
+code is never written to it).
 
 ## 7. Wire protocol (HTTPS + JSON)
 
@@ -417,13 +438,13 @@ capped at 1 MiB, except blob uploads and log chunks (256 KiB).
 | Method + path | Auth | Request → Response |
 |---|---|---|
 | `GET /api/v1/hello` | none | → `Hello` |
-| `POST /api/v1/register` | proof (or keyless) | `RegisterRequest` → `RegisterResponse`; 409 `duplicate node id` if the ID is online with another BootID; 403 bad proof; 426 when `api_version` (0 = v1) differs |
+| `POST /api/v1/register` | proof (or keyless) | `RegisterRequest` → `RegisterResponse`; 409 `duplicate node id` if the ID is online with another BootID; 403 bad proof, keyless joins disabled, or a keyless join for a node ID that joined with the key; 426 when `api_version` (0 = v1) differs |
 | `POST /api/v1/heartbeat` | node | `HeartbeatRequest` → `HeartbeatResponse` |
 | `POST /api/v1/claim` | node | `ClaimRequest` → `ClaimResponse` (long-poll ≤ 30 s) |
 | `POST /api/v1/tasks/{id}/report` | node | `TaskReport` → `{}`; 409 `stale lease` |
 | `POST /api/v1/tasks/{id}/log?lease=L&offset=N` | node | raw text → `{"next": N'}` (bytes before the hive's current offset are dropped, so retries are idempotent) |
 | `GET /api/v1/blobs/{sha256}` | node (scoped) or admin | bytes (Range supported) |
-| `GET /api/v1/blobs/{sha256}/render?cw=&ch=&x=&y=&w=&h=&pw=&ph=&fit=` | node (scoped) or admin | PNG: the image fitted into a canvas cw×ch, the rect x,y,w,h cropped from it, scaled to pw×ph pixels (11.5) |
+| `GET /api/v1/blobs/{sha256}/render?cw=&ch=&x=&y=&w=&h=&pw=&ph=&fit=[&bg=rrggbb]` | node (scoped) or admin | PNG: the image fitted into a canvas cw×ch, the rect x,y,w,h cropped from it, scaled to pw×ph pixels (11.5). Canvas areas the image doesn't cover are transparent, or `bg` when given; the node composites the PNG over its spec's `bg`. |
 | `PUT /api/v1/blobs/{sha256}` | node (scoped) or admin | bytes → `BlobInfo` (hash verified; 413 above max; 507 when disk would drop below max(5%, 512 MiB), capped at 10%, free. While free space is below that, jobs with outputs are not dispatched; the job and `HiveInfo.Warnings` say why) |
 | `GET /api/v1/stats` | node or admin | → `SwarmStats` |
 
@@ -456,7 +477,7 @@ or bearer) or the admin token (bearer).
 | `POST jobs/{id}/cancel` | → `JobView` |
 | `DELETE jobs/{id}` | → `{}` (finished jobs only) |
 | `GET tasks/{id}` | → `TaskView` |
-| `GET tasks/{id}/log?offset=N&wait_s=W` | → text from offset N, header `X-Savior-Log-Offset: <next>`; long-polls up to W s (≤ 25) when no new data |
+| `GET tasks/{id}/log?offset=N&wait_s=W` | → text from offset N of the task's current (or last) attempt; headers `X-Savior-Log-Offset: <next>` and `X-Savior-Log-Attempt: <attempt>`; long-polls up to W s (≤ 25) when no new data. Every dispatch starts a new stream at offset 0: an N past the end of the current attempt's stream is answered at once (with next < N), and a follower that sees the attempt change starts over at offset 0 (`savior ctl logs -f` prints `--- log restarted (attempt N) ---` on stderr, the dashboard a `--- attempt N ---` line). |
 | `GET tasks/{id}/outputs/{name}` | → file with Content-Disposition attachment |
 | `GET walls`, `POST walls`, `GET/PUT/DELETE walls/{id}` | `WallSpec` |
 | `GET blobs` | → `[]BlobInfo` |
@@ -472,9 +493,14 @@ The hive broadcasts a `Beacon` every 5 s, to `255.255.255.255:7701` and to
 each interface's directed broadcast address. It answers `Probe` datagrams of
 at least `MinProbeSize` bytes, only from directly connected subnets and at most
 once per second per source, with a unicast beacon. The node collects beacons
-for 2 s (`discovery.Collect`), keeps those matching its swarm hint, and tries
-them in order. A hive that answered wrongly (swarm key, fingerprint, API
-version, refused registration) is skipped for 5 minutes. One that could not
+for 2 s (`discovery.Collect`). Beacons are unauthenticated, so a listener
+drops those whose fields exceed the protocol (hive_id and version at most 64
+bytes, swarm_hint empty or 8 hex, fp empty or `sha256:` + 64 hex) and keeps
+at most 32 distinct hives per window, at most 4 per source address (the first
+seen). The node keeps those matching its swarm hint and tries them in order,
+at most 8 per join round (`maxCandidates`). A hive that answered wrongly
+(swarm key, fingerprint, API version, refused registration) is skipped for 5
+minutes. One that could not
 be reached (not listening yet, network error, 5xx) is skipped for 2 s,
 doubling up to 1 minute, until a join succeeds. If beacons are seen but none match, the link state is
 `key_mismatch`.
@@ -605,7 +631,9 @@ requirements together) gets `JobView.Warning`. It stays queued, since nodes may 
 * **Logs:** the node posts combined stdout+stderr chunks at most every 2 s
   (`?lease&offset`). The hive keeps a 1 MiB in-memory ring per running task.
   When the task finishes, the last 64 KiB goes to `<hive_data>/logs/<task_id>.log`.
-  Logs are never stored in `state.json`. Offsets count every byte ever written.
+  Logs are never stored in `state.json`. Offsets count every byte an attempt
+  wrote; each dispatch starts a new stream at 0, and log reads name the
+  attempt (`X-Savior-Log-Attempt`).
 * **Outputs:** collected only after the task's cgroup is empty. Patterns
   (`proto.ValidOutputPattern`) are matched via `os.Root` on the workdir.
   Every match must be a regular file (checked with `Lstat`). It is opened with
@@ -649,7 +677,8 @@ restart every node starts `offline` until its first heartbeat.
   Derived images for the render endpoint are cached in `<hive_data>/cache/`
   (LRU, 256 MiB).
 * Long-poll: claims wait on a broadcast channel that is closed and replaced
-  when tasks become pending or node capacity may have changed.
+  when tasks become pending or node capacity may have changed (including a
+  heartbeat that ends or starts a node's power pause).
 * Background loop (1 s): liveness, lost/offline requeue, deadlines,
   reservations, recovery window, action expiry, session expiry, persistence.
 * Walls: saving computes each cell's `WallTile` (canvas geometry in mm, see
@@ -711,7 +740,9 @@ enforced by a parent cgroup `<CgroupRoot>/tasks` with
 `cpu.max = total.cores × 100000 100000`. With `scratch=ram`,
 `ScratchInRAM=true`, `total.disk_mb = 0` and disk is charged to memory. With
 disk scratch, `total.disk_mb = free space × 90%`. Free = total − Σ running
-task resources. When the power policy says no, free is forced to 0.
+task resources. When the power policy says no, free is forced to 0. When
+roles=auto enables the display role after start (5.3), the display reserve
+is subtracted from the budget at that point.
 
 ### 10.4 Power and thermal policy (`internal/power`, pure)
 
@@ -759,6 +790,8 @@ runner has free slots. Power pause and preempt are level-triggered: they
 are applied to every running task on every tick while they hold. On
 shutdown all tasks share one 10 s grace period. It
 writes `/run/savior/status.json` (0644, atomic) every heartbeat for `savior console`.
+The file holds no secrets: the hive panel's pairing code is left out, and
+`savior console` (root) reads it from `hive-status.json` itself.
 
 ### 10.6 Link state and console
 
@@ -820,7 +853,8 @@ The modes are those of `proto.DisplayModes`:
   fingerprint, pairing code and node count.
 * `off`: blank.
 * `color`: solid `bg`.
-* `text`: auto-sized, word-wrapped, centered, optional `title`.
+* `text`: auto-sized, word-wrapped (lines break between words; a word is
+  split only when it can't fit a line at any size), centered, optional `title`.
 * `clock`: time in `clock_format` (Go layout, default `15:04`) and the date.
   Uses `timezone` (spec, else config).
 * `image`: the image fitted with `fit` (default `contain`).
@@ -868,7 +902,7 @@ type FetchRequest struct { CanvasW, CanvasH int; Rect image.Rectangle; PixelW, P
 type StatusInfo struct { Name, ShortCode, NodeID, Version string; Link proto.HiveLink; HiveAddr, HiveError, Message string;
     Addrs []string; Roles []proto.Role; Metrics proto.Metrics; Inventory proto.Inventory; RunningTasks int;
     PowerReason string; Hive *HivePanel }
-type HivePanel struct { URLs []string; Fingerprint, PairCode string; NodesOnline int; Persistent bool }
+type HivePanel struct { URLs []string; Fingerprint, PairCode string; NodesOnline int; Persistent bool } // PairCode is never serialized (json:"-")
 
 // Render draws one frame of spec into dst and returns when the scene next changes.
 func Render(ctx context.Context, spec proto.DisplaySpec, dst *image.RGBA, env Env) (next time.Time, err error)
@@ -889,7 +923,9 @@ func (c *Controller) Run(ctx context.Context) error
   are drawn in tiles straight into the frame.
 * No float scalers on `GOARCH=386`. Scaling is integer: nearest neighbor for
   upscaling, a fixed-point box filter for downscaling. Each media item is
-  scaled once to its final size.
+  scaled once to its final size. Each output pixel samples the source where
+  its centre falls on the (wall) canvas, in exact integer arithmetic, so
+  content lines up across wall tile edges.
 * Every frame render is wrapped in `recover()`, so a panic becomes
   `DisplayState.Error`.
 * Budget: steady-state status/clock under 5% of a 1 GHz core.
@@ -902,8 +938,10 @@ func (c *Controller) Run(ctx context.Context) error
 * URL media and local fallback: a separate `http.Client` with no auth header,
   system CA verification, http/https only, at most 3 redirects, and a
   64 MiB cap. If `Media.SHA256` is set it must match.
-* Before decoding: `image.DecodeConfig`. Reject if either side exceeds 8192
-  or the image exceeds 16 MP, or if w×h×8 exceeds 25% of MemAvailable.
+* Before decoding: `image.DecodeConfig` on the header (read up to 1 MiB into
+  the file, so large EXIF/ICC blocks don't skip these checks). Reject if
+  either side exceeds 8192 or the image exceeds 16 MP, or if w×h×8 exceeds
+  25% of MemAvailable.
   Rejections become `DisplayState.MediaErrors`, never a crash. After decode,
   crop to the needed source rectangle, scale to the final size and discard
   the original.
@@ -1077,7 +1115,8 @@ background (`start-stop-daemon -b`) with progress on tty1.
 
 A hive writes its status panel (URLs, fingerprint, pairing code, nodes
 online, persistence) to `/run/savior/hive-status.json` (0600). The node's
-status scene and `savior console` read it.
+status scene reads it in-process, and `savior console` (root) reads it
+itself; the node never copies the pairing code into `status.json`.
 
 `/usr/libexec/savior/run <node|hive|console>` sources the env and runs
 `savior <svc> --config /run/savior/savior.conf --log-file /var/log/savior-<svc>.log`
@@ -1090,8 +1129,11 @@ Test support: with `console=ttyS0` on the command line, rcS prints
 `SAVIOR-BOOT: rcS start` and `/usr/libexec/savior/boot-report` prints
 `SAVIOR-BOOT: rcS done ... cfg= media= key= fb= net= console= node= ver=` on
 the serial console (never secrets), then `SAVIOR-AGENT: up= agent=up|crashing|down
-age= starts= arch= ver=` once `savior node` has run 10 s without a restart
-(or hasn't). S65netboot prints `SAVIOR-NETBOOT: mode=full|proxy iface= addr=
+age= starts= arch= ver= mem_avail= offer_mem=` once `savior node` has run 10 s
+without a restart (or hasn't). `mem_avail` is MemAvailable in MiB at that
+moment and `offer_mem` the memory the agent offers for tasks (`Total.mem_mb`
+of status.json); new fields only ever go at the end of these lines.
+S65netboot prints `SAVIOR-NETBOOT: mode=full|proxy iface= addr=
 bios=grub|undionly|ipxe|no uefi=yes|no`. `savior_dumplog=1` also copies the
 boot log and syslog there.
 
@@ -1115,7 +1157,9 @@ On first start with the hive role and `hive_data=auto`, `savior storage init-dat
    `/var/lib/savior/data/hive`.
 
 The FAT boot partition is never written at runtime. Without a data
-partition the hive runs from RAM with `Persistent=false`.
+partition the hive runs from RAM with `Persistent=false`, and gets a new
+certificate (6.1) on every reboot: nodes pinned with `hive_fingerprint` need
+a new savior.conf, and unpinned nodes must be restarted (6.2, step 5).
 
 ### 13.5 Users
 
@@ -1125,9 +1169,12 @@ entries on the host; the sandbox `/etc/passwd` lists `savior-job:x:<uid>:<uid>::
 ## 14. Build system
 
 * Top-level `make`: `build` (host binary), `build-linux` (amd64 v1, 386 sse2,
-  386 softfloat into `build/linux-*/savior`), `test`, `vet`, `fmt-check`,
-  `lint-sh` (shellcheck), `dev-image`, `dev-test` (QEMU), `image ARCH=x86_64|i686`
-  (Buildroot), `universal-image`, `clean`.
+  386 softfloat into `build/linux-*/savior`), `test`, `test-web-e2e` (the
+  dashboard in headless Chromium through playwright-core against a real hive
+  and node agents; skips without Node.js 22+, playwright-core or Chromium),
+  `vet`, `fmt-check`, `lint-sh` (shellcheck), `dev-image`, `dev-test` (QEMU),
+  `swarm-test`, `netboot-test` (`hive-pxe` and `hive-pxe-proxy`),
+  `image ARCH=x86_64|i686` (Buildroot), `universal-image`, `clean`.
 * **Buildroot** (`os/buildroot`, BR2_EXTERNAL name `SAVIOR`): a pinned
   release; defconfigs `savior_x86_64_defconfig` (generic x86-64) and
   `savior_i686_defconfig` (`BR2_x86_i686`); an internal musl toolchain; BusyBox
@@ -1199,26 +1246,63 @@ entries on the host; the sandbox `/etc/passwd` lists `savior-job:x:<uid>:<uid>::
 * **QEMU tests** (`os/dev/qemu-test.sh`, TCG): static checks of the payload
   (`image`: soft dependencies, the Realtek PHY driver, radeon firmware, the CA
   bundle); SeaBIOS USB-EHCI stick; OVMF x64; ISO under BIOS and UEFI; PXE via
-  slirp TFTP; a baked `--conf` image; and multi-VM tests on a
+  slirp TFTP; a baked `--conf` image; a 256 MB machine with a screen
+  (`mem-256`: boot-report's `mem_avail` and `offer_mem`); Wi-Fi (`wifi-conf`:
+  `write_wpa_conf` under BusyBox, PSK checked against PBKDF2; `wifi`: WPA2 and
+  open joins through `mac80211_hwsim`, with hostapd and udhcpd in their own
+  network namespace); and multi-VM tests on a
   socket-multicast LAN with a random group/port per run and
   `localaddr=127.0.0.1`. Each VM gets a distinct MAC and `-uuid`. Boot tests
   require `agent=up starts=1` in the `SAVIOR-AGENT` line and no agent restart
-  for 30 s. The swarm run (hive + 2 compute + 1 display) runs a job end to end
-  (tasks also check they can read the CA bundle), compares the display text
-  pixel for pixel with `savior display render` after a black reference
-  screen, and runs a duplicate-ID test. `hive-pxe` netboots BIOS and UEFI
+  for 30 s. The stick boot tests also log in as root with `ssh_key` and check
+  that another key is refused. The swarm run (hive + 2 compute + 1 display)
+  runs a job end to end (tasks also check they can read the CA bundle, and
+  probe their sandbox as `TestRealSandboxIsolation` does), compares the
+  display text pixel for pixel with `savior display render` after a black
+  reference screen, reboots the hive with `savior ctl reboot` and checks that
+  its certificate, jobs, outputs, node names and SSH host key survive on
+  SAVIOR-DATA, and runs a duplicate-ID test. `hive-pxe` netboots BIOS and UEFI
   clients from a hive that is the DHCP server; `hive-pxe-proxy` does it behind
   a router VM (udhcpd, then a dnsmasq that names itself as next-server), with
   a PXE probe that checks plain PXE ROMs get iPXE (QEMU's own NIC ROMs are
   iPXE), and checks that `dhcp_server = yes` without a static address stays
   a proxy.
-* **Release CI** (`.github/workflows/images.yml`, `scripts/qemu-smoke.sh`):
-  Buildroot x86_64 and i686 payloads, then boots under SeaBIOS, OVMF x64, the
-  ISO, `qemu-system-i386 -cpu pentium3,-pae -m 256` and OVMF32, and the
-  universal image on all of them. Each boot must report `node=yes fb=yes`, a
-  DHCP lease, a real version, `agent=up` (on the Pentium III this proves the
-  SSE2/softfloat pick) and the expected `arch=`, and each netboot tree must
-  contain `undionly.kpxe`. Tagged builds become GitHub releases.
+* **Release CI** (`.github/workflows/images.yml`, `scripts/qemu-smoke.sh`,
+  `scripts/release-e2e.sh`): Buildroot x86_64 and i686 payloads, then boots
+  of every published medium:
+  * the sticks under SeaBIOS, OVMF x64,
+    `qemu-system-i386 -cpu pentium3,-pae -m 256` (TCG) and OVMF32;
+  * each ISO: x86_64 under SeaBIOS and OVMF x64, i686 on the Pentium III,
+    the universal ISO on all three (`media=/dev/sr*` required);
+  * the universal netboot tree from QEMU's TFTP server (SeaBIOS `core.0`,
+    OVMF `core.efi`).
+
+  Each boot must report `node=yes fb=yes`, a DHCP lease, a real version,
+  `agent=up` (on the Pentium III this proves the SSE2/softfloat pick) and the
+  expected `arch=`, and each netboot tree must contain `undionly.kpxe`.
+
+  `release-e2e.sh` then tests the media end to end against a hive running on
+  the runner. `savior ctl node-config` writes the stick's savior.conf; a
+  netbooted machine gets the same settings on the kernel command line of a
+  grub.cfg copy. The node must:
+  * join with a strict sandbox and every isolation feature;
+  * run a job whose task probes the sandbox: slot uid, no `/proc/cmdline`,
+    `/run`, `/media` or `/sys`, a read-only root, no network, `unshare` and
+    `mount` fail, seccomp mode 2, and `uname -m`;
+  * show text that matches `savior display render` pixel for pixel in a
+    monitor screendump;
+  * let root in over SSH with its `ssh_key`, with `/etc/savior-release`
+    naming the version.
+
+  It runs on the x86_64 stick, plus a hive-role boot with 2 GiB free where
+  `ctl info` must report persistent state on SAVIOR-DATA; on the i686 stick
+  on the Pentium III; and on the universal netboot tree on the Pentium III.
+
+  Each Buildroot build also runs `make legal-info` (checked by
+  `scripts/legal-info.sh`), and the universal job downloads the Ubuntu source
+  packages of the GRUB and iPXE builds on the media. Tagged builds become
+  GitHub releases with the images, the legal-info archives and the host
+  sources. `make release-e2e-dev` runs `release-e2e.sh` on the dev image.
 
 ## 15. Testing strategy
 
@@ -1229,11 +1313,29 @@ entries on the host; the sandbox `/etc/passwd` lists `savior-job:x:<uid>:<uid>::
   tests. `runner` has real-process tests with `sandbox=none`, and when run as
   root with cgroup2 it tests namespaces, cgroups and seccomp: a task must not
   be able to read `/proc/cmdline` or files outside `/work`, `unshare` must fail,
-  and output symlinks must be refused.
+  and output symlinks must be refused. CI runs these root tests with sudo
+  (GOARCH amd64 and 386) and fails on a skip; the QEMU swarm test runs the
+  same probes inside real tasks on SaviorOS nodes.
 * `internal/node` integration test: a real `hive.Server` over TLS plus 3
   in-process agents with fake hardware roots and memory display devices. It
   covers join, heartbeat, a count=5 job with outputs, cancellation, node loss →
   requeue, a stale-lease report being rejected, hive restart → re-adoption,
-  display assignment, walls, a rejected wrong key, and a MITM (different cert
-  between /hello and /register) that never gets a proof.
-* shellcheck on all scripts. QEMU tests (14) in CI.
+  display assignment, an uploaded image through the hive render endpoint
+  (letterbox in the spec's bg), a 1x2 wall across two agents (image, contain
+  with bg, content change, delete), identify and reboot actions (reboot acked
+  to the hive before acting, run once), roles=auto enabling the display role
+  when a display appears, a rejected wrong key, keyless join (pending,
+  approval, re-approval of the same machine after a restart; refused without
+  a pin or on a hive without keyless joins), the TOFU pin kept across
+  re-joins (another server with the swarm key at the hive's address is
+  refused), and a MITM (different cert between /hello and /register) that
+  never gets a proof.
+* shellcheck on all scripts. All 15 QEMU tests of os/dev/qemu-test.sh run in
+  CI: the 12 of `all` (dev-test), `swarm`, and `hive-pxe` and
+  `hive-pxe-proxy` (netboot job). CI also runs the runner root tests with
+  sudo, as amd64 and as 386, and fails if one of them or a test-scripts case
+  skips. The tests of the hive and ctl packages also run on macOS and Windows
+  runners (ci.yml job `hive-desktop`), with `scripts/hive-smoke.sh`: a real
+  hive, `ctl info`, `node-config` and `upload`, and a restart that keeps the
+  certificate and blobs. On Windows only their assertions of POSIX file
+  modes are skipped.
