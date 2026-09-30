@@ -90,6 +90,11 @@ type Config struct {
 	SwarmKey   string // "" = load or generate <data>/swarm_key
 	AdminToken string // "" = load or generate <data>/admin_token
 	JoinPolicy string // open (default) or approve
+	// KeylessJoin accepts registrations without a swarm-key proof
+	// (join = keyless, used by netbooted machines). Such nodes wait for an
+	// admin's approval; only a record that itself joined keyless and was
+	// approved is re-approved on its next join (DESIGN 6.2). Off by default.
+	KeylessJoin bool
 
 	Beacon        bool     // announce on UDP (DESIGN 7.3)
 	BeaconPort    int      // default proto.DiscoveryPort
@@ -154,6 +159,9 @@ func ConfigFromFile(c config.Config) Config {
 		AdminToken: c.AdminToken,
 		JoinPolicy: c.JoinPolicy,
 		Beacon:     c.Beacon,
+		// Netbooted machines never get the swarm key, so netboot implies
+		// keyless joins.
+		KeylessJoin: c.KeylessJoin || c.Netboot,
 	}
 	if c.Netboot {
 		// S65netboot builds the TFTP tree (boot files + generated grub.cfg,

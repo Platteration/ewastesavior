@@ -8,10 +8,12 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"syscall"
 	"time"
 
 	"github.com/platteration/ewastesavior/internal/config"
+	"github.com/platteration/ewastesavior/internal/hwinfo"
 	"github.com/platteration/ewastesavior/internal/logging"
 	"github.com/platteration/ewastesavior/internal/proto"
 	"github.com/platteration/ewastesavior/internal/version"
@@ -31,6 +33,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	swarmKey := fs.String("swarm-key", "", "swarm key (swarm_key; default: stored in the data directory)")
 	adminToken := fs.String("admin-token", "", "admin token (admin_token; default: generated in the data directory)")
 	noBeacon := fs.Bool("no-beacon", false, "do not announce the hive on the LAN")
+	keylessJoin := fs.Bool("keyless-join", false, "accept nodes without the swarm key (join = keyless); they wait for approval (keyless_join; netboot = yes implies it)")
 	logFile := fs.String("log-file", "", "also log to this file (rotated at 1 MiB)")
 	logLevel := fs.String("log-level", "", "debug, info, warn or error")
 	fs.Usage = func() {
@@ -80,8 +83,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 			cfg.AdminToken = *adminToken
 		case "no-beacon":
 			cfg.Beacon = !*noBeacon
+		case "keyless-join":
+			cfg.KeylessJoin = *keylessJoin
 		}
 	})
+	if limit, ok := setMemoryLimit(hwinfo.MemTotalMB(""), os.Getenv("GOMEMLIMIT"), debug.SetMemoryLimit); ok {
+		log.Debug("soft memory limit", "bytes", limit)
+	}
 	cfg.tune.clockRaised = prepareProcess(log)
 
 	s, err := New(cfg)
@@ -140,6 +148,22 @@ func printBanner(w io.Writer, s *Server) {
 		fmt.Fprintf(w, "\nWARNING: %s\n", warn)
 	}
 	fmt.Fprintln(w)
+}
+
+// Soft Go memory limit for the hive (DESIGN 4): a quarter of MemTotal, at
+// least hiveMinMemLimit. The hive may share a 256 MB machine with a node.
+const hiveMinMemLimit = 64 << 20
+
+// setMemoryLimit sets the hive's soft memory limit from MemTotal (MiB)
+// unless the operator set GOMEMLIMIT or MemTotal is unknown. It returns the
+// limit and whether it was set.
+func setMemoryLimit(memTotalMB int, gomemlimit string, set func(int64) int64) (int64, bool) {
+	if gomemlimit != "" || memTotalMB <= 0 {
+		return 0, false
+	}
+	limit := max(int64(memTotalMB)<<20/4, hiveMinMemLimit)
+	set(limit)
+	return limit, true
 }
 
 // prepareProcess applies DESIGN 4 process setup: on Linux as root protect

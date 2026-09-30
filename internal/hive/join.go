@@ -118,6 +118,11 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 // register creates or updates the node record and issues a token.
 func (s *Server) register(req proto.RegisterRequest, keyless bool, addr string) (proto.RegisterResponse, int, string) {
+	if keyless && !s.cfg.KeylessJoin {
+		s.log.Warn("join rejected: keyless joins are disabled", "node_id", req.NodeID, "addr", addr)
+		return proto.RegisterResponse{}, http.StatusForbidden,
+			"keyless joins are disabled on this hive (it needs netboot = yes or keyless_join = yes)"
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := time.Now()
@@ -126,6 +131,13 @@ func (s *Server) register(req proto.RegisterRequest, keyless bool, addr string) 
 	bootID := proto.Sanitize(req.BootID, 256, false)
 
 	n := s.nodes[req.NodeID]
+	// A keyless client proves nothing: its node ID and hardware IDs are
+	// self-reported (a MAC is visible to the whole LAN). It never touches a
+	// record that joined with the swarm key (DESIGN 6.2).
+	if keyless && n != nil && !n.Keyless {
+		return proto.RegisterResponse{}, http.StatusForbidden,
+			"node " + req.NodeID + " joined with the swarm key; a keyless join can't use its record (forget the node on the hive first)"
+	}
 	if n != nil && n.isOnline(now, s.cfg.OfflineAfter) && n.BootID != bootID {
 		return proto.RegisterResponse{}, http.StatusConflict, "duplicate node id: another online machine uses " + req.NodeID
 	}
@@ -134,7 +146,7 @@ func (s *Server) register(req proto.RegisterRequest, keyless bool, addr string) 
 		if len(s.nodes) >= maxNodes {
 			return proto.RegisterResponse{}, http.StatusServiceUnavailable, "too many nodes"
 		}
-		takeover = s.takeoverCandidateLocked(hwids, now)
+		takeover = s.takeoverCandidateLocked(hwids, now, keyless)
 		if keyless && takeover == nil && s.pendingCountLocked() >= maxPendingNodes {
 			return proto.RegisterResponse{}, http.StatusServiceUnavailable, "too many nodes waiting for approval"
 		}
@@ -148,7 +160,10 @@ func (s *Server) register(req proto.RegisterRequest, keyless bool, addr string) 
 	var approved bool
 	switch {
 	case keyless:
-		approved = s.hwidApprovedLocked(hwids) && (prior == nil || !prior.Denied)
+		// Re-approved only as the same record that itself joined keyless
+		// and was approved (a netbooted machine rebooting). A new ID, even
+		// one taking over a record by hardware ID, waits for an admin.
+		approved = n != nil && n.Keyless && n.Approved && !n.Denied
 	case s.cfg.JoinPolicy == "open":
 		approved = prior == nil || !prior.Denied
 	default: // approve
@@ -289,14 +304,15 @@ func (s *Server) adoptLocked(n *node, running []proto.RunningTask, now time.Time
 
 // takeoverCandidateLocked finds the most recently seen offline record
 // sharing a HWID (DESIGN 9: a new ID takes over name, labels, display and
-// wall cell).
-func (s *Server) takeoverCandidateLocked(hwids []string, now time.Time) *node {
+// wall cell). A keyless client may only take over a record that joined
+// keyless too.
+func (s *Server) takeoverCandidateLocked(hwids []string, now time.Time, keyless bool) *node {
 	if len(hwids) == 0 {
 		return nil
 	}
 	var best *node
 	for _, n := range s.nodes {
-		if n.isOnline(now, s.cfg.OfflineAfter) || !intersects(n.HWIDs, hwids) {
+		if n.isOnline(now, s.cfg.OfflineAfter) || !intersects(n.HWIDs, hwids) || keyless && !n.Keyless {
 			continue
 		}
 		if best == nil || n.LastSeen.After(best.LastSeen) {
@@ -360,18 +376,6 @@ func (s *Server) removeNodeLocked(n *node, why string) {
 	}
 	delete(s.nodes, n.ID)
 	s.dirty = true
-}
-
-func (s *Server) hwidApprovedLocked(hwids []string) bool {
-	if len(hwids) == 0 {
-		return false
-	}
-	for _, n := range s.nodes {
-		if n.Approved && intersects(n.HWIDs, hwids) {
-			return true
-		}
-	}
-	return false
 }
 
 func (s *Server) pendingCountLocked() int {
@@ -474,7 +478,14 @@ func (s *Server) heartbeat(tok string, st proto.NodeStatus, addr string) (proto.
 	n.online = true
 	n.LastSeen = s.now()
 	n.Addr = addr
+	wasPaused := n.status.State == proto.NodePaused
 	n.status = st
+	if wasPaused != (st.State == proto.NodePaused) {
+		// Claim eligibility changed (claimEligibleLocked): a node whose
+		// power pause just ended claims at once and must not sit out the
+		// long poll it started while still paused (DESIGN 9).
+		s.notifyLocked()
+	}
 	n.Metrics = st.Metrics
 	if st.Total != (proto.Resources{}) {
 		if t := clampTotal(st.Total, n.Inventory); t != n.Total {

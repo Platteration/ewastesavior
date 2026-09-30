@@ -25,6 +25,8 @@ const (
 	// could not be reached at all (not listening yet, network down, 5xx).
 	unreachableFirst = 2 * time.Second
 	unreachableMax   = time.Minute
+	// maxCandidates bounds the discovered hives tried per join round.
+	maxCandidates = 8
 )
 
 // join finds the hive and registers. It returns a client pinned to the
@@ -109,27 +111,62 @@ func (a *Agent) candidates(ctx context.Context) ([]string, error) {
 		if err != nil {
 			a.log.Debug("discovery failed", "err", err)
 		}
-		var mine, others []string
-		for _, c := range seen {
-			switch {
-			case hint != "" && c.Beacon.SwarmHint == hint:
-				mine = append(mine, c.URL)
-			case hint == "" && a.cfg.HiveFingerprint != "" && c.Beacon.Fingerprint == a.cfg.HiveFingerprint:
-				// Keyless nodes recognize their pinned hive by fingerprint.
-				mine = append(mine, c.URL)
-			default:
-				others = append(others, c.URL)
-			}
-		}
+		mine, wrongCert, others := sortBeacons(seen, hint, a.cfg.HiveFingerprint)
 		if len(mine) > 0 {
-			return dedupe(mine), nil
+			return firstCandidates(mine), nil
 		}
-		if len(others) > 0 {
+		switch {
+		case len(wrongCert) > 0:
+			a.setLink(proto.LinkFingerprintMismatch, hostOf(wrongCert[0]), a.pinMismatchDetail())
+		case len(others) > 0:
 			a.setLink(proto.LinkKeyMismatch, others[0], fmt.Sprintf("%d hive(s) with a different swarm key", len(others)))
 		}
 		sleep(ctx, 3*time.Second)
 	}
 	return nil, ctx.Err()
+}
+
+// sortBeacons splits discovered hives into ours (swarm hint, or for a
+// keyless node the pinned fingerprint), ours by swarm hint but announcing a
+// certificate other than the pin (never contacted), and other swarms.
+func sortBeacons(seen []discovery.Candidate, hint, pin string) (mine, wrongCert, others []string) {
+	for _, c := range seen {
+		switch {
+		case hint != "" && c.Beacon.SwarmHint == hint:
+			if pin != "" && c.Beacon.Fingerprint != "" && c.Beacon.Fingerprint != pin {
+				wrongCert = append(wrongCert, c.URL)
+				continue
+			}
+			mine = append(mine, c.URL)
+		case hint == "" && pin != "" && c.Beacon.Fingerprint == pin:
+			// Keyless nodes recognize their pinned hive by fingerprint.
+			mine = append(mine, c.URL)
+		default:
+			others = append(others, c.URL)
+		}
+	}
+	return mine, wrongCert, others
+}
+
+// pinMismatchDetail explains a certificate that differs from the node's
+// pin: the configured hive_fingerprint, or the certificate this process
+// learned on its first join (DESIGN 6.2 step 5).
+func (a *Agent) pinMismatchDetail() string {
+	if a.opt.Config.HiveFingerprint == "" {
+		return "the hive's certificate changed since this node joined it; the node keeps trusting only the hive it first joined until it restarts"
+	}
+	return "the hive's certificate doesn't match hive_fingerprint"
+}
+
+// firstCandidates dedupes the hives found by discovery and keeps the first
+// maxCandidates: a LAN host can copy the public swarm hint into many
+// beacons, and each candidate costs a handshake.
+func firstCandidates(urls []string) []string {
+	urls = dedupe(urls)
+	if len(urls) > maxCandidates {
+		urls = urls[:maxCandidates]
+	}
+	return urls
 }
 
 func dedupe(in []string) []string {
@@ -187,6 +224,11 @@ func hostOf(base string) string {
 }
 
 // handshake runs DESIGN 6.2 against one hive.
+//
+// a.cfg.HiveFingerprint is the pin: hive_fingerprint from savior.conf, or,
+// without one, the certificate of the first hive this process joined (set
+// below once its hive_proof verifies, DESIGN 6.2 step 5). Only the Run
+// goroutine (join, candidates, handshake) reads or writes it.
 func (a *Agent) handshake(ctx context.Context, base string) (*hiveClient, error) {
 	addr := hostOf(base)
 	hctx, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -195,7 +237,7 @@ func (a *Agent) handshake(ctx context.Context, base string) (*hiveClient, error)
 	hello, fpSeen, err := probeHello(hctx, base, a.cfg.HiveFingerprint)
 	if err != nil {
 		if errors.Is(err, auth.ErrFingerprintMismatch) || strings.Contains(err.Error(), "fingerprint mismatch") {
-			a.setLink(proto.LinkFingerprintMismatch, addr, "the hive's certificate doesn't match hive_fingerprint")
+			a.setLink(proto.LinkFingerprintMismatch, addr, a.pinMismatchDetail())
 			a.ban(base)
 			return nil, err
 		}
@@ -241,7 +283,17 @@ func (a *Agent) handshake(ctx context.Context, base string) (*hiveClient, error)
 			a.setLink(proto.LinkRejected, addr, msg)
 			a.ban(base)
 		case 403:
-			a.setLink(proto.LinkRejected, addr, "the hive rejected our swarm key")
+			msg := "the hive rejected our swarm key"
+			if keyless {
+				// Keyless joins disabled on that hive, or our node ID
+				// belongs to a node that joined with the key.
+				msg = "the hive refused this keyless join"
+				var he *HTTPError
+				if errors.As(err, &he) && he.Msg != "" {
+					msg += ": " + he.Msg
+				}
+			}
+			a.setLink(proto.LinkRejected, addr, msg)
 			a.ban(base)
 		case 409:
 			a.setLink(proto.LinkDuplicate, addr, "another online machine uses this node ID")
@@ -265,6 +317,13 @@ func (a *Agent) handshake(ctx context.Context, base string) (*hiveClient, error)
 			a.setLink(proto.LinkRejected, addr, "the hive could not prove it knows the swarm key")
 			a.ban(base)
 			return nil, errors.New("invalid hive proof")
+		}
+		if a.cfg.HiveFingerprint == "" {
+			// Keep the pin for the process lifetime (DESIGN 6.2 step 5):
+			// later joins accept only this certificate, so another server
+			// with the swarm key can't take over a running node.
+			a.cfg.HiveFingerprint = fpSeen
+			a.log.Info("pinned the hive's certificate until this node restarts", "fingerprint", fpSeen)
 		}
 	}
 	hc.setToken(resp.Token)

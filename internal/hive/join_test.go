@@ -217,7 +217,7 @@ func TestDuplicateNodeID(t *testing.T) {
 
 func TestKeylessPendingUntilApproved(t *testing.T) {
 	t.Parallel()
-	h := newHive(t, nil)
+	h := newHive(t, func(c *Config) { c.KeylessJoin = true; c.OfflineAfter = time.Second })
 	n := h.newNode(nil)
 	resp := n.registerKeyless()
 	if !resp.Pending || !resp.Directives.Pending || resp.HiveProof != "" {
@@ -251,15 +251,36 @@ func TestKeylessPendingUntilApproved(t *testing.T) {
 		t.Fatalf("approved node claim: %v", tasks)
 	}
 
-	// A keyless join whose HWID matches an approved record is re-approved.
-	again := h.newNode(func(r *proto.RegisterRequest) { r.NodeID = "n00000000beef"; r.HWIDs = n.req.HWIDs; r.BootID = "b2" })
-	if resp := again.registerKeyless(); resp.Pending {
-		t.Fatal("HWID match of an approved record should approve")
+	// Another ID claiming the approved record's hardware IDs proves nothing
+	// (HWIDs are self-reported): it waits for an admin, even while the
+	// approved record is online.
+	clone := h.newNode(func(r *proto.RegisterRequest) { r.HWIDs = n.req.HWIDs; r.BootID = "b-clone" })
+	if resp := clone.registerKeyless(); !resp.Pending {
+		t.Fatalf("HWID match of an online approved record approved a new ID: %+v", resp)
+	}
+	if code, _ := clone.api("GET", "stats", nil, nil); code != http.StatusForbidden {
+		t.Fatalf("pending clone read stats: %d", code)
+	}
+	if v := h.nodeView(n.req.NodeID); !v.Approved || v.Name != n.resp.Name {
+		t.Fatalf("the approved record changed: %+v", v)
+	}
+
+	// The same keyless record rebooting (new boot ID, once it is offline)
+	// is re-approved without an admin.
+	time.Sleep(1200 * time.Millisecond)
+	n.req.BootID = "b2"
+	if resp := n.registerKeyless(); resp.Pending {
+		t.Fatal("an approved keyless record should be re-approved on its next join")
 	}
 	// Unknown hardware stays pending.
 	other := h.newNode(nil)
 	if resp := other.registerKeyless(); !resp.Pending {
 		t.Fatal("unknown keyless node approved")
+	}
+	// Revoking approval sticks for keyless re-joins too.
+	h.mustAdmin("PATCH", "nodes/"+n.req.NodeID, proto.NodePatch{Approved: ptr(false)}, nil)
+	if resp := n.registerKeyless(); !resp.Pending {
+		t.Fatal("denied keyless node re-approved")
 	}
 }
 

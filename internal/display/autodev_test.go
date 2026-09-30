@@ -195,6 +195,7 @@ func TestLinkHint(t *testing.T) {
 		{proto.LinkNoNetwork, "", "", "network cable"},
 		{proto.LinkSearching, "", "", "savior hive"},
 		{proto.LinkFingerprintMismatch, "10.0.0.2:7700", "", "hive_fingerprint"},
+		{proto.LinkFingerprintMismatch, "10.0.0.2:7700", "the hive's certificate changed since this node joined it; the node keeps trusting only the hive it first joined until it restarts", "restart this node"},
 		{proto.LinkVersionMismatch, "", "", "version"},
 		{proto.LinkRateLimited, "", "", "retry"},
 		{proto.LinkRejected, "", "", "swarm_key"},

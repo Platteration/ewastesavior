@@ -35,6 +35,10 @@ func LinkHint(link proto.HiveLink, hiveAddr, hiveErr string) string {
 		}
 		return "Hive found at " + host + " but port " + port + " is blocked. Allow savior through that computer's firewall."
 	case proto.LinkFingerprintMismatch:
+		if strings.Contains(hiveErr, "since this node joined it") {
+			// The pin this node learned on its first join (no hive_fingerprint).
+			return "The hive" + at + " has a different certificate than when this node joined it. If the hive was reinstalled or runs from RAM, restart this node; otherwise check for an impostor."
+		}
 		return "The hive" + at + " has a different certificate than hive_fingerprint in savior.conf. Fix the pin, or check for an impostor."
 	case proto.LinkVersionMismatch:
 		return "The hive" + at + " speaks a different protocol version. Update this stick or the hive to the same SaviorOS release."

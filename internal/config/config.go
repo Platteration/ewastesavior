@@ -79,11 +79,12 @@ type Config struct {
 	DisplayDevice  string // display_device
 	DisplayIdleOff int    // display_idle_off_min
 
-	HiveListen string // hive_listen
-	HiveData   string // hive_data
-	AdminToken string // admin_token
-	JoinPolicy string // join_policy
-	Beacon     bool   // beacon
+	HiveListen  string // hive_listen
+	HiveData    string // hive_data
+	AdminToken  string // admin_token
+	JoinPolicy  string // join_policy
+	KeylessJoin bool   // keyless_join
+	Beacon      bool   // beacon
 
 	LogLevel string // log_level
 	Timezone string // timezone
@@ -459,6 +460,8 @@ var defs = []keyDef{
 		}),
 	str("join_policy", "open", "open = nodes with the swarm key join directly; approve = new nodes wait for admin approval.", false,
 		func(c *Config) *string { return &c.JoinPolicy }, oneOf("open", "approve")),
+	boolean("keyless_join", false, "Hive: accept nodes without the swarm key (join = keyless); they wait for approval. netboot = yes implies it. Only on a LAN you trust.",
+		func(c *Config) *bool { return &c.KeylessJoin }),
 	boolean("beacon", true, "Hive announces itself on the LAN.", func(c *Config) *bool { return &c.Beacon }),
 
 	str("log_level", "info", "debug, info, warn or error.", false, func(c *Config) *string { return &c.LogLevel }, oneOf("debug", "info", "warn", "error")),
