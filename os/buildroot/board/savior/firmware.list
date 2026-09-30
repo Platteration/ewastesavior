@@ -13,6 +13,12 @@
 # behind (e.g. iwlwifi-*.ucode -> intel/iwlwifi/...), the link is recreated
 # and its target installed.
 #
+# The licences need no line here: install-firmware.sh adds WHENCE (its
+# sections for the installed files, where some licences are spelled out)
+# and every LICENCE.*/LICENSE.*/GPL-* file those sections name, and the
+# prune keeps them. They end up in the modloop's firmware/ next to the
+# blobs (/lib/firmware/WHENCE on a running node).
+#
 # Deliberately absent: amdgpu, NVIDIA GSP, and anything for hardware newer
 # than this project targets. ipw2x00 and b43 firmware can't be redistributed:
 # users drop it into /firmware/ on the stick. ar3k (Atheros *Bluetooth*) is

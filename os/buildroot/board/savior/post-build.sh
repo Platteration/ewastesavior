@@ -17,7 +17,9 @@
 #   5. moves /lib/modules and /lib/firmware into /lib/modloop.sqfs (xz squashfs
 #      with top-level directories modules/ and firmware/), leaving empty
 #      mountpoints for S00mounts;
-#   6. prunes the firmware to board/savior/firmware.list on the way;
+#   6. prunes the firmware to board/savior/firmware.list on the way, keeping
+#      its licences (WHENCE and the LICENCE files install-firmware.sh put
+#      next to the blobs; the build fails when firmware ships without them);
 #   7. checks the applets and programs the init scripts rely on, and the
 #      radeon module option this kernel needs.
 #
@@ -304,6 +306,14 @@ fi
 # Enforce the allowlist on the merged tree (other packages' firmware, and
 # files a changed list no longer names on an incremental rebuild).
 sh "$BOARD_DIR/install-firmware.sh" --prune "$STAGE/firmware" "$FW_LIST"
+# linux-firmware's licences require their notices to travel with the blobs:
+# install-firmware.sh installs WHENCE (the sections for the installed files)
+# and the licence files those name, and the prune above keeps them.
+blobs=$(cd "$STAGE/firmware" && find . \( -type f -o -type l \) ! -name 'regulatory.db*' ! -name WHENCE \
+	! -name 'LICEN[CS]E*' ! -name 'GPL-*' ! -name 'COPYING*' -print | head -n 1)
+if [ -n "$blobs" ] && [ ! -s "$STAGE/firmware/WHENCE" ]; then
+	die "firmware without its licences: /lib/firmware has ${blobs#./} but no WHENCE (install the firmware with board/savior/install-firmware.sh)"
+fi
 nmods=$(find "$STAGE/modules" -name '*.ko*' | wc -l | tr -d ' ')
 [ "$nmods" -gt 0 ] || die "no kernel modules found (is CONFIG_MODULES set, did the kernel install?)"
 for k in "$STAGE"/modules/*; do
@@ -326,7 +336,7 @@ chmod 0644 "$TARGET_DIR/lib/modloop.sqfs"
 # Empty mountpoints. Keep lib/modules/<kver> so Buildroot's depmod hook finds
 # its directory on the next run; the modloop mount hides it.
 mkdir -p "$TARGET_DIR/lib/modules/$KVER" "$TARGET_DIR/lib/firmware"
-log "modloop: $nmods modules, $(find "$STAGE/firmware" \( -type f -o -type l \) | wc -l | tr -d ' ') firmware files -> /lib/modloop.sqfs ($(($(wc -c <"$TARGET_DIR/lib/modloop.sqfs") / 1024)) KiB)"
+log "modloop: $nmods modules, $(find "$STAGE/firmware" \( -type f -o -type l \) | wc -l | tr -d ' ') firmware and licence files -> /lib/modloop.sqfs ($(($(wc -c <"$TARGET_DIR/lib/modloop.sqfs") / 1024)) KiB)"
 
 # ---------------------------------------------------------------------------
 # 7. what the overlay's scripts rely on

@@ -6,10 +6,16 @@
 #       (SRC_DIR, with its WHENCE file) into DEST_DIR (the target's
 #       /lib/firmware). WHENCE "Link:" entries are handled like upstream's
 #       copy-firmware.sh: a selected link name installs its target, and every
-#       link whose target got installed is created.
+#       link whose target got installed is created. The licences travel
+#       with the files: DEST_DIR/WHENCE gets WHENCE's header and every
+#       section that lists an installed file or link (the licence terms,
+#       some of them spelled out there), and each licence file those
+#       sections name (LICENCE.*, LICENSE.*, GPL-*, COPYING*) is installed.
 #   install-firmware.sh --prune DIR LIST_FILE
 #       Delete every file in DIR the list doesn't select (plus dangling links
-#       and empty directories). Keeps regulatory.db* (wireless-regdb).
+#       and empty directories). Keeps regulatory.db* (wireless-regdb) and
+#       the licences: WHENCE and the top-level LICENCE*, LICENSE*, GPL-* and
+#       COPYING* files.
 #
 # LIST_FILE syntax: see board/savior/firmware.list. Exit status 1 when a
 # required pattern matches nothing (upstream renamed something: fix the list).
@@ -117,7 +123,7 @@ BEGIN {
 
 	for (f in isfile) if (selected(f)) keep[f] = 1
 	for (l in linkto) if (selected(l)) { r = resolve(l); if (r != "") keep[r] = 1 }
-	if (prune == "yes") for (f in isfile) if (f ~ /^regulatory\.db/) keep[f] = 1
+	if (prune == "yes") for (f in isfile) if (f ~ /^regulatory\.db/ || f ~ /^(WHENCE|LICEN[CS]E[^\/]*|GPL-[^\/]*|COPYING[^\/]*)$/) keep[f] = 1
 
 	for (f in keep) print "F " f
 	for (l in linkto) { r = resolve(l); if (r != "" && (r in keep)) print "L " l "\t" linkto[l] }
@@ -131,6 +137,65 @@ if [ "$PRUNE" = no ] && grep -q '^E ' "$WORK/plan"; then
 	die "firmware list patterns matched nothing in $SRC (update $LIST)"
 fi
 sed -n 's/^F //p' "$WORK/plan" | LC_ALL=C sort >"$WORK/keep"
+
+if [ "$PRUNE" = no ]; then
+	# The licences of what gets installed. WHENCE is a header, then one
+	# section per driver between lines of dashes; a section lists its files
+	# ("File:", "RawFile:", names may be quoted) and links ("Link: A -> B")
+	# and states the licence, often as "See LICENCE.foo for details."
+	sed -n 's/^L \([^	]*\)	.*/\1/p' "$WORK/plan" >"$WORK/linknames"
+	: >"$WORK/WHENCE"
+	LC_ALL=C awk -v keepf="$WORK/keep" -v linkf="$WORK/linknames" -v filesf="$WORK/files" \
+		-v out="$WORK/WHENCE" -v lics="$WORK/licences" -v missing="$WORK/licences-missing" '
+	function unq(s) {
+		sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s)
+		if (s ~ /^".*"$/) s = substr(s, 2, length(s) - 2)
+		return s
+	}
+	function flush() {
+		if (nsec == 0) printf "%s", cur > out
+		else if (used) { printf "%s\n%s", sepline, cur > out; for (l in cl) need[l] = 1; nused++ }
+		cur = ""; used = 0; split("", cl)
+	}
+	BEGIN {
+		while ((getline l < keepf) > 0) kept[l] = 1
+		while ((getline l < linkf) > 0) linked[l] = 1
+		while ((getline l < filesf) > 0) isfile[l] = 1
+		nsec = 0; used = 0; cur = ""
+	}
+	{ sub(/\r$/, "") }
+	/^----------+[ \t]*$/ { if (sepline == "") sepline = $0; flush(); nsec++; next }
+	{
+		cur = cur $0 "\n"
+		if ($0 ~ /^(Raw)?File:/ && (unq(substr($0, index($0, ":") + 1)) in kept)) used = 1
+		if ($0 ~ /^Link:/ && (x = index($0, " -> ")) && (unq(substr($0, 6, x - 6)) in linked)) used = 1
+		n = split($0, w, /[ \t]+/)
+		for (i = 1; i <= n; i++) {
+			t = w[i]
+			sub(/^[("\047`]+/, "", t)
+			while (!(t in isfile) && t ~ /[.,;:)"\047`]$/) t = substr(t, 1, length(t) - 1)
+			if (t ~ /^(LICEN[CS]E|GPL-|COPYING)/) {
+				if (t in isfile) cl[t] = 1
+				else cl["?" t] = 1
+			}
+		}
+	}
+	END {
+		flush()
+		if (nused) printf "%s\n", sepline > out
+		for (l in need) {
+			if (substr(l, 1, 1) == "?") print substr(l, 2) > missing
+			else print l > lics
+		}
+	}' "$SRC/WHENCE"
+	if [ -s "$WORK/licences-missing" ]; then
+		log "warning: WHENCE names licence files this tree lacks: $(LC_ALL=C sort -u "$WORK/licences-missing" | tr '\n' ' ')"
+	fi
+	if [ -s "$WORK/licences" ]; then
+		LC_ALL=C sort -u "$WORK/keep" "$WORK/licences" >"$WORK/keep.tmp"
+		mv "$WORK/keep.tmp" "$WORK/keep"
+	fi
+fi
 
 if [ "$PRUNE" = yes ]; then
 	removed=0
@@ -157,6 +222,9 @@ while IFS= read -r f; do
 	chmod 0644 "$DEST/$f"
 	n=$((n + 1))
 done <"$WORK/keep"
+rm -f "$DEST/WHENCE"
+cp "$WORK/WHENCE" "$DEST/WHENCE"
+chmod 0644 "$DEST/WHENCE"
 nl=0
 sed -n 's/^L //p' "$WORK/plan" | LC_ALL=C sort | while IFS="	" read -r name target; do
 	mkdir -p "$DEST/$(dirname "$name")"
@@ -166,4 +234,5 @@ sed -n 's/^L //p' "$WORK/plan" | LC_ALL=C sort | while IFS="	" read -r name targ
 	echo x
 done >"$WORK/linked"
 nl=$(wc -l <"$WORK/linked" | tr -d ' ')
-log "installed $n file(s) and $nl link(s) into $DEST ($(du -sk "$DEST" | cut -f1) KiB)"
+nlic=$(LC_ALL=C sort -u "$WORK/licences" 2>/dev/null | wc -l | tr -d ' ')
+log "installed $n file(s) ($nlic licence file(s)), $nl link(s) and the matching WHENCE sections into $DEST ($(du -sk "$DEST" | cut -f1) KiB)"

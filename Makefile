@@ -45,7 +45,7 @@ BR_ENV = env -u ARCH -u MAKEFLAGS -u MFLAGS -u MAKELEVEL -u MAKEOVERRIDES BR2_DL
 BR_ARGS = -C $(BUILDROOT_SRC) O=$(abspath $(BR_OUT)) BR2_EXTERNAL=$(abspath os/buildroot)
 
 .PHONY: help build build-linux build-linux-amd64 build-linux-386 cross test test-386 test-race \
-	vet fmt-check lint-sh test-scripts check dev-image dev-test swarm-test \
+	test-web-e2e vet fmt-check lint-sh test-scripts check dev-image dev-test swarm-test netboot-test \
 	buildroot-src check-arch image universal-image universal-media clean distclean
 
 help:
@@ -58,6 +58,8 @@ help:
 	@echo "  test              go test ./..."
 	@echo "  test-race         go test -race ./... (needs cgo; falls back to test)"
 	@echo "  test-386          go test ./... as GOARCH=386, sse2 and softfloat"
+	@echo "  test-web-e2e      the dashboard in headless Chromium against a real hive and nodes"
+	@echo "                    (needs Node.js 22+, playwright-core and Chromium; skips without)"
 	@echo "  vet               go vet ./..."
 	@echo "  fmt-check         fail if gofmt would change anything"
 	@echo "  lint-sh           shellcheck -s sh on every shell script in os/ and scripts/"
@@ -67,6 +69,8 @@ help:
 	@echo "  dev-image         dev image from Ubuntu packages -> $(DEV_OUT)/ (os/dev/build.sh)"
 	@echo "  dev-test          QEMU boot tests of the dev image (os/dev/qemu-test.sh all)"
 	@echo "  swarm-test        QEMU swarm test only (os/dev/qemu-test.sh swarm)"
+	@echo "  netboot-test      QEMU: machines netboot from a hive (full DHCP, and behind a router)"
+	@echo "  release-e2e-dev   scripts/release-e2e.sh on the dev image: stick (+ hive role) and netboot"
 	@echo ""
 	@echo "  image ARCH=x86_64|i686"
 	@echo "                    Buildroot $(BUILDROOT_VERSION) image -> $(IMAGES)/<arch>/savior-<arch>.{img,iso} + netboot/"
@@ -74,6 +78,8 @@ help:
 	@echo "                    -> $(IMAGES)/savior-universal.{img,iso} + $(IMAGES)/netboot/"
 	@echo "  universal-media   only the last step, from existing payloads"
 	@echo "                    (X86_64_PAYLOAD=dir I686_PAYLOAD=dir)"
+	@echo "  legal-info ARCH=x86_64|i686"
+	@echo "                    after image: Buildroot's licences + sources -> $(IMAGES)/<arch>/savior-<arch>-legal-info.tar"
 	@echo ""
 	@echo "  clean             remove binaries, images and the dev image (keeps Buildroot trees)"
 	@echo "  distclean         remove all of $(BUILD)/"
@@ -120,6 +126,19 @@ test-race:
 		CGO_ENABLED=0 $(GO) test $(GOFLAGS) ./...; \
 	fi
 
+# Browser test of the dashboard (internal/hive/web/e2e_test.go): a real hive
+# and node agents in-process, driven by testdata/e2e.mjs through
+# playwright-core and headless Chromium. Setup, for example:
+#   mkdir -p /tmp/pw && cd /tmp/pw && npm install playwright-core && npx playwright-core install chromium
+#   make test-web-e2e SAVIOR_PLAYWRIGHT_DIR=/tmp/pw
+# It skips when Node.js 22+, playwright-core or Chromium is missing;
+# SAVIOR_WEB_E2E=require makes that a failure (CI). SAVIOR_E2E_CHROMIUM names
+# a browser executable, SAVIOR_E2E_OUT keeps screenshots of a failed step.
+SAVIOR_WEB_E2E ?= 1
+test-web-e2e:
+	SAVIOR_WEB_E2E=$(SAVIOR_WEB_E2E) $(if $(SAVIOR_PLAYWRIGHT_DIR),SAVIOR_PLAYWRIGHT_DIR=$(SAVIOR_PLAYWRIGHT_DIR)) \
+		CGO_ENABLED=0 $(GO) test $(GOFLAGS) -count=1 -v -run '^TestDashboardE2E$$' ./internal/hive/web/
+
 vet:
 	CGO_ENABLED=0 $(GO) vet ./...
 
@@ -152,6 +171,22 @@ swarm-test:
 	@[ -f $(DEV_OUT)/vmlinuz ] || $(MAKE) dev-image
 	sh os/dev/qemu-test.sh swarm --out $(DEV_OUT)
 
+netboot-test:
+	@[ -f $(DEV_OUT)/vmlinuz ] || $(MAKE) dev-image
+	sh os/dev/qemu-test.sh hive-pxe hive-pxe-proxy --out $(DEV_OUT)
+
+# The release end-to-end test (the images workflow runs it on the Buildroot
+# media) against the dev image: a hive on this host, the stick joins it, runs
+# a sandboxed task, shows text, takes an SSH login, then boots as a hive with
+# SAVIOR-DATA; then the same node test over the netboot tree.
+.PHONY: release-e2e-dev
+release-e2e-dev:
+	@[ -f $(DEV_OUT)/media/savior.img ] || $(MAKE) dev-image
+	sh scripts/release-e2e.sh --image $(DEV_OUT)/media/savior.img --savior $(DEV_OUT)/savior --hive-role \
+		--out $(DEV_OUT)/logs/release-e2e --name stick
+	sh scripts/release-e2e.sh --netboot $(DEV_OUT)/media/netboot --savior $(DEV_OUT)/savior \
+		--out $(DEV_OUT)/logs/release-e2e --name netboot
+
 # --- Buildroot images (os/buildroot) -----------------------------------------------
 
 buildroot-src: $(BUILDROOT_SRC)/Makefile
@@ -181,6 +216,18 @@ universal-media:
 	sh os/image/mkimage.sh --out $(IMAGES) --name savior-universal --version $(VERSION) \
 		--payload x86_64=$(X86_64_PAYLOAD)/vmlinuz,$(X86_64_PAYLOAD)/initrd \
 		--payload i686=$(I686_PAYLOAD)/vmlinuz,$(I686_PAYLOAD)/initrd
+
+# Licences and corresponding source of what a Buildroot image contains
+# (README "Licenses"): Buildroot's legal-info for the configuration and
+# downloads "make image ARCH=..." left in $(BR_OUT), plus the kernel and
+# BusyBox configurations, packed and checked by scripts/legal-info.sh.
+.PHONY: legal-info
+legal-info: check-arch buildroot-src
+	@[ -f $(BR_OUT)/.config ] || { echo "legal-info: run 'make image ARCH=$(ARCH)' first" >&2; exit 1; }
+	$(BR_ENV) $(BRMAKE) $(BR_ARGS) legal-info
+	sh scripts/legal-info.sh pack $(BR_OUT) $(IMAGES)/$(ARCH)/savior-$(ARCH)-legal-info.tar \
+		--add kernel.config=$(BR_PAYLOAD)/kernel.config \
+		$(foreach f,$(wildcard $(BR_OUT)/build/busybox-*/.config),--add busybox.config=$(f))
 
 # --- housekeeping -------------------------------------------------------------------
 

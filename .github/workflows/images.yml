@@ -1,7 +1,10 @@
 name: images
 
-# Production images: Buildroot payloads for x86_64 and i686, QEMU boot tests,
-# a universal image with both, and a GitHub release on v* tags.
+# Production images: Buildroot payloads for x86_64 and i686, QEMU boot tests
+# of every medium, end-to-end tests of the release media (scripts/release-e2e.sh),
+# a universal image with both payloads, the licences and corresponding source
+# (Buildroot legal-info, GRUB and iPXE source packages), and a GitHub release
+# on v* tags.
 on:
   workflow_dispatch:
     inputs:
@@ -42,6 +45,12 @@ env:
   # Each step adds --expect arch=x86_64|i686 for the payload it must boot.
   # scripts/test-scripts.sh runs this line against fake boot logs.
   BOOT_EXPECT: --expect node=yes --expect fb=yes --expect net=10.0.2. --expect agent=up --fail net=none --fail ver=unknown --fail SIGILL
+  # On the 256 MB Pentium III boots: MemAvailable (MiB) at idle with the
+  # display role, and the memory offered for tasks, from boot-report's
+  # SAVIOR-AGENT line. The floor is the dev image's measurement (DESIGN's
+  # target for these images is 150 / about 50); raise it once the release
+  # images' numbers are known.
+  MEM256_EXPECT: --expect-min mem_avail=100 --expect-min offer_mem=24
 
 jobs:
   buildroot:
@@ -104,6 +113,18 @@ jobs:
       # clients of a hive in proxy DHCP mode chain through it).
       - name: Netboot tree has iPXE
         run: test -s build/images/${{ matrix.arch }}/netboot/boot/ipxe/undionly.kpxe
+      # Licences and corresponding source (README "Licenses"): Buildroot's
+      # legal-info for this build, checked by scripts/legal-info.sh, and the
+      # versions of the host's GRUB and iPXE packages mkimage.sh put on the
+      # media (the universal job fetches their source).
+      - name: make legal-info ARCH=${{ matrix.arch }}
+        run: |
+          set --
+          if [ -n "$BUILDROOT_VERSION_INPUT" ]; then
+            set -- "BUILDROOT_VERSION=$BUILDROOT_VERSION_INPUT"
+          fi
+          make legal-info ARCH=${{ matrix.arch }} "$@"
+          sh scripts/legal-info.sh host-manifest >build/images/${{ matrix.arch }}/host-packages.txt
 
       - name: Summary
         if: always()
@@ -130,13 +151,13 @@ jobs:
         run: sh scripts/qemu-smoke.sh --image build/images/x86_64/savior-x86_64.img --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --timeout 900 --log build/logs/x86_64-uefi.log
       - name: QEMU x86_64 (ISO, SeaBIOS)
         if: matrix.arch == 'x86_64'
-        run: sh scripts/qemu-smoke.sh --iso build/images/x86_64/savior-x86_64.iso --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --timeout 900 --log build/logs/x86_64-iso.log
+        run: sh scripts/qemu-smoke.sh --iso build/images/x86_64/savior-x86_64.iso --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --expect media=/dev/sr --timeout 900 --log build/logs/x86_64-iso.log
       # TCG on purpose: under KVM an SSE2 instruction would still run.
       - name: QEMU i686 (Pentium III, no PAE, no SSE2, 256 MB)
         if: matrix.arch == 'i686'
         run: >-
           sh scripts/qemu-smoke.sh --arch i686 --image build/images/i686/savior-i686.img
-          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=i686
+          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT $MEM256_EXPECT --expect arch=i686
           --timeout 1500 --log build/logs/i686-pentium3.log
       - name: QEMU i686 (OVMF ia32)
         if: matrix.arch == 'i686'
@@ -145,16 +166,25 @@ jobs:
       - name: Collect artifacts
         run: |
           d=dist/${{ matrix.arch }}
-          mkdir -p "$d/payload" "$d/media"
+          mkdir -p "$d/payload" "$d/media" dist-legal/${{ matrix.arch }}
           cp -R build/br-${{ matrix.arch }}/images/payload/${{ matrix.arch }}/. "$d/payload/"
           cp build/images/${{ matrix.arch }}/savior-${{ matrix.arch }}.img build/images/${{ matrix.arch }}/savior-${{ matrix.arch }}.iso "$d/media/"
           tar -C build/images/${{ matrix.arch }} -czf "$d/media/savior-${{ matrix.arch }}-netboot.tar.gz" netboot
+          mv build/images/${{ matrix.arch }}/savior-${{ matrix.arch }}-legal-info.tar build/images/${{ matrix.arch }}/host-packages.txt dist-legal/${{ matrix.arch }}/
       - uses: actions/upload-artifact@v4
         with:
           name: image-${{ matrix.arch }}
           path: dist/${{ matrix.arch }}/
           if-no-files-found: error
           retention-days: 30
+      # Separate: the e2e jobs need the images, not the sources.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: legal-${{ matrix.arch }}
+          path: dist-legal/${{ matrix.arch }}/
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
       - name: Upload logs
         if: failure()
         uses: actions/upload-artifact@v4
@@ -167,21 +197,109 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-  universal:
-    name: universal image
+  # The release media end to end (scripts/release-e2e.sh): a hive on the
+  # runner, `savior ctl node-config` for the stick as users do, then the
+  # node must join, run a job in the task sandbox (isolation probes of
+  # internal/runner's TestRealSandboxIsolation), draw the text it is sent
+  # (compared with `savior display render` pixel for pixel), and let root in
+  # with the ssh_key key; on x86_64 the stick also boots as a hive, which
+  # must keep its state on SAVIOR-DATA. Plus the ISOs the buildroot job does
+  # not boot.
+  e2e:
+    name: release e2e ${{ matrix.arch }}
     needs: buildroot
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, i686]
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # git describe: the version the images must report
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
       - name: Install host packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 ovmf ovmf-ia32 mtools jq python3 curl openssh-client
+      - name: Enable KVM when the runner has it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: dist/${{ matrix.arch }}
+      # The runner's hive, ctl and display renderer.
+      - name: make build-linux-amd64
+        run: make build-linux-amd64
+      - name: QEMU x86_64 (ISO, OVMF x64)
+        if: matrix.arch == 'x86_64'
+        run: sh scripts/qemu-smoke.sh --iso dist/x86_64/media/savior-x86_64.iso --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --expect media=/dev/sr --timeout 900 --log build/logs/x86_64-iso-uefi.log
+      - name: QEMU i686 (ISO, Pentium III)
+        if: matrix.arch == 'i686'
+        run: >-
+          sh scripts/qemu-smoke.sh --arch i686 --iso dist/i686/media/savior-i686.iso
+          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT $MEM256_EXPECT --expect arch=i686
+          --expect media=/dev/sr --timeout 1500 --log build/logs/i686-iso-pentium3.log
+      - name: End to end x86_64 (SeaBIOS; node, then hive role)
+        if: matrix.arch == 'x86_64'
+        run: >-
+          sh scripts/release-e2e.sh --image dist/x86_64/media/savior-x86_64.img --arch x86_64
+          --savior build/linux-amd64/savior --version "$(git describe --always --dirty)" --hive-role
+          --out build/logs/e2e -- --marker "$BOOT_MARKER" $BOOT_EXPECT
+      # TCG and a Pentium III: a 32-bit kernel without PAE or SSE2 runs a task.
+      - name: End to end i686 (Pentium III, no PAE, no SSE2, 256 MB)
+        if: matrix.arch == 'i686'
+        run: >-
+          sh scripts/release-e2e.sh --image dist/i686/media/savior-i686.img --arch i686
+          --cpu pentium3,-pae --mem 256 --accel tcg --timeout 1500
+          --savior build/linux-amd64/savior --version "$(git describe --always --dirty)"
+          --out build/logs/e2e -- --marker "$BOOT_MARKER" $BOOT_EXPECT
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-e2e-${{ matrix.arch }}
+          path: build/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  universal:
+    name: universal image
+    needs: buildroot
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      # deb-src: scripts/legal-info.sh host-sources fetches the source of
+      # the GRUB and iPXE packages whose files are on the media.
+      - name: Install host packages
+        run: |
+          sudo sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 ovmf ovmf-ia32 grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
-            mtools dosfstools xorriso cpio xz-utils ipxe
+            mtools dosfstools xorriso cpio xz-utils ipxe jq python3 curl openssh-client
+      - name: Enable KVM when the runner has it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
       - uses: actions/download-artifact@v4
         with:
           name: image-x86_64
@@ -190,6 +308,14 @@ jobs:
         with:
           name: image-i686
           path: dist/i686
+      - uses: actions/download-artifact@v4
+        with:
+          name: legal-x86_64
+          path: dist/legal-x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: legal-i686
+          path: dist/legal-i686
       - name: Verify payload checksums
         run: |
           (cd dist/x86_64/payload && sha256sum -c SHA256SUMS)
@@ -209,8 +335,34 @@ jobs:
       - name: QEMU universal (Pentium III -> i686 payload)
         run: >-
           sh scripts/qemu-smoke.sh --arch i686 --image build/images/savior-universal.img
-          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=i686
+          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT $MEM256_EXPECT --expect arch=i686
           --timeout 1500 --log build/logs/universal-pentium3.log
+      # The universal ISO: CD-only machines (many pre-2005 BIOSes) boot it.
+      - name: QEMU universal ISO (SeaBIOS, 64-bit CPU -> x86_64 payload)
+        run: sh scripts/qemu-smoke.sh --iso build/images/savior-universal.iso --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --expect media=/dev/sr --timeout 900 --log build/logs/universal-iso-bios.log
+      - name: QEMU universal ISO (OVMF x64)
+        run: sh scripts/qemu-smoke.sh --iso build/images/savior-universal.iso --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --expect media=/dev/sr --timeout 900 --log build/logs/universal-iso-uefi.log
+      - name: QEMU universal ISO (Pentium III -> i686 payload)
+        run: >-
+          sh scripts/qemu-smoke.sh --arch i686 --iso build/images/savior-universal.iso
+          --cpu pentium3,-pae --mem 256 --accel tcg --marker "$BOOT_MARKER" $BOOT_EXPECT $MEM256_EXPECT --expect arch=i686
+          --expect media=/dev/sr --timeout 1500 --log build/logs/universal-iso-pentium3.log
+      # The universal netboot tree from QEMU's TFTP server (the two-payload
+      # grub.cfg picks by cpuid -l over the network too).
+      - name: QEMU universal netboot (SeaBIOS PXE, core.0 -> x86_64 payload)
+        run: sh scripts/qemu-smoke.sh --netboot build/images/netboot --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --expect media=none --timeout 1500 --log build/logs/universal-netboot-bios.log
+      - name: QEMU universal netboot (OVMF x64, core.efi)
+        run: sh scripts/qemu-smoke.sh --netboot build/images/netboot --firmware uefi --marker "$BOOT_MARKER" $BOOT_EXPECT --expect arch=x86_64 --expect media=none --timeout 1500 --log build/logs/universal-netboot-uefi.log
+      # A netbooted Pentium III end to end: the settings (swarm key, hive,
+      # pin, ssh_key) ride on the kernel command line of a grub.cfg copy.
+      - name: make build-linux-amd64
+        run: make build-linux-amd64
+      - name: End to end universal netboot (Pentium III -> i686 payload)
+        run: >-
+          sh scripts/release-e2e.sh --netboot build/images/netboot --arch i686
+          --cpu pentium3,-pae --mem 256 --accel tcg --timeout 2400
+          --savior build/linux-amd64/savior --version "$(git describe --always --dirty)"
+          --out build/logs/e2e --name netboot-pentium3 -- --marker "$BOOT_MARKER" $BOOT_EXPECT --expect media=none
       - name: Collect release files
         run: |
           mkdir -p release
@@ -218,7 +370,13 @@ jobs:
           tar -C build/images -czf release/savior-universal-netboot.tar.gz netboot
           for a in x86_64 i686; do
             cp dist/$a/media/savior-$a.img dist/$a/media/savior-$a.iso dist/$a/media/savior-$a-netboot.tar.gz release/
+            # Licences and sources of everything Buildroot built (checked again).
+            sh scripts/legal-info.sh check dist/legal-$a/savior-$a-legal-info.tar
+            mv dist/legal-$a/savior-$a-legal-info.tar release/
           done
+          # GRUB and iPXE come from Ubuntu packages on the build runners.
+          sh scripts/legal-info.sh host-sources release/savior-host-sources.tar \
+            dist/legal-x86_64/host-packages.txt dist/legal-i686/host-packages.txt
           (cd release && sha256sum -- * >SHA256SUMS)
           cat release/SHA256SUMS >>"$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v4
@@ -239,7 +397,7 @@ jobs:
   release:
     name: GitHub release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: universal
+    needs: [universal, e2e]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:

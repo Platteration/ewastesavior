@@ -4,8 +4,10 @@
 # defconfigs' board scripts, install-firmware.sh, fetch-buildroot.sh (file://
 # mirror), post-fakeroot.sh, post-build.sh and post-image.sh (fake Buildroot
 # trees; skipped without mksquashfs), flash-usb.sh (fake sysfs, never
-# writes), qemu-smoke.sh with the images workflow's expectations (fake QEMU)
-# and S50sshd (in a chroot; only as root, with a static busybox).
+# writes), qemu-smoke.sh with the images workflow's expectations and the
+# options release-e2e.sh uses (fake QEMU and mcopy), legal-info.sh (fake
+# legal-info tree, fake dpkg-query and apt-get) and S50sshd (in a chroot;
+# only as root, with a static busybox).
 #
 # Usage: scripts/test-scripts.sh     (exit status 1 if any test fails)
 set -eu
@@ -148,11 +150,72 @@ echo e >"$FW/amdgpu/tahiti_mc.bin"
 echo f >"$FW/amdgpu/navi10_sos.bin"
 echo g >"$FW/rtl_nic/rtl8168d-1.fw"
 echo h >"$FW/rt2860.bin"
+mkdir -p "$FW/nvidia"
+echo i >"$FW/nvidia/gsp.bin"
+for l in LICENCE.iwlwifi_firmware LICENSE.radeon LICENSE.amdgpu LICENCE.nvidia GPL-2 GPL-3; do
+	echo "licence text of $l" >"$FW/$l"
+done
+# WHENCE as upstream writes it: a header, then sections between dashes.
 cat >"$FW/WHENCE" <<'EOF'
+linux-firmware: the header
+
+--------------------------------------------------------------------------
+
+Driver: iwlwifi - Intel Wireless Wifi
+
 File: intel/iwlwifi/iwlwifi-6000-4.ucode
 Link: iwlwifi-6000-4.ucode -> intel/iwlwifi/iwlwifi-6000-4.ucode
+
+Licence: Redistributable. See LICENCE.iwlwifi_firmware for details.
+
+--------------------------------------------------------------------------
+
+Driver: radeon - ATI Radeon
+
+File: radeon/R100_cp.bin
+File: "radeon/BONAIRE_ce.bin"
+File: radeon/RV710_uvd.bin
 Link: radeon/tahiti_mc.bin -> ../amdgpu/tahiti_mc.bin
+
+Licence: Redistributable. See LICENSE.radeon for details.
+
+--------------------------------------------------------------------------
+
+Driver: amdgpu - AMD Radeon
+
+File: amdgpu/tahiti_mc.bin
+File: amdgpu/navi10_sos.bin
+
+Licence: Redistributable. See LICENSE.amdgpu for details.
+
+--------------------------------------------------------------------------
+
+Driver: nouveau - NVIDIA
+
+File: nvidia/gsp.bin
+
+Licence: Redistributable. See LICENCE.nvidia for details.
+
+--------------------------------------------------------------------------
+
+Driver: r8169 - RealTek ethernet
+
+File: rtl_nic/rtl8168d-1.fw
+
+Licence:
+ * Copyright (c) Realtek Semiconductor Corporation
+ * Permission is hereby granted for the distribution of this firmware.
+
+--------------------------------------------------------------------------
+
+Driver: rt2800pci - Ralink
+
+File: rt2860.bin
 Link: rt3090.bin -> rt2860.bin
+
+Licence: GPLv2 or later (see GPL-2 and GPL-3).
+
+--------------------------------------------------------------------------
 EOF
 cat >"$T/fwlist" <<'EOF'
 iwlwifi-6000-4.ucode
@@ -176,6 +239,26 @@ if [ -f "$T/fwout/radeon/R100_cp.bin" ] && [ ! -e "$T/fwout/radeon/BONAIRE_ce.bi
 	ok "install-firmware: exclusions"
 else bad "install-firmware: exclusions"; fi
 if [ -L "$T/fwout/rt3090.bin" ]; then ok "install-firmware: links to installed files are created"; else bad "install-firmware: links to installed files are created"; fi
+miss=""
+for l in LICENCE.iwlwifi_firmware LICENSE.radeon LICENSE.amdgpu GPL-2 GPL-3; do
+	[ -f "$T/fwout/$l" ] || miss="$miss $l"
+done
+extra=""
+for l in LICENCE.nvidia nvidia/gsp.bin; do
+	[ ! -e "$T/fwout/$l" ] || extra="$extra $l"
+done
+if [ -z "$miss$extra" ]; then
+	ok "install-firmware: the licence files WHENCE names for the installed files (only those)"
+else bad "install-firmware: the licence files WHENCE names for the installed files (only those):${miss:+ missing$miss}${extra:+ unwanted$extra}"; fi
+# WHENCE: the header and the sections of installed files, verbatim (the
+# Realtek terms are only there), not the others.
+if [ -f "$T/fwout/WHENCE" ] && grep -q -x 'linux-firmware: the header' "$T/fwout/WHENCE" &&
+	grep -q -x 'File: intel/iwlwifi/iwlwifi-6000-4.ucode' "$T/fwout/WHENCE" &&
+	grep -q -F ' * Permission is hereby granted for the distribution of this firmware.' "$T/fwout/WHENCE" &&
+	grep -q -x 'Link: rt3090.bin -> rt2860.bin' "$T/fwout/WHENCE" &&
+	! grep -q nvidia "$T/fwout/WHENCE" && [ "$(grep -c -x -e '-\{74\}' "$T/fwout/WHENCE")" -eq 6 ]; then
+	ok "install-firmware: WHENCE keeps the header and the installed files' sections"
+else bad "install-firmware: WHENCE keeps the header and the installed files' sections"; sed 's/^/     | /' "$T/fwout/WHENCE" || true; fi
 printf 'nothing-matches-*.bin\n' >"$T/fwlist2"
 expect 1 "install-firmware: a required pattern without match fails" sh "$BOARD/install-firmware.sh" "$FW" "$T/fwout2" "$T/fwlist2"
 echo x >"$T/fwout/stray.bin"
@@ -184,6 +267,9 @@ expect 0 "install-firmware: prune" sh "$BOARD/install-firmware.sh" --prune "$T/f
 if [ ! -e "$T/fwout/stray.bin" ] && [ -f "$T/fwout/regulatory.db" ] && [ -f "$T/fwout/amdgpu/tahiti_mc.bin" ]; then
 	ok "install-firmware: prune keeps the allowlist and regulatory.db"
 else bad "install-firmware: prune keeps the allowlist and regulatory.db"; fi
+if [ -f "$T/fwout/WHENCE" ] && [ -f "$T/fwout/LICENCE.iwlwifi_firmware" ] && [ -f "$T/fwout/GPL-2" ] && [ -f "$T/fwout/LICENSE.radeon" ]; then
+	ok "install-firmware: prune keeps WHENCE and the licence files"
+else bad "install-firmware: prune keeps WHENCE and the licence files"; find "$T/fwout" | sed 's/^/     | /'; fi
 # The shipped list parses: every pattern compiles (pruning an empty directory).
 mkdir -p "$T/empty-fw"
 expect 0 "install-firmware: shipped firmware.list parses" \
@@ -282,6 +368,9 @@ if command -v mksquashfs >/dev/null 2>&1; then
 	echo 'kernel/e1000.ko:' >"$tg/lib/modules/6.12.40-savior/modules.dep"
 	echo fw >"$tg/lib/firmware/rtl_nic/rtl8168d-1.fw"
 	echo junk >"$tg/lib/firmware/junk/x.bin"
+	# What install-firmware.sh puts next to the blobs: WHENCE and a licence.
+	printf 'File: rtl_nic/rtl8168d-1.fw\nLicence: see LICENCE.rtl\n' >"$tg/lib/firmware/WHENCE"
+	echo 'licence text' >"$tg/lib/firmware/LICENCE.rtl"
 	elf 2 62 no "$B/bin/linux-amd64/savior"
 	printf 'build\tGOAMD64=v1\n' >>"$B/bin/linux-amd64/savior"
 	cp -pR "$B" "$T/br-bump" # pristine copy for the kernel-bump tests below
@@ -307,6 +396,9 @@ if command -v mksquashfs >/dev/null 2>&1; then
 			grep -q 'squashfs-root/firmware/rtl_nic/rtl8168d-1.fw' "$T/out" && ! grep -q junk "$T/out"; then
 			ok "post-build: modloop layout (modules/, firmware/, pruned)"
 		else bad "post-build: modloop layout (modules/, firmware/, pruned)"; sed 's/^/     | /' "$T/out"; fi
+		if grep -q -x 'squashfs-root/firmware/WHENCE' "$T/out" && grep -q -x 'squashfs-root/firmware/LICENCE.rtl' "$T/out"; then
+			ok "post-build: the firmware licences (WHENCE, LICENCE.*) survive the prune into the modloop"
+		else bad "post-build: the firmware licences (WHENCE, LICENCE.*) survive the prune into the modloop"; sed 's/^/     | /' "$T/out"; fi
 	fi
 	cp "$tg/lib/modloop.sqfs" "$T/modloop.1"
 	# A reinstalled dropbear package runs "ln -snf" onto the directory.
@@ -330,10 +422,17 @@ if command -v mksquashfs >/dev/null 2>&1; then
 	expect 0 "post-build: run after a partial firmware reinstall" pb SAVIOR_BIN_DIR="$B/bin/linux-amd64" sh "$BOARD/post-build.sh" "$tg" x86_64
 	if command -v unsquashfs >/dev/null 2>&1; then
 		unsquashfs -l "$tg/lib/modloop.sqfs" >"$T/out" 2>&1
-		if grep -q 'firmware/rtl_nic/rtl8168d-1.fw' "$T/out" && grep -q 'firmware/rtl_nic/rtl8168e-1.fw' "$T/out"; then
+		if grep -q 'firmware/rtl_nic/rtl8168d-1.fw' "$T/out" && grep -q 'firmware/rtl_nic/rtl8168e-1.fw' "$T/out" &&
+			grep -q 'firmware/WHENCE' "$T/out"; then
 			ok "post-build: firmware merged file by file"
 		else bad "post-build: firmware merged file by file"; sed 's/^/     | /' "$T/out"; fi
 	fi
+	# Firmware installed some other way, without its licences, fails.
+	mv "$B/build/savior-modloop/firmware/WHENCE" "$T/WHENCE.saved" 2>/dev/null || true
+	expect 1 "post-build: firmware without WHENCE (its licences) fails the build" \
+		pb SAVIOR_BIN_DIR="$B/bin/linux-amd64" sh "$BOARD/post-build.sh" "$tg" x86_64
+	contains "firmware without its licences" "post-build: says the licences are missing"
+	mv "$T/WHENCE.saved" "$B/build/savior-modloop/firmware/WHENCE" 2>/dev/null || true
 	elf 2 62 yes "$B/bin/linux-amd64/savior"
 	expect 1 "post-build: rejects a dynamic binary" pb SAVIOR_BIN_DIR="$B/bin/linux-amd64" sh "$BOARD/post-build.sh" "$tg" x86_64
 	elf 2 62 no "$B/bin/linux-amd64/savior"
@@ -508,11 +607,23 @@ else bad "flash-usb: --list shows real disks only"; sed 's/^/     | /' "$T/out";
 # --- qemu-smoke with the images workflow's expectations (fake QEMU) -----------------------
 # The fake writes the lines of $FAKE_SERIAL to QEMU's -serial file ("sleep N"
 # pauses, "exit" ends it), then idles like a VM that keeps running.
+# With $FAKE_ARGS set, it also writes its arguments there (one per line),
+# the size of a writable stick copy, and the grub.cfg of a TFTP root.
 cat >"$T/fake-qemu" <<'EOF'
 #!/bin/sh
 log=""
+[ -z "${FAKE_ARGS:-}" ] || : >"$FAKE_ARGS"
 while [ $# -gt 0 ]; do
-	case "$1" in -serial) log=${2#file:}; shift 2 ;; *) shift ;; esac
+	[ -z "${FAKE_ARGS:-}" ] || printf '%s\n' "$1" >>"$FAKE_ARGS"
+	case "$1" in
+	-serial) log=${2#file:} ;;
+	if=none,id=stick,format=raw,file=*) echo "stick-size $(wc -c <"${1#*,file=}")" >>"$FAKE_ARGS" ;;
+	user,*tftp=*)
+		t=${1#*tftp=}
+		cp "${t%%,*}/boot/grub/grub.cfg" "$FAKE_ARGS.grub"
+		;;
+	esac
+	shift
 done
 [ -n "$log" ] || exit 1
 while IFS= read -r line; do
@@ -557,6 +668,200 @@ expect 1 "qemu-smoke: the wrong payload (arch) fails" \
 contains "'arch=i686'" "qemu-smoke: names the missing string"
 expect 1 "qemu-smoke: no SAVIOR-AGENT line fails" smoke "$BL${NL}exit" --expect arch=i686
 contains "'agent=up'" "qemu-smoke: names agent=up"
+ML="$AL mem_avail=152 offer_mem=50"
+expect 0 "qemu-smoke --expect-min: values at or above the minimum pass" \
+	smoke "$BL${NL}$ML" --expect-min mem_avail=150 --expect-min offer_mem=50
+expect 1 "qemu-smoke --expect-min: a value below the minimum fails" \
+	smoke "$BL${NL}$ML" --expect-min mem_avail=160
+contains "mem_avail=152 is below the minimum 160" "qemu-smoke --expect-min: names the low value"
+expect 1 "qemu-smoke --expect-min: an unknown value (-) fails" \
+	smoke "$BL${NL}$AL mem_avail=- offer_mem=50" --expect-min mem_avail=100
+expect 1 "qemu-smoke --expect-min: a SAVIOR-AGENT line without the field fails" \
+	smoke "$BL${NL}$AL" --expect-min offer_mem=10
+expect 2 "qemu-smoke --expect-min: a malformed NAME=N is a usage error" \
+	smoke "$BL${NL}$ML" --expect-min mem_avail
+
+# The options scripts/release-e2e.sh uses. A fake mcopy records what goes
+# onto the stick copy's FAT partition (mtools is not needed here; the real
+# thing is exercised by release-e2e on the dev image).
+mkdir -p "$T/fakebin"
+cat >"$T/fakebin/mcopy" <<'EOF'
+#!/bin/sh
+# mcopy -o -i IMG@@OFFSET SRC ::/NAME
+echo "mcopy $3 $5" >>"$FAKE_MCOPY"
+cat "$4" >>"$FAKE_MCOPY"
+EOF
+chmod 0755 "$T/fakebin/mcopy"
+# A stick image whose MBR partition 1 starts at LBA 2048 (1 MiB).
+dd if=/dev/zero of="$T/stick.img" bs=512 count=4096 2>/dev/null
+printf '\000\010\000\000' | dd of="$T/stick.img" bs=1 seek=454 conv=notrunc 2>/dev/null
+printf 'swarm_key = 0123456789abcdef\nhive = 10.0.2.2:7700\n' >"$T/node.conf"
+mkdir -p "$T/nb/boot/grub/i386-pc" "$T/nb/boot/grub/i386-efi"
+printf 'set timeout=5\nset savior_cmdline="console=ttyS0 savior.media=none"\n' >"$T/nb/boot/grub/grub.cfg"
+: >"$T/nb/boot/grub/i386-pc/core.0"
+: >"$T/nb/boot/grub/i386-efi/core.efi"
+: >"$T/ovmf32-code.fd"
+: >"$T/ovmf32-vars.fd"
+GOOD="$BL${NL}sleep 1${NL}$AL"
+# smoke2 SERIAL-TEXT QEMU-SMOKE-ARGS...: like smoke, with the medium given.
+smoke2() {
+	printf '%s\n' "$1" >"$T/fake-serial"
+	shift
+	: >"$T/mcopy.log"
+	rm -f "$T/args" "$T/args.grub"
+	mkdir -p "$T/tmp"
+	env PATH="$T/fakebin:$PATH" TMPDIR="$T/tmp" QEMU="$T/fake-qemu" FAKE_SERIAL="$T/fake-serial" FAKE_ARGS="$T/args" \
+		FAKE_MCOPY="$T/mcopy.log" OVMF32_CODE="$T/ovmf32-code.fd" OVMF32_VARS="$T/ovmf32-vars.fd" \
+		sh "$HERE/qemu-smoke.sh" --arch i686 --accel tcg --timeout 20 --marker "$BOOT_MARKER" "$@"
+}
+# has_arg ARG: the fake QEMU got ARG.
+has_arg() { grep -q -x -F -- "$1" "$T/args"; }
+expect 0 "qemu-smoke --conf --append --grow: boots a private copy of the stick" \
+	smoke2 "$GOOD" --image "$T/stick.img" --conf "$T/node.conf" --append "savior_dumplog=1 savior.name=x" --grow 3
+if grep -q -x "mcopy $T/.*/stick.img@@1048576 ::/savior.conf" "$T/mcopy.log" && grep -q -x 'hive = 10.0.2.2:7700' "$T/mcopy.log"; then
+	ok "qemu-smoke --conf: savior.conf onto the copy's FAT partition, found through the MBR (offset 1 MiB)"
+else bad "qemu-smoke --conf: savior.conf onto the copy's FAT partition, found through the MBR (offset 1 MiB)"; sed 's/^/     | /' "$T/mcopy.log" || true; fi
+if grep -q -x "mcopy $T/.*/stick.img@@1048576 ::/boot-options.cfg" "$T/mcopy.log" &&
+	grep -q -F 'set savior_args="savior_dumplog=1 savior.name=x"' "$T/mcopy.log"; then
+	ok "qemu-smoke --append on a stick: /boot-options.cfg sets savior_args"
+else bad "qemu-smoke --append on a stick: /boot-options.cfg sets savior_args"; sed 's/^/     | /' "$T/mcopy.log" || true; fi
+if grep -q "^if=none,id=stick,format=raw,file=$T/.*/stick.img\$" "$T/args" && ! grep -q snapshot "$T/args" &&
+	grep -q -x "stick-size $((2097152 + 3 * 1048576))" "$T/args"; then
+	ok "qemu-smoke --grow: the copy (not a snapshot of the original) is 3 MiB larger"
+else bad "qemu-smoke --grow: the copy (not a snapshot of the original) is 3 MiB larger"; sed 's/^/     | /' "$T/args" || true; fi
+expect 0 "qemu-smoke --image alone still boots a snapshot of the original" smoke2 "$GOOD" --image "$T/stick.img"
+if has_arg "if=none,id=stick,format=raw,snapshot=on,file=$T/stick.img" && [ ! -s "$T/mcopy.log" ]; then
+	ok "qemu-smoke --image alone: snapshot=on, nothing written"
+else bad "qemu-smoke --image alone: snapshot=on, nothing written"; sed 's/^/     | /' "$T/args" || true; fi
+rm -f "$T/qemu.pid" "$T/mon"
+expect 0 "qemu-smoke --hostfwd --monitor --keep-running" smoke2 "$GOOD" --image "$T/stick.img" --log "$T/keep.serial" \
+	--hostfwd tcp:127.0.0.1:2222-:22 --hostfwd tcp:127.0.0.1:7777-:7700 --monitor "unix:$T/mon" --keep-running "$T/qemu.pid"
+if has_arg "user,id=n0,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:7777-:7700" && has_arg "unix:$T/mon,server,nowait" &&
+	[ "$(grep -c -x -e -monitor "$T/args")" -eq 1 ]; then
+	ok "qemu-smoke: host forwards on the user network, HMP monitor on the socket"
+else bad "qemu-smoke: host forwards on the user network, HMP monitor on the socket"; sed 's/^/     | /' "$T/args" || true; fi
+kpid=$(cat "$T/qemu.pid" 2>/dev/null || true)
+if [ -n "$kpid" ] && kill -0 "$kpid" 2>/dev/null; then
+	ok "qemu-smoke --keep-running: QEMU still runs after PASS, its PID in the file"
+	kill "$kpid" 2>/dev/null || true
+else bad "qemu-smoke --keep-running: QEMU still runs after PASS, its PID in the file (pid '$kpid')"; fi
+expect 2 "qemu-smoke --keep-running needs --log" smoke2 "$GOOD" --image "$T/stick.img" --keep-running "$T/qemu.pid"
+expect 1 "qemu-smoke --keep-running: a failed boot leaves nothing running" \
+	smoke2 "exit" --image "$T/stick.img" --log "$T/keep.serial" --keep-running "$T/qemu2.pid"
+if [ ! -e "$T/qemu2.pid" ]; then ok "qemu-smoke --keep-running: no PID file after a failure"; else bad "qemu-smoke --keep-running: no PID file after a failure"; fi
+expect 0 "qemu-smoke --netboot (BIOS): PXE from QEMU's TFTP server" \
+	smoke2 "$GOOD" --netboot "$T/nb" --append "savior.swarm_key=K1|x&y savior_dumplog=1"
+if grep -q "^user,id=n0,tftp=.*/tftp,bootfile=boot/grub/i386-pc/core.0\$" "$T/args" && has_arg "e1000,netdev=n0,bootindex=0"; then
+	ok "qemu-smoke --netboot: TFTP root and core.0, the NIC is the boot device"
+else bad "qemu-smoke --netboot: TFTP root and core.0, the NIC is the boot device"; sed 's/^/     | /' "$T/args" || true; fi
+if grep -q -x -F 'set savior_cmdline="savior.swarm_key=K1|x&y savior_dumplog=1 console=ttyS0 savior.media=none"' "$T/args.grub" 2>/dev/null &&
+	grep -q -x -F 'set savior_cmdline="console=ttyS0 savior.media=none"' "$T/nb/boot/grub/grub.cfg"; then
+	ok "qemu-smoke --netboot --append: a copy of grub.cfg gets the arguments, the tree is untouched"
+else bad "qemu-smoke --netboot --append: a copy of grub.cfg gets the arguments, the tree is untouched"; sed 's/^/     | /' "$T/args.grub" || true; fi
+expect 0 "qemu-smoke --netboot --firmware uefi32" smoke2 "$GOOD" --netboot "$T/nb" --firmware uefi32
+if grep -q "^user,id=n0,tftp=.*/tftp,bootfile=boot/grub/i386-efi/core.efi\$" "$T/args"; then
+	ok "qemu-smoke --netboot: the bootfile follows --firmware (i386-efi/core.efi)"
+else bad "qemu-smoke --netboot: the bootfile follows --firmware (i386-efi/core.efi)"; sed 's/^/     | /' "$T/args" || true; fi
+expect 2 "qemu-smoke: --conf needs --image" smoke2 "$GOOD" --iso "$T/stick.img" --conf "$T/node.conf"
+# shellcheck disable=SC2016 # a literal $ for GRUB
+expect 2 "qemu-smoke: --append refuses characters GRUB expands" smoke2 "$GOOD" --image "$T/stick.img" --append 'savior.name=$x'
+expect 2 "qemu-smoke: --hostfwd refuses a ',' (netdev option injection)" smoke2 "$GOOD" --image "$T/stick.img" --hostfwd 'tcp::1-:22,smb=/'
+expect 2 "qemu-smoke: --netboot needs a netboot tree" smoke2 "$GOOD" --netboot "$T/fakebin"
+expect 2 "qemu-smoke: --bootfile stays inside the tree" smoke2 "$GOOD" --netboot "$T/nb" --bootfile ../../etc/passwd
+expect 2 "qemu-smoke: --netboot needs the network" smoke2 "$GOOD" --netboot "$T/nb" --no-net
+
+# Every option the images workflow passes to qemu-smoke.sh, release-e2e.sh
+# (before its "--"; qemu-smoke options after it) and legal-info.sh exists.
+awk '
+/^      - (name|uses):/ || /^  [a-z]/ { if (blk != "") print blk; blk = ""; inrun = 0; next }
+/^        run: / { inrun = 1; blk = substr($0, 14); next }
+inrun && /^          / { blk = blk " " $0 }
+END { if (blk != "") print blk }' "$ROOT/.github/workflows/images.yml" >"$T/steps"
+# opts_ok SCRIPT TEXT: every --option in TEXT is in SCRIPT's usage.
+opts_ok() {
+	# (Options inside $(...), e.g. git describe --always, are not the script's.)
+	# shellcheck disable=SC2016 # a literal $( in the sed pattern
+	for o in $(printf '%s\n' "$2" | sed 's/\$([^)]*)//g' | grep -o -e '--[a-z][a-z0-9-]*' | sort -u); do
+		grep -q -e "^#   $o\( \|\$\)" "$HERE/$1" || { echo "$1 has no $o"; return 1; }
+	done
+}
+wf_bad=""
+nsteps=0
+while IFS= read -r step; do
+	case "$step" in
+	*scripts/release-e2e.sh*)
+		nsteps=$((nsteps + 1))
+		r=${step#*scripts/release-e2e.sh}
+		opts_ok release-e2e.sh "${r%% -- *}" >>"$T/wf.err" || wf_bad="$wf_bad release-e2e"
+		case "$r" in *" -- "*) opts_ok qemu-smoke.sh "${r#* -- }" >>"$T/wf.err" || wf_bad="$wf_bad release-e2e/qemu-smoke" ;; esac
+		;;
+	*scripts/qemu-smoke.sh*)
+		nsteps=$((nsteps + 1))
+		opts_ok qemu-smoke.sh "${step#*scripts/qemu-smoke.sh}" >>"$T/wf.err" || wf_bad="$wf_bad qemu-smoke"
+		;;
+	esac
+done <"$T/steps"
+opts_ok qemu-smoke.sh "$BOOT_EXPECT" >>"$T/wf.err" || wf_bad="$wf_bad BOOT_EXPECT"
+if [ -z "$wf_bad" ] && [ "$nsteps" -ge 19 ]; then
+	ok "images.yml: the $nsteps qemu-smoke/release-e2e steps use only options the scripts have"
+else bad "images.yml: the $nsteps qemu-smoke/release-e2e steps use only options the scripts have:$wf_bad"; sed 's/^/     | /' "$T/wf.err"; fi
+
+# --- legal-info (release licences and sources) ---------------------------------------
+LB="$T/br-legal"
+mkdir -p "$LB/legal-info/licenses/linux-6.12.40" "$LB/legal-info/licenses/busybox-1.37.0" \
+	"$LB/legal-info/sources/linux-6.12.40" "$LB/legal-info/sources/busybox-1.37.0"
+echo 'PACKAGE,VERSION,LICENSE' >"$LB/legal-info/manifest.csv"
+echo GPL-2.0 >"$LB/legal-info/licenses/linux-6.12.40/COPYING"
+echo GPL-2.0 >"$LB/legal-info/licenses/busybox-1.37.0/LICENSE"
+echo src >"$LB/legal-info/sources/linux-6.12.40/linux-6.12.40.tar.xz"
+echo src >"$LB/legal-info/sources/busybox-1.37.0/busybox-1.37.0.tar.bz2"
+echo 'CONFIG_X86=y' >"$T/kernel.config"
+expect 0 "legal-info pack: Buildroot's legal-info plus the kernel config" \
+	sh "$HERE/legal-info.sh" pack "$LB" "$T/legal/savior-x86_64-legal-info.tar" --add "kernel.config=$T/kernel.config"
+if tar -tf "$T/legal/savior-x86_64-legal-info.tar" | grep -q -x 'legal-info/savior/kernel.config' &&
+	tar -tf "$T/legal/savior-x86_64-legal-info.tar" | grep -q -x 'legal-info/sources/linux-6.12.40/linux-6.12.40.tar.xz'; then
+	ok "legal-info pack: the archive has the sources and legal-info/savior/kernel.config"
+else bad "legal-info pack: the archive has the sources and legal-info/savior/kernel.config"; fi
+expect 0 "legal-info check: a complete archive" sh "$HERE/legal-info.sh" check "$T/legal/savior-x86_64-legal-info.tar"
+rm -rf "$LB/legal-info/sources/busybox-1.37.0"
+expect 1 "legal-info pack: fails without BusyBox's source" sh "$HERE/legal-info.sh" pack "$LB" "$T/legal/bad.tar"
+contains "sources/busybox-*" "legal-info: names what is missing"
+echo 'not a tar' >"$T/legal/junk.tar"
+expect 1 "legal-info check: not an archive" sh "$HERE/legal-info.sh" check "$T/legal/junk.tar"
+# host-sources with fake dpkg-query and apt-get.
+cat >"$T/fakebin/dpkg-query" <<'EOF'
+#!/bin/sh
+shift 2
+for p in "$@"; do
+	case "$p" in
+	grub-efi-amd64-bin) echo "$p 2.12-1ubuntu7.3 grub2-unsigned 2.12-1ubuntu7.3" ;;
+	ipxe) echo "$p 1.21.1-0ubuntu2 ipxe 1.21.1-0ubuntu2" ;;
+	*) echo "$p 2.12-1ubuntu7.3 grub2 2.12-1ubuntu7.3" ;;
+	esac
+done
+EOF
+cat >"$T/fakebin/apt-get" <<'EOF'
+#!/bin/sh
+# apt-get source --download-only -qq SRC=VER
+v=$4
+[ "$v" != "${FAKE_APT_FAIL:-}" ] || { echo "E: Can not find version '${v#*=}' of package '${v%%=*}'"; exit 100; }
+echo dsc >"${v%%=*}_${v#*=}.dsc"
+echo orig >"${v%%=*}_${v#*=}.orig.tar.xz"
+EOF
+chmod 0755 "$T/fakebin/dpkg-query" "$T/fakebin/apt-get"
+printf 'grub-pc-bin 2.12-1ubuntu7 grub2 2.12-1ubuntu7
+' >"$T/legal/other-job.txt"
+expect 0 "legal-info host-sources: GRUB and iPXE sources of every build job's versions" \
+	env PATH="$T/fakebin:$PATH" sh "$HERE/legal-info.sh" host-sources "$T/legal/savior-host-sources.tar" "$T/legal/other-job.txt"
+tar -tf "$T/legal/savior-host-sources.tar" >"$T/out" 2>&1 || true
+if grep -q -x 'host-sources/grub2_2.12-1ubuntu7.3.dsc' "$T/out" && grep -q -x 'host-sources/grub2_2.12-1ubuntu7.dsc' "$T/out" &&
+	grep -q -x 'host-sources/grub2-unsigned_2.12-1ubuntu7.3.dsc' "$T/out" && grep -q -x 'host-sources/ipxe_1.21.1-0ubuntu2.dsc' "$T/out" &&
+	grep -q -x 'host-sources/host-packages.txt' "$T/out" && grep -q -x 'host-sources/host-packages-1.txt' "$T/out"; then
+	ok "legal-info host-sources: each source version once, with the manifests"
+else bad "legal-info host-sources: each source version once, with the manifests"; sed 's/^/     | /' "$T/out"; fi
+expect 1 "legal-info host-sources: a version the archive lacks fails" \
+	env PATH="$T/fakebin:$PATH" FAKE_APT_FAIL=grub2=2.12-1ubuntu7 sh "$HERE/legal-info.sh" host-sources "$T/legal/x.tar" "$T/legal/other-job.txt"
+contains "cannot download the source of grub2 2.12-1ubuntu7" "legal-info host-sources: names the package"
 
 # --- S50sshd in a chroot: Buildroot's dangling /etc/dropbear link ------------------------
 BB=$(command -v busybox 2>/dev/null || true)
