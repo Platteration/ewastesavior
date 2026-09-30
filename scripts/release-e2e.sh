@@ -140,13 +140,28 @@ LOG=$OUT/$NAME.log
 W=$(mktemp -d "${TMPDIR:-/tmp}/release-e2e.XXXXXX")
 HIVE_PID=""
 # shellcheck disable=SC2317 # called by the EXIT trap
+# The exit status stays the tests' result: nothing here may fail the run.
 cleanup() {
+	rc=$?
+	set +e
 	for f in "$W"/*.qpid; do
 		[ -f "$f" ] || continue
-		kill "$(cat "$f")" 2>/dev/null || true
+		kill "$(cat "$f")" 2>/dev/null
 	done
-	[ -z "$HIVE_PID" ] || kill "$HIVE_PID" 2>/dev/null || true
-	rm -rf "$W"
+	if [ -n "$HIVE_PID" ]; then
+		# Wait for the hive: it writes its state while it shuts down, and
+		# removing $W under it fails ("Directory not empty").
+		kill "$HIVE_PID" 2>/dev/null
+		n=0
+		while kill -0 "$HIVE_PID" 2>/dev/null && [ "$n" -lt 20 ]; do
+			sleep 0.5
+			n=$((n + 1))
+		done
+		kill -9 "$HIVE_PID" 2>/dev/null
+		wait "$HIVE_PID" 2>/dev/null
+	fi
+	rm -rf "$W" 2>/dev/null || { sleep 1; rm -rf "$W" 2>/dev/null; }
+	exit "$rc"
 }
 trap cleanup EXIT
 trap 'exit 1' INT TERM

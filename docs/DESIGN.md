@@ -1070,7 +1070,10 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
   | i686 | ≤ 24 MiB | ≤ 48 MiB |
   | x86_64 | ≤ 32 MiB | ≤ 64 MiB |
 
-  Target: MemAvailable ≥ 150 MB at idle with the display role on a 256 MB machine.
+  Target: MemAvailable ≥ 150 MB at idle with the display role on a 256 MB
+  machine, and at least 50 MB offered for tasks; the release CI fails below
+  either (`MEM256_EXPECT`). The i686 release images measure 176-179 MB and
+  75-79 MB on a 256 MB Pentium III (stick, ISO and netboot).
 * Firmware allowlist: Intel NIC and Wi-Fi (iwlwifi older generations), Realtek
   NIC (`rtl_nic`), Atheros (ar9170, ar3k), Ralink (rt2x00), radeon (R100–SI).
   No amdgpu, no nvidia GSP. ipw2x00 and b43 are "bring your own firmware" via

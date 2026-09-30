@@ -157,9 +157,9 @@ command that isn't found exits with 127, and one that can't run on the
 machine exits with 126. Both count as a failed attempt. Small machines offer
 little memory, and task scratch is in RAM, so a task's `--mem` plus `--disk`
 must fit what the node offers (`savior ctl node <id> --json`,
-`status.total.mem_mb`). A 256 MB machine with a screen offers a few tens of
-MB (about 50 MB at the DESIGN 13.2 target): use tasks like
-`--mem 32 --disk 16`; the defaults (128 MB + 64 MB) never fit there.
+`status.total.mem_mb`). A 256 MB machine with a screen offers about 75 MB:
+use tasks like `--mem 48 --disk 16`; the defaults (128 MB + 64 MB) never fit
+there.
 
 **Retries:** failed tasks are retried (`--retries`, default 1). If a machine
 disappears or is unplugged, or a laptop's battery runs low, its tasks move to

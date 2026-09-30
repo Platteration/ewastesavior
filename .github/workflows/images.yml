@@ -47,10 +47,9 @@ env:
   BOOT_EXPECT: --expect node=yes --expect fb=yes --expect net=10.0.2. --expect agent=up --fail net=none --fail ver=unknown --fail SIGILL
   # On the 256 MB Pentium III boots: MemAvailable (MiB) at idle with the
   # display role, and the memory offered for tasks, from boot-report's
-  # SAVIOR-AGENT line. The floor is the dev image's measurement (DESIGN's
-  # target for these images is 150 / about 50); raise it once the release
-  # images' numbers are known.
-  MEM256_EXPECT: --expect-min mem_avail=100 --expect-min offer_mem=24
+  # SAVIOR-AGENT line. The floor is DESIGN 13.2's target; the release images
+  # measured 176-179 and 75-79 (i686 stick, ISO and netboot, 2026-09-30).
+  MEM256_EXPECT: --expect-min mem_avail=150 --expect-min offer_mem=50
 
 jobs:
   buildroot:
