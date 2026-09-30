@@ -10,8 +10,10 @@
 #                  and BusyBox modprobe finds realtek for a Realtek PHY),
 #                  radeon has all its firmware, and the CA bundle is
 #                  Mozilla's set (not the build host's)
-#   boot-bios      USB stick (usb-storage on EHCI), SeaBIOS
-#   boot-uefi      USB stick, OVMF (x86_64 UEFI)
+#   boot-bios      USB stick (usb-storage on EHCI), SeaBIOS; the stick sets
+#                  ssh_key: root logs in over SSH with that key (dropbear,
+#                  port 22 forwarded), another key is refused
+#   boot-uefi      USB stick, OVMF (x86_64 UEFI), the same SSH checks
 #   boot-iso-bios  the ISO as an IDE CD-ROM, SeaBIOS (config from the CD)
 #   boot-iso-uefi  the ISO as a CD-ROM, OVMF, plus a plain FAT stick with
 #                  savior.conf (a CD-booted machine takes that config)
@@ -20,12 +22,33 @@
 #   screen         boot, then screendump through the QEMU monitor (PPM)
 #   baked-conf     mkimage --conf: the config baked into savior-conf.cpio
 #                  (second initrd) is used when the stick has no savior.conf
+#   mem-256        the stick on a 256 MB machine with a screen (roles auto:
+#                  compute + display): MemAvailable at idle and the memory
+#                  the agent offers for tasks (boot-report's mem_avail= and
+#                  offer_mem=) must reach MEM256_MIN_AVAIL and
+#                  MEM256_MIN_OFFER (environment; defaults 100 and 24 MB for
+#                  the dev image, which measures 111-113 and 30-32)
+#   wifi-conf      no VM: write_wpa_conf from S30network, run with the
+#                  image's BusyBox: hex SSID, the hashed PSK (checked
+#                  against PBKDF2), the quoted fallback without
+#                  wpa_passphrase and its refusal of '"', open networks,
+#                  country, mode 0600 (needs wpa_passphrase and python3)
+#   wifi           Wi-Fi join with mac80211_hwsim: an access point (hostapd
+#                  + udhcpd from this host, in its own network namespace on
+#                  the second simulated radio) and the node on the first,
+#                  WPA2 with an SSID and passphrase full of quotes, then an
+#                  open network; the node must get a DHCP lease over the
+#                  air (needs hostapd, wpa_supplicant, iw on this host)
 #   swarm          hive + 2 compute nodes + 1 display node on a private
 #                  multicast LAN, driven with `savior ctl` from this host:
 #                  job with count=4 and outputs (the tasks must see the CA
-#                  bundle), display black then text (compared pixel for
-#                  pixel with savior display render), identify, duplicate
-#                  node ID
+#                  bundle and the sandbox must hold: task uid, no
+#                  /proc/cmdline, /run, /media or /sys, unshare and mount
+#                  fail, a seccomp filter), display black then text
+#                  (compared pixel for pixel with savior display render),
+#                  identify, a reboot of the hive (its state on SAVIOR-DATA,
+#                  certificate, jobs, outputs, names and SSH host key must
+#                  survive), duplicate node ID
 #   hive-pxe       a hive with netboot = yes PXE-boots diskless VMs (BIOS,
 #                  then UEFI) on a private LAN (S65netboot: dnsmasq DHCP +
 #                  TFTP, kernels over HTTP); each node joins keyless, is
@@ -64,6 +87,7 @@
 #                net=10.0.2.15 console=yes node=yes ver=.. t=...
 # and, once savior node has kept running for 10 s (or has not):
 #   SAVIOR-AGENT: up=.. agent=up age=.. starts=1 arch=x86_64 ver=..
+#                 mem_avail=.. offer_mem=..
 # savior node's own log (stderr) also goes to the serial console, so the
 # harness sees every start ('savior node starting') and crash.
 
@@ -81,7 +105,9 @@ EXPECT_DISPLAY=no
 BOOT_TIMEOUT=300
 MEM=512
 TESTS=""
-ALL_TESTS="image boot-bios boot-uefi boot-iso-bios boot-iso-uefi pxe-bios pxe-uefi screen baked-conf"
+ALL_TESTS="image boot-bios boot-uefi boot-iso-bios boot-iso-uefi pxe-bios pxe-uefi screen baked-conf mem-256 wifi-conf wifi"
+MEM256_MIN_AVAIL=${MEM256_MIN_AVAIL:-100}
+MEM256_MIN_OFFER=${MEM256_MIN_OFFER:-24}
 
 usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
 while [ $# -gt 0 ]; do
@@ -97,7 +123,9 @@ while [ $# -gt 0 ]; do
 	*) TESTS="$TESTS $1"; shift ;;
 	esac
 done
-case "$BOOT_TIMEOUT$MEM" in *[!0-9]*) echo "qemu-test: --timeout and --mem take numbers" >&2; exit 2 ;; esac
+case "$BOOT_TIMEOUT$MEM$MEM256_MIN_AVAIL$MEM256_MIN_OFFER" in
+*[!0-9]*) echo "qemu-test: --timeout, --mem, MEM256_MIN_AVAIL and MEM256_MIN_OFFER take numbers" >&2; exit 2 ;;
+esac
 [ -n "$TESTS" ] || { usage >&2; exit 2; }
 expanded=""
 for t in $TESTS; do
@@ -106,7 +134,8 @@ for t in $TESTS; do
 		expanded="$expanded $ALL_TESTS"
 		[ "$SWARM" = no ] || expanded="$expanded swarm hive-pxe hive-pxe-proxy"
 		;;
-	image | boot-bios | boot-uefi | boot-iso-bios | boot-iso-uefi | pxe-bios | pxe-uefi | screen | baked-conf | swarm | hive-pxe | hive-pxe-proxy)
+	image | boot-bios | boot-uefi | boot-iso-bios | boot-iso-uefi | pxe-bios | pxe-uefi | screen | baked-conf | \
+		mem-256 | wifi-conf | wifi | swarm | hive-pxe | hive-pxe-proxy)
 		expanded="$expanded $t"
 		;;
 	*) echo "qemu-test: unknown test $t" >&2; exit 2 ;;
@@ -318,6 +347,7 @@ check_agent() {
 	fi
 	_bl=$BOOTLINE
 	BOOTLINE=$(grep -a 'SAVIOR-AGENT: ' "$1" | tail -n 1 | tr -d '\r')
+	AGENTLINE=$BOOTLINE
 	info "$BOOTLINE"
 	check_report agent=up starts=1 arch=x86_64
 	_v=$(field ver)
@@ -521,6 +551,70 @@ need_ovmf() {
 
 usb_stick_args() { echo "-drive if=none,id=stick,format=raw,file=$1 -device usb-ehci,id=ehci -device usb-storage,bus=ehci.0,drive=stick${2:+,bootindex=$2}"; }
 
+# rand_port: a TCP port on this host for a hostfwd, 20000-39999 (the hive
+# API ports are 40000-59999).
+rand_port() { echo $((20000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000)); }
+
+# ---------------------------------------------------------------------------
+# SSH (ssh_key, S50sshd, dropbear)
+
+# ssh_keys: two ed25519 key pairs, $W/id (goes into ssh_key) and
+# $W/id-other (must be refused); 1 without OpenSSH's client.
+ssh_keys() {
+	[ -s "$W/id.pub" ] && [ -s "$W/id-other.pub" ] && return 0
+	if ! command -v ssh >/dev/null 2>&1 || ! command -v ssh-keygen >/dev/null 2>&1; then
+		fail "the SSH checks need ssh and ssh-keygen (apt install openssh-client)"
+		return 1
+	fi
+	rm -f "$W/id" "$W/id.pub" "$W/id-other" "$W/id-other.pub"
+	ssh-keygen -q -t ed25519 -N '' -C qemu-test -f "$W/id" >>"$TLOG" 2>&1 &&
+		ssh-keygen -q -t ed25519 -N '' -C not-authorized -f "$W/id-other" >>"$TLOG" 2>&1 &&
+		return 0
+	fail "ssh-keygen failed"
+	return 1
+}
+
+# ssh_to PORT KEY COMMAND: run COMMAND as root on 127.0.0.1:PORT (a
+# hostfwd to a guest's port 22) with only KEY, no agent, no password
+# prompt; stdout and stderr in $W/ssh.out and $W/ssh.err.
+ssh_to() {
+	ssh -p "$1" -i "$2" -F /dev/null -o BatchMode=yes -o IdentitiesOnly=yes -o IdentityAgent=none \
+		-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=20 \
+		-o LogLevel=ERROR "root@127.0.0.1" "$3" </dev/null >"$W/ssh.out" 2>"$W/ssh.err"
+}
+
+# check_ssh PORT: within 120 s, root logs in with $W/id (the stick's
+# ssh_key) and `id -u` says 0; $W/id-other is refused, and the server
+# offers no method but publickey.
+check_ssh() {
+	t0=$(date +%s)
+	ok=no
+	while [ $(($(date +%s) - t0)) -lt 120 ]; do
+		if ssh_to "$1" "$W/id" 'id -u; cat /etc/savior-release' && [ "$(head -n 1 "$W/ssh.out")" = 0 ]; then
+			ok=yes
+			break
+		fi
+		sleep 5
+	done
+	sed 's/^/    ssh> /' "$W/ssh.out" "$W/ssh.err" >>"$TLOG"
+	if [ "$ok" = yes ]; then
+		pass "root logs in over SSH with the ssh_key key after $(($(date +%s) - t0)) s ($(sed -n 2p "$W/ssh.out"))"
+	else
+		fail "no root login over SSH with the ssh_key key within 120 s: $(tail -n 2 "$W/ssh.err" | tr '\n' ' ')"
+		return 1
+	fi
+	ssh_to "$1" "$W/id-other" 'id -u'
+	_rc=$?
+	sed 's/^/    ssh(other key)> /' "$W/ssh.out" "$W/ssh.err" >>"$TLOG"
+	check "a key that is not in ssh_key is refused, and only publickey is offered (exit $_rc: $(tr '\n' ' ' <"$W/ssh.err"))" \
+		grep -q 'Permission denied (publickey)' "$W/ssh.err"
+}
+
+# host_key PORT: the SSH server's ed25519 host key on 127.0.0.1:PORT.
+host_key() {
+	ssh-keyscan -p "$1" -t ed25519 -T 20 127.0.0.1 2>/dev/null | awk '$2 == "ssh-ed25519" { print $3; exit }'
+}
+
 # ---------------------------------------------------------------------------
 # Tests
 
@@ -628,18 +722,23 @@ t_image() {
 	check "none of the build host's $local_n local CAs is in the image's CA bundle ($leaked are)" [ "$leaked" -eq 0 ]
 }
 
-# boot_stick TEST FIRMWARE: boot a copy of savior.img with a test swarm key.
+# boot_stick TEST FIRMWARE: boot a copy of savior.img with a test swarm key
+# and a test ssh_key (the guest's port 22 is forwarded to SSH_PORT).
 boot_stick() {
 	need_file "$MEDIA/savior.img" || return
 	fw=$2
 	[ "$fw" = bios ] || need_ovmf || return
+	ssh_keys || return
 	img=$W/$1.img
 	stick_copy "$img"
-	stick_conf "$img@@$MT_OFF" "swarm_key = $KEY" || { fail "cannot edit savior.conf on the stick copy"; return; }
+	stick_conf "$img@@$MT_OFF" "swarm_key = $KEY" "ssh_key = $(cat "$W/id.pub")" ||
+		{ fail "cannot edit savior.conf on the stick copy"; return; }
 	boot_options "$img@@$MT_OFF"
 	serial=$LOGS/$1.serial
+	SSH_PORT=$(rand_port)
 	# shellcheck disable=SC2046 # word-split the device arguments
-	set -- -m "$MEM" -smp 1 -vga std -netdev user,id=n0 -device e1000,netdev=n0 $(usb_stick_args "$img" 0)
+	set -- -m "$MEM" -smp 1 -vga std -netdev "user,id=n0,hostfwd=tcp:127.0.0.1:$SSH_PORT-:22" -device e1000,netdev=n0 \
+		$(usb_stick_args "$img" 0)
 	[ "$fw" = bios ] || set -- -bios "$OVMF" "$@"
 	vm "$CUR" "$serial" "$@"
 	wait_boot "$serial" "$VM_PID" || return
@@ -654,6 +753,7 @@ boot_stick() {
 	fi
 	check "/boot-options.cfg sourced by GRUB (boot log dumped)" wait_for "$serial" 'SAVIOR-LOG: ' 30 "$VM_PID"
 	check_respawn "$serial" "$VM_PID"
+	check_ssh "$SSH_PORT"
 }
 
 t_boot_bios() { boot_stick boot-bios bios; }
@@ -691,6 +791,320 @@ t_baked_conf() {
 	check_agent "$serial" "$VM_PID"
 }
 t_boot_uefi() { boot_stick boot-uefi uefi; }
+
+# num_ge A B: A is a whole number >= B.
+num_ge() {
+	case "$1" in '' | *[!0-9]*) return 1 ;; esac
+	[ "$1" -ge "$2" ]
+}
+
+# mem-256: DESIGN 13.2's smallest machine, 256 MB, with a screen (roles =
+# auto: compute and display). boot-report's SAVIOR-AGENT line says how much
+# memory is available at idle with every role running (mem_avail) and how
+# much the agent offers for tasks (offer_mem, DESIGN 10.3: MemAvailable at
+# start minus 48 MB for the agent, the framebuffers and the frame cache,
+# times max_mem_percent). A task fits when its mem_mb + disk_mb (scratch in
+# RAM) is at most offer_mem. DESIGN's target for the production image is
+# MemAvailable >= 150 MB, which offers about 50 MB (a --mem 32 --disk 16
+# task). The dev image is heavier: the Ubuntu kernel leaves MemTotal at
+# 207 MiB of 256, and its initramfs keeps 37 MiB in RAM; it measures
+# mem_avail 111-113 and offer_mem 30-32. The defaults of MEM256_MIN_AVAIL
+# and MEM256_MIN_OFFER sit about 10 MB below that, so a regression that
+# eats memory at idle, or a node that offers nothing, fails.
+t_mem_256() {
+	need_file "$MEDIA/savior.img" || return
+	img=$W/mem-256.img
+	stick_copy "$img"
+	stick_conf "$img@@$MT_OFF" "swarm_key = $KEY" || { fail "cannot edit savior.conf on the stick copy"; return; }
+	boot_options "$img@@$MT_OFF"
+	serial=$LOGS/$CUR.serial
+	# shellcheck disable=SC2046
+	vm "$CUR" "$serial" -m 256 -smp 1 -vga std -netdev user,id=n0 -device e1000,netdev=n0 $(usb_stick_args "$img" 0)
+	wait_boot "$serial" "$VM_PID" || return
+	check_report cfg=yes key=yes fb=yes node=yes
+	AGENTLINE=""
+	check_agent "$serial" "$VM_PID" || return
+	_bl=$BOOTLINE
+	BOOTLINE=$AGENTLINE
+	avail=$(field mem_avail)
+	offer=$(field offer_mem)
+	BOOTLINE=$_bl
+	# savior node logs roles="[compute display]" when it starts.
+	roles=$(grep -a 'msg="savior node starting"' "$serial" | head -n 1 | grep -o 'roles="[^"]*"')
+	check "the display role runs (fb=yes, roles = auto): ${roles:-no roles= in the agent log}" \
+		eval 'printf "%s\n" "$roles" | grep -q -E "roles=\"\\[([a-z]+ )*display[] ]"'
+	check "MemAvailable at idle with the display role >= $MEM256_MIN_AVAIL MB on a 256 MB machine (mem_avail=${avail:-?})" \
+		num_ge "$avail" "$MEM256_MIN_AVAIL"
+	check "the agent offers >= $MEM256_MIN_OFFER MB for tasks: mem_mb + disk_mb up to that fit (offer_mem=${offer:-?})" \
+		num_ge "$offer" "$MEM256_MIN_OFFER"
+}
+
+# ---------------------------------------------------------------------------
+# Wi-Fi
+
+# WIFI_SSID, WIFI_PSK: an SSID with quotes, spaces and a non-ASCII letter,
+# longer than the 16 bytes od prints per line, and a passphrase with every
+# character a shell or a config file could mangle. The quote in the
+# passphrase rules out S30network's quoted fallback: only a correctly
+# hashed psk= (wpa_passphrase) can join.
+WIFI_SSID='Lab "5" Ü, 2nd floor'
+WIFI_PSK='a"b$c\d e`x`'"'"'f'
+
+# host_prog NAME: the host's NAME, also in the sbin directories.
+host_prog() {
+	for _d in /usr/sbin /usr/bin /sbin /bin; do
+		[ -x "$_d/$1" ] && { echo "$_d/$1"; return 0; }
+	done
+	command -v "$1" 2>/dev/null
+}
+
+# wifi-conf: write_wpa_conf, cut out of the real S30network and run by the
+# image's own BusyBox (sh, od, tr, sed, chmod, mv) with log and have
+# stubbed. With this host's wpa_passphrase the psk= must be
+# PBKDF2-HMAC-SHA1(passphrase, SSID, 4096, 32), the WPA2 PSK (IEEE
+# 802.11i), computed here with python3.
+t_wifi_conf() {
+	need_file "$OUT/initrd" || return
+	command -v python3 >/dev/null 2>&1 || { fail "this test needs python3"; return; }
+	wpp=$(host_prog wpa_passphrase)
+	[ -n "$wpp" ] || { fail "this test needs wpa_passphrase (apt install wpasupplicant)"; return; }
+	x=$W/wifi-conf
+	rm -rf "$x"
+	mkdir -p "$x/root" "$x/bin" "$x/wpp"
+	(cd "$x/root" && xz -dc "$OUT/initrd" | cpio -id --quiet bin/busybox) 2>>"$TLOG"
+	bb=$x/root/bin/busybox
+	[ -x "$bb" ] || { fail "no /bin/busybox in the initrd"; return; }
+	for a in sh od tr sed chmod mv cat printf; do
+		ln -s "$bb" "$x/bin/$a"
+	done
+	ln -s "$wpp" "$x/wpp/wpa_passphrase"
+	sed -n '/^write_wpa_conf() {$/,/^}$/p' "$REPO/os/rootfs-overlay/etc/init.d/S30network" >"$x/fn.sh"
+	check "write_wpa_conf is in S30network ($(wc -l <"$x/fn.sh") lines)" [ "$(wc -l <"$x/fn.sh")" -gt 10 ]
+	cat >"$x/run.sh" <<'EOF'
+# run.sh CONF PATH SSID PSK COUNTRY: write_wpa_conf with this environment.
+WPA_CONF=$1
+PATH=$2
+SAVIOR_WIFI_SSID=$3
+SAVIOR_WIFI_PSK=$4
+SAVIOR_WIFI_COUNTRY=$5
+SCRIPT=/etc/init.d/S30network
+log() { printf '%s\n' "$*" >>"$WPA_CONF.log"; }
+have() { command -v "$1" >/dev/null 2>&1; }
+umask 022
+. "${0%/*}/fn.sh"
+write_wpa_conf
+EOF
+	# wconf NAME WPP(yes|no) SSID PSK [COUNTRY]: $x/NAME.conf, status in RC.
+	wconf() {
+		_p=$x/bin
+		[ "$2" = no ] || _p=$_p:$x/wpp
+		rm -f "$x/$1.conf" "$x/$1.conf.log"
+		"$bb" sh "$x/run.sh" "$x/$1.conf" "$_p" "$3" "$4" "${5:-}" >>"$TLOG" 2>&1
+		RC=$?
+		sed "s/^/    $1.conf> /" "$x/$1.conf" "$x/$1.conf.log" >>"$TLOG" 2>/dev/null
+	}
+	has() { grep -q -x -F -- "$2" "$x/$1.conf" 2>/dev/null; }
+	hex=$(python3 -c 'import os, sys; print(os.fsencode(sys.argv[1]).hex())' "$WIFI_SSID")
+	want=$(python3 -c 'import hashlib, os, sys; print(hashlib.pbkdf2_hmac("sha1", os.fsencode(sys.argv[1]), os.fsencode(sys.argv[2]), 4096, 32).hex())' "$WIFI_PSK" "$WIFI_SSID")
+	tab=$(printf '\t')
+
+	wconf wpa yes "$WIFI_SSID" "$WIFI_PSK"
+	check "WPA2: write_wpa_conf succeeds (status $RC)" [ "$RC" -eq 0 ]
+	check "the SSID is hex-encoded UTF-8 (ssid=$hex)" has wpa "${tab}ssid=$hex"
+	check "psk= is the PBKDF2 hash of the passphrase ($want)" has wpa "${tab}psk=$want"
+	check "... and the passphrase itself is not in the file" eval '! grep -q -F -- "$WIFI_PSK" "$x/wpa.conf"'
+	check "key_mgmt=WPA-PSK and country=US by default" eval 'has wpa "${tab}key_mgmt=WPA-PSK" && has wpa country=US'
+	check "the file is mode 0600 under umask 022 ($(stat -c %a "$x/wpa.conf" 2>/dev/null))" \
+		[ "$(stat -c %a "$x/wpa.conf" 2>/dev/null)" = 600 ]
+	check "no temporary file is left" [ ! -e "$x/wpa.conf.tmp" ]
+
+	wconf open yes "$WIFI_SSID" "" DE
+	check "open network: key_mgmt=NONE, no psk= (status $RC)" \
+		eval '[ "$RC" -eq 0 ] && has open "${tab}key_mgmt=NONE" && ! grep -q psk= "$x/open.conf"'
+	check "wifi_country = DE gives country=DE" has open country=DE
+
+	wconf quoted no "lab" 'pass word\1$x'
+	check "without wpa_passphrase the passphrase is quoted as is (status $RC)" \
+		eval '[ "$RC" -eq 0 ] && has quoted "${tab}psk=\"pass word\\1\$x\"" && has quoted "${tab}ssid=6c6162"'
+	wconf refused no "$WIFI_SSID" "$WIFI_PSK"
+	check "without wpa_passphrase a passphrase with a double quote is refused (status $RC, no file)" \
+		eval '[ "$RC" -ne 0 ] && [ ! -e "$x/refused.conf" ] && grep -q "double quote" "$x/refused.conf.log"'
+}
+
+# wifi_initrd KIND: the dev initrd plus a cpio with this host's hostapd,
+# wpa_supplicant, wpa_passphrase and iw (and the libraries the image lacks),
+# the network config (/etc/savior/baked.conf) and an S35dhcpd that sets up
+# the access point: mac80211_hwsim with two radios, the second (wlan1)
+# moved into its own network namespace with iw (so the node sees only
+# wlan0 and the AP's address is not the node's), hostapd there (its log on
+# the serial console) and udhcpd for 10.66.0.100-200. KIND wpa: WPA2 with
+# $WIFI_SSID / $WIFI_PSK; open: no encryption. The hook also reports the
+# station's address as "SAVIOR-WIFIAP: station IFACE addr=A" (up to 240 s,
+# boot-report waits only 40 s). Sets WIFI_INITRD.
+wifi_initrd() {
+	st=$W/wifi-$1
+	rm -rf "$st"
+	for d in etc etc/init.d etc/savior etc/qemu-wifi lib lib/x86_64-linux-gnu lib64 usr usr/bin usr/sbin; do
+		mkdir -p "$st/$d"
+		chmod 0755 "$st/$d"
+	done
+	[ -s "$W/initrd.list" ] || xz -dc "$OUT/initrd" | cpio -t --quiet 2>/dev/null >"$W/initrd.list"
+	for p in hostapd wpa_supplicant wpa_passphrase iw; do
+		src=$(host_prog "$p")
+		if [ -z "$src" ]; then
+			fail "this test needs $p on this host (apt install hostapd wpasupplicant iw)"
+			return 1
+		fi
+		case "$src" in /usr/sbin/* | /usr/bin/* | /sbin/* | /bin/*) dst=$src ;; *) dst=/usr/sbin/$p ;; esac
+		cp "$src" "$st$dst"
+		chmod 0755 "$st$dst"
+		for lib in $(ldd "$src" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }'); do
+			# Never replace a library of the image under test.
+			grep -q -x -F "${lib#/}" "$W/initrd.list" && continue
+			[ -e "$st$lib" ] && continue
+			mkdir -p "$st${lib%/*}"
+			cp -L "$lib" "$st$lib"
+			chmod 0755 "$st$lib"
+		done
+	done
+	{
+		echo "interface=wlan1"
+		echo "driver=nl80211"
+		echo "ssid2=$(printf '%s' "$WIFI_SSID" | od -An -v -tx1 | tr -d ' \n')"
+		echo "hw_mode=g"
+		echo "channel=1"
+		if [ "$1" = wpa ]; then
+			echo "wpa=2"
+			echo "wpa_key_mgmt=WPA-PSK"
+			echo "rsn_pairwise=CCMP"
+			echo "wpa_passphrase=$WIFI_PSK"
+		fi
+	} >"$st/etc/qemu-wifi/hostapd.conf"
+	printf '%s\n' "interface wlan1" "start 10.66.0.100" "end 10.66.0.200" "max_leases 101" \
+		"lease_file /run/qemu-wifi.leases" "option subnet 255.255.255.0" "option lease 3600" \
+		>"$st/etc/qemu-wifi/udhcpd.conf"
+	{
+		echo "# qemu-test wifi ($1)"
+		echo "name = wifi-$1"
+		echo "wifi_ssid = $WIFI_SSID"
+		[ "$1" != wpa ] || echo "wifi_psk = $WIFI_PSK"
+	} >"$st/etc/savior/baked.conf"
+	chmod 0600 "$st/etc/savior/baked.conf"
+	cat >"$st/etc/init.d/S35dhcpd" <<'EOF'
+#!/bin/sh
+# qemu-test wifi: the access point on the second mac80211_hwsim radio, in
+# its own network namespace (for this node it is another machine).
+. /usr/libexec/savior/lib.sh
+[ "${1:-}" = start ] || exit 0
+ap() { printf 'SAVIOR-WIFIAP: %s\r\n' "$*" >/dev/ttyS0; }
+if ! modprobe mac80211_hwsim radios=2; then
+	ap "modprobe mac80211_hwsim failed"
+	exit 0
+fi
+n=0
+while [ ! -e /sys/class/net/wlan1/phy80211/name ] && [ "$n" -lt 30 ]; do
+	sleep 1
+	n=$((n + 1))
+done
+phy=$(cat /sys/class/net/wlan1/phy80211/name 2>/dev/null) || { ap "no wlan1"; exit 0; }
+unshare -n sleep 2147483647 </dev/null >/dev/null 2>&1 &
+ns=$!
+n=0
+while [ "$(readlink "/proc/$ns/ns/net")" = "$(readlink /proc/self/ns/net)" ] && [ "$n" -lt 100 ]; do
+	sleep 0.1
+	n=$((n + 1))
+done
+if ! iw phy "$phy" set netns "$ns"; then
+	ap "iw phy $phy set netns $ns failed"
+	exit 0
+fi
+in_ap() { nsenter -n -t "$ns" "$@"; }
+in_ap ip link set lo up
+in_ap ip addr add 10.66.0.1/24 dev wlan1
+in_ap ip link set wlan1 up
+# stdout is the serial console, a terminal: line buffered.
+in_ap hostapd -t /etc/qemu-wifi/hostapd.conf </dev/null >/dev/ttyS0 2>&1 &
+: >/run/qemu-wifi.leases
+in_ap udhcpd -S /etc/qemu-wifi/udhcpd.conf
+ap "access point: $phy (wlan1, 10.66.0.1/24) in the network namespace of pid $ns; left here: $(wireless_ifaces | tr '\n' ' ')"
+(
+	n=0
+	while [ "$n" -lt 240 ]; do
+		w=$(first_wireless)
+		a=$(if_ipv4 "${w:-none}")
+		if [ -n "$a" ]; then
+			ap "station $w addr=${a%% *}"
+			exit 0
+		fi
+		sleep 1
+		n=$((n + 1))
+	done
+	ap "station ${w:-none}: no address within 240 s"
+) </dev/null >/dev/null 2>&1 &
+exit 0
+EOF
+	chmod 0755 "$st/etc/init.d/S35dhcpd"
+	(cd "$st" && find . -mindepth 1 | sed 's|^\./||' | LC_ALL=C sort | cpio -o -H newc -R 0:0 --quiet) >"$W/wifi-$1.cpio" ||
+		{ fail "cpio failed"; return 1; }
+	# The kernel reads concatenated archives at 4-byte boundaries.
+	WIFI_INITRD=$W/wifi-$1.initrd
+	cp "$OUT/initrd" "$WIFI_INITRD"
+	_pad=$(((4 - $(wc -c <"$WIFI_INITRD") % 4) % 4))
+	[ "$_pad" -eq 0 ] || head -c "$_pad" /dev/zero >>"$WIFI_INITRD"
+	cat "$W/wifi-$1.cpio" >>"$WIFI_INITRD"
+}
+
+# wifi_boot KIND: boot the dev payload without any wired NIC, with
+# wifi_initrd KIND, and check that the node joined the access point.
+wifi_boot() {
+	wifi_initrd "$1" || return 1
+	serial=$LOGS/$CUR-$1.serial
+	vm "wifi-$1" "$serial" -m "$MEM" -smp 1 -vga std -nic none \
+		-kernel "$OUT/vmlinuz" -initrd "$WIFI_INITRD" \
+		-append "consoleblank=0 quiet loglevel=3 console=ttyS0,115200 console=tty0 savior.media=none savior_dumplog=1"
+	_cur=$CUR
+	CUR=$_cur/$1
+	if wait_boot "$serial" "$VM_PID"; then
+		check_report cfg=no media=none node=yes
+		wait_for "$serial" 'SAVIOR-WIFIAP: access point' 60 "$VM_PID"
+		info "$(grep -a 'SAVIOR-WIFIAP: access point' "$serial" | tail -n 1 | tr -d '\r')"
+		check "hostapd is up on the second radio (AP-ENABLED)" grep -a -q 'wlan1: AP-ENABLED' "$serial"
+		check "S30network: \"wifi: joining '$WIFI_SSID' on wlan0\"" \
+			wait_for "$serial" "SAVIOR-LOG: .*wifi: joining '$WIFI_SSID' on wlan0" 60 "$VM_PID"
+		check "the node associated (hostapd: AP-STA-CONNECTED)" wait_for "$serial" 'wlan1: AP-STA-CONNECTED ' 180 "$VM_PID"
+		if [ "$1" = wpa ]; then
+			check "... after a WPA2 4-way handshake with the hashed PSK (EAPOL-4WAY-HS-COMPLETED)" \
+				grep -a -q 'wlan1: EAPOL-4WAY-HS-COMPLETED ' "$serial"
+		fi
+		if wait_for "$serial" 'SAVIOR-WIFIAP: station ' 240 "$VM_PID"; then
+			sta=$(grep -a 'SAVIOR-WIFIAP: station ' "$serial" | tail -n 1 | tr -d '\r' | sed 's/.*SAVIOR-WIFIAP: //')
+			info "$sta"
+			check "the node got a DHCP lease over Wi-Fi from the access point's udhcpd" \
+				eval 'printf "%s\n" "$sta" | grep -q -E "station wlan0 addr=10\.66\.0\.(1[0-9][0-9]|200)\$"'
+		else
+			fail "no station address line within 240 s"
+		fi
+		# net= is the first address boot-report saw within its 40 s: the
+		# lease, or none when the join took longer (never the AP's .1).
+		case "$(field net)" in
+		none) info "the lease came after boot-report's 40 s wait (net=none)" ;;
+		*) check_report 'net~^10\.66\.0\.(1[0-9][0-9]|200)$' ;;
+		esac
+		check_agent "$serial" "$VM_PID"
+		grep -a -E 'AP-STA-POSSIBLE-PSK-MISMATCH|CTRL-EVENT-SSID-TEMP-DISABLED|wifi: ' "$serial" | tr -d '\r' |
+			head -n 5 | sed 's/^/        | /' >>"$TLOG"
+	fi
+	stop_vms
+	CUR=$_cur
+}
+
+# wifi: WPA2, then an open network (key_mgmt=NONE).
+t_wifi() {
+	need_file "$OUT/vmlinuz" || return
+	need_file "$OUT/initrd" || return
+	wifi_boot wpa
+	wifi_boot open
+}
 
 t_boot_iso_bios() {
 	need_file "$MEDIA/savior.iso" || return
@@ -789,10 +1203,145 @@ ctl() {
 	return "$_rc"
 }
 
-# online_nodes: number of online nodes (needs jq).
+# online_nodes [SINCE]: number of online nodes (needs jq); with SINCE (an
+# RFC 3339 time), only those last seen after it.
 online_nodes() {
 	ctl nodes --all --json || ctl nodes --json || { echo 0; return; }
-	jq '[.[] | select(.liveness == "online")] | length' "$W/ctl.out" 2>/dev/null || echo 0
+	jq --arg t "${1:-}" 'def secs: sub("\\.[0-9]+"; "") | fromdate;
+		[.[] | select(.liveness == "online" and ($t == "" or (.last_seen | secs) > ($t | secs)))] | length' \
+		"$W/ctl.out" 2>/dev/null || echo 0
+}
+
+# wait_online N [SINCE]: N nodes online within 420 s (last seen after
+# SINCE, see online_nodes); the node list stays in $W/ctl.out.
+wait_online() {
+	t0=$(date +%s)
+	n=0
+	while [ $(($(date +%s) - t0)) -lt 420 ]; do
+		n=$(online_nodes "${2:-}")
+		[ "$n" -ge "$1" ] && break
+		sleep 10
+	done
+	if [ "$n" -ge "$1" ]; then
+		pass "$1 nodes online${2:+ and seen since $2} after $(($(date +%s) - t0)) s"
+		return 0
+	fi
+	fail "only $n nodes online after $(($(date +%s) - t0)) s ($(tail -n 1 "$W/ctl.err" 2>/dev/null))"
+	return 1
+}
+
+# wait_hive_api: the hive API answers on 127.0.0.1:$HIVE_PORT within 240 s
+# (with curl; without it, ctl's own retries have to do).
+wait_hive_api() {
+	command -v curl >/dev/null 2>&1 || return 0
+	t0=$(date +%s)
+	until curl -s -k -m 5 -o /dev/null "https://127.0.0.1:$HIVE_PORT/api/v1/hello"; do
+		if [ $(($(date +%s) - t0)) -ge 240 ]; then
+			fail "the hive API (https://127.0.0.1:$HIVE_PORT -> hive:7700) did not answer within 240 s"
+			return 1
+		fi
+		sleep 5
+	done
+	pass "hive API answers on the forwarded port after $(($(date +%s) - t0)) s"
+}
+
+# wait_host_key PORT: the SSH host key on PORT, retried for 120 s (on a
+# hive, S50sshd starts dropbear once SAVIOR-DATA is mounted).
+wait_host_key() {
+	_t0=$(date +%s)
+	_k=$(host_key "$1")
+	while [ -z "$_k" ] && [ $(($(date +%s) - _t0)) -lt 120 ]; do
+		sleep 5
+		_k=$(host_key "$1")
+	done
+	echo "$_k"
+}
+
+# out_sums DIR: the sorted SHA-256 sums of the files below DIR.
+out_sums() { find "$1" -type f -exec sha256sum {} + 2>/dev/null | awk '{ print $1 }' | sort; }
+
+# swarm_hive_reboot: DESIGN 13.4 / USER_GUIDE 2: a hive keeps its state on
+# SAVIOR-DATA across reboots. Before: ctl info says persistent, c2 is
+# renamed, the SSH host key is noted. The hive's own node agent reboots it
+# (ctl reboot: BusyBox init runs rcK, which stops the hive and unmounts
+# SAVIOR-DATA; QEMU runs with -no-reboot, so the VM exits), and the same
+# stick boots again with the same MAC and UUID. After: the same
+# certificate (ctl.json pins it, so ctl fails on a new one), still
+# persistent, the job and its outputs (blobs) are there, the 4 nodes come
+# back and c2 keeps its new name, and the SSH host key is the same (S50sshd
+# keeps it in /var/lib/savior/data/ssh). A hive that formats SAVIOR-DATA
+# again or falls back to RAM fails every one of these.
+swarm_hive_reboot() {
+	if ! ctl info --json; then
+		fail "ctl info failed: $(tail -n 2 "$W/ctl.err" | tr '\n' ' ')"
+		return 1
+	fi
+	cp "$W/ctl.out" "$LOGS/swarm-hive-info.json"
+	fp1=$(jq -r '.fingerprint // empty' "$W/ctl.out")
+	p=$(jq -r '.persistent' "$W/ctl.out")
+	dd=$(jq -r '.data_dir // empty' "$W/ctl.out")
+	check "the hive keeps its state on disk (ctl info: persistent = $p, data_dir = $dd)" [ "$p" = true ]
+	check "... on SAVIOR-DATA (data_dir below /var/lib/savior/data)" \
+		eval 'case "$dd" in /var/lib/savior/data/*) true ;; *) false ;; esac'
+	job=""
+	ctl jobs --json && job=$(jq -r '[.[] | select(.name == "qemu-swarm-test")][0].id // empty' "$W/ctl.out")
+	check "rename c2 to c2-renamed" ctl rename c2 c2-renamed
+	hk1=$(wait_host_key "$HIVE_SSH_PORT")
+	check "the hive's SSH server answers (ed25519 host key ${hk1:-missing})" [ -n "$hk1" ]
+	[ -z "$hk1" ] || check_ssh "$HIVE_SSH_PORT"
+	hive_id=$(jq -r '[.[] | select(.name == "hive")][0].id // empty' "$LOGS/swarm-nodes.json")
+	check "ctl reboot the hive's machine" ctl reboot "${hive_id:-hive}"
+	t0=$(date +%s)
+	while kill -0 "$HIVE_PID" 2>/dev/null && [ $(($(date +%s) - t0)) -lt 180 ]; do
+		sleep 2
+	done
+	if kill -0 "$HIVE_PID" 2>/dev/null; then
+		fail "the hive did not reboot within 180 s of ctl reboot; switching it off"
+		stop_pid "$HIVE_PID"
+	else
+		pass "the hive's machine rebooted $(($(date +%s) - t0)) s after ctl reboot"
+	fi
+
+	swarm_vm hive-2 52:54:00:77:00:01 "${U}01" "$W/hive.img" 1024 \
+		-netdev "$HIVE_UP" -device e1000,netdev=up,mac=52:54:00:77:01:01
+	HIVE_PID=$VM_PID
+	hs=$LOGS/swarm-hive-2.serial
+	CUR=swarm/hive-2
+	wait_boot "$hs" "$HIVE_PID" || { CUR=swarm; return 1; }
+	check_report 'net~^10\.77\.0\.1$' cfg=yes key=yes
+	check_agent "$hs" "$HIVE_PID"
+	CUR=swarm
+	wait_hive_api || return 1
+	started=""
+	if ctl info --json; then
+		cp "$W/ctl.out" "$LOGS/swarm-hive-2-info.json"
+		started=$(jq -r '.started_at // empty' "$W/ctl.out")
+		fp2=$(jq -r '.fingerprint // empty' "$W/ctl.out")
+		check "same hive certificate after the reboot ($fp2)" eval '[ -n "$fp2" ] && [ "$fp2" = "$fp1" ]'
+		check "still persistent after the reboot" [ "$(jq -r '.persistent' "$W/ctl.out")" = true ]
+	else
+		fail "ctl (pinned to $fp1) cannot talk to the rebooted hive: $(tail -n 2 "$W/ctl.err" | tr '\n' ' ')"
+	fi
+	st=""
+	ctl jobs --json && st=$(jq -r --arg id "$job" '.[] | select(.id == $id) | .state' "$W/ctl.out")
+	check "the job survived the reboot (${job:-no job}: ${st:-missing})" eval '[ -n "$job" ] && [ "$st" = succeeded ]'
+	rm -rf "$W/outputs2"
+	if [ -n "$job" ] && ctl outputs "$job" -o "$W/outputs2"; then
+		check "its outputs survived the reboot with the same contents ($(find "$W/outputs2" -type f | wc -l) files)" \
+			[ "$(out_sums "$W/outputs")" = "$(out_sums "$W/outputs2")" ]
+	else
+		fail "ctl outputs ${job:-(no job)} failed after the reboot: $(tail -n 2 "$W/ctl.err" | tr '\n' ' ')"
+	fi
+	# Every node heartbeats to the new hive process (not just a last_seen
+	# from before the reboot).
+	if wait_online 4 "$started"; then
+		cp "$W/ctl.out" "$LOGS/swarm-nodes-2.json"
+		check "c2's new name survived the reboot ($(jq -r '[.[].name] | join(" ")' "$W/ctl.out"))" \
+			jq -e '[.[] | select(.name == "c2-renamed")] | length == 1' "$W/ctl.out"
+	fi
+	hk2=$(wait_host_key "$HIVE_SSH_PORT")
+	check "the hive's SSH host key survived the reboot (${hk2:-no host key})" eval '[ -n "$hk1" ] && [ "$hk2" = "$hk1" ]'
+	info "hive syslog (second boot): $(grep -a 'SAVIOR-SYSLOG: .*\(hive data\|SAVIOR-DATA\|init-data\|sshd\)' "$hs" | tail -n 3 | tr -d '\r' | tr '\n' ' ')"
 }
 
 rand_byte() { od -An -N1 -tu1 /dev/urandom | tr -d ' '; }
@@ -812,10 +1361,12 @@ t_swarm() {
 	CTL=$OUT/savior
 	need_file "$CTL" || return
 	command -v jq >/dev/null 2>&1 || { fail "the swarm test needs jq (apt install jq)"; return; }
+	ssh_keys || return
 	MCAST="230.$(rand_byte).$(rand_byte).$(rand_byte):$((20000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000))"
 	HIVE_PORT=$((40000 + $(od -An -N2 -tu2 /dev/urandom | tr -d ' ') % 20000))
+	HIVE_SSH_PORT=$(rand_port)
 	ADMIN_TOKEN=$(od -An -N20 -tx1 /dev/urandom | tr -d ' \n')
-	info "LAN mcast=$MCAST, hive API on 127.0.0.1:$HIVE_PORT"
+	info "LAN mcast=$MCAST, hive API on 127.0.0.1:$HIVE_PORT, hive SSH on 127.0.0.1:$HIVE_SSH_PORT"
 
 	# Sticks. The hive's copy gets 2 GiB of (sparse) free space for
 	# SAVIOR-DATA: blob uploads need max(5%, 512 MiB) free (DESIGN 7.1).
@@ -824,8 +1375,10 @@ t_swarm() {
 	done
 	truncate -s +2G "$W/hive.img"
 	common="swarm_key = $KEY"
+	# ssh_key on the hive: S50sshd keeps its host key on SAVIOR-DATA.
 	stick_conf "$W/hive.img@@$MT_OFF" "$common" "name = hive" "roles = hive,compute" "net = static" \
-		"ip = 10.77.0.1/24" "dhcp_server = yes" "admin_token = $ADMIN_TOKEN" || { fail "stick setup"; return; }
+		"ip = 10.77.0.1/24" "dhcp_server = yes" "admin_token = $ADMIN_TOKEN" "ssh_key = $(cat "$W/id.pub")" ||
+		{ fail "stick setup"; return; }
 	stick_conf "$W/c1.img@@$MT_OFF" "$common" "name = c1" "roles = compute" || { fail "stick setup"; return; }
 	stick_conf "$W/c2.img@@$MT_OFF" "$common" "name = c2" "roles = compute" || { fail "stick setup"; return; }
 	stick_conf "$W/disp.img@@$MT_OFF" "$common" "name = disp" "roles = display" || { fail "stick setup"; return; }
@@ -837,8 +1390,9 @@ t_swarm() {
 	done
 
 	U=5a510000-0000-4000-8000-0000000000
+	HIVE_UP="user,id=up,hostfwd=tcp:127.0.0.1:$HIVE_PORT-:7700,hostfwd=tcp:127.0.0.1:$HIVE_SSH_PORT-:22"
 	swarm_vm hive 52:54:00:77:00:01 "${U}01" "$W/hive.img" 1024 \
-		-netdev "user,id=up,hostfwd=tcp:127.0.0.1:$HIVE_PORT-:7700" -device e1000,netdev=up,mac=52:54:00:77:01:01
+		-netdev "$HIVE_UP" -device e1000,netdev=up,mac=52:54:00:77:01:01
 	HIVE_PID=$VM_PID
 	: >"$W/swarm.pids"
 	swarm_vm c1 52:54:00:77:00:02 "${U}02" "$W/c1.img" "$MEM"
@@ -863,50 +1417,39 @@ t_swarm() {
 	done
 	CUR=swarm
 	sleep 10
-	info "hive syslog: $(grep -a -o 'SAVIOR-SYSLOG: .*\(hive data\|SAVIOR-DATA\|init-data\)[^\r]*' "$LOGS/swarm-hive.serial" | tail -n 2 | tr '\n' ' ')"
+	info "hive syslog: $(grep -a 'SAVIOR-SYSLOG: .*\(hive data\|SAVIOR-DATA\|init-data\|sshd\)' "$LOGS/swarm-hive.serial" | tail -n 3 | tr -d '\r' | tr '\n' ' ')"
 
 	# The hive API through the forwarded port (hostfwd to its second NIC).
-	if command -v curl >/dev/null 2>&1; then
-		t0=$(date +%s)
-		until curl -s -k -m 5 -o /dev/null "https://127.0.0.1:$HIVE_PORT/api/v1/hello"; do
-			if [ $(($(date +%s) - t0)) -ge 240 ]; then
-				fail "the hive API (https://127.0.0.1:$HIVE_PORT -> hive:7700) did not answer within 240 s"
-				return
-			fi
-			sleep 5
-		done
-		pass "hive API answers on the forwarded port after $(($(date +%s) - t0)) s"
-	fi
-
+	wait_hive_api || return
 	# All four nodes online (the hive also runs a compute node).
-	t0=$(date +%s)
-	n=0
-	while [ $(($(date +%s) - t0)) -lt 420 ]; do
-		n=$(online_nodes)
-		[ "$n" -ge 4 ] && break
-		sleep 10
-	done
-	if [ "$n" -ge 4 ]; then
-		pass "4 nodes online after $(($(date +%s) - t0)) s"
-	else
-		fail "only $n nodes online after $(($(date +%s) - t0)) s ($(tail -n 1 "$W/ctl.err" 2>/dev/null))"
-		return
-	fi
+	wait_online 4 || return
 	cp "$W/ctl.out" "$LOGS/swarm-nodes.json"
 
-	# A job: 4 tasks that write an output file each, with the number of CA
-	# certificates the sandbox sees (the runner binds /etc/ssl/certs).
-	cat >"$W/job.json" <<'EOF'
+	# A job: 4 tasks that write an output file each: their index, the
+	# number of CA certificates the sandbox sees (the runner binds
+	# /etc/ssl/certs), and what internal/runner's TestRealSandboxIsolation
+	# probes from inside a task, here with SaviorOS's kernel, init and
+	# BusyBox.
+	cat >"$W/job.sh" <<'EOF'
+echo "task $SAVIOR_TASK_INDEX of $SAVIOR_TASK_COUNT" > out.txt
+uname -m >> out.txt
+echo "ca $(grep -c -e '-----BEGIN CERTIFICATE-----' /etc/ssl/certs/ca-certificates.crt 2>&1 | head -n 1)" >> out.txt
 {
-  "name": "qemu-swarm-test",
-  "script": "echo \"task $SAVIOR_TASK_INDEX of $SAVIOR_TASK_COUNT\" > out.txt\nuname -m >> out.txt\necho \"ca $(grep -c -e '-----BEGIN CERTIFICATE-----' /etc/ssl/certs/ca-certificates.crt 2>&1 | head -n 1)\" >> out.txt\n",
-  "outputs": ["out.txt"],
-  "count": 4,
-  "resources": {"cores": 0.5, "mem_mb": 64, "disk_mb": 16},
-  "requirements": {},
-  "timeout_s": 300
-}
+	echo "uid=$(id -u)"
+	echo "cmdline=[$(cat /proc/cmdline 2>/dev/null)]"
+	for d in media run sys root; do [ -e "/$d" ] && echo "$d=present" || echo "$d=absent"; done
+	(echo hi > /oops.txt) 2>/dev/null && echo rootwrite=ok || echo rootwrite=fail
+	(echo hi > /etc/x) 2>/dev/null && echo etcwrite=ok || echo etcwrite=fail
+	grep -qE 'eth|ens|enp|wl' /proc/net/dev && echo extranet=present || echo extranet=absent
+	mkdir -p m
+	unshare -Un true 2>/dev/null && echo unshare=ok || echo unshare=fail
+	mount -t tmpfs none m 2>/dev/null && echo mount=ok || echo mount=fail
+	echo "seccomp=$(grep '^Seccomp:' /proc/self/status | tr -d '\t ' | cut -d: -f2)"
+} >> out.txt
 EOF
+	jq -n --rawfile script "$W/job.sh" '{name: "qemu-swarm-test", script: $script, outputs: ["out.txt"], count: 4,
+		resources: {cores: 0.5, mem_mb: 64, disk_mb: 16}, requirements: {}, timeout_s: 300}' >"$W/job.json" ||
+		{ fail "jq could not write the job spec"; return; }
 	rm -rf "$W/outputs"
 	t0=$(date +%s)
 	if ctl --timeout 900s submit "$W/job.json" --fetch "$W/outputs"; then
@@ -924,6 +1467,20 @@ EOF
 	ca=$(grep -r -h -E '^ca [0-9]+$' "$W/outputs" 2>/dev/null | awk '$2 >= 100 { n++ } END { print n + 0 }')
 	check "all 4 tasks see the CA bundle /etc/ssl/certs/ca-certificates.crt ($ca/4)" [ "$ca" -eq 4 ]
 	[ "$ca" -eq 4 ] || info "the tasks said: $(grep -r -h '^ca ' "$W/outputs" 2>/dev/null | sort | uniq -c | tr -s ' \n' ' ')"
+	# The sandbox held in every task: a slot uid (the VMs have one CPU, so
+	# two slots: 10000-10001), no kernel command line (the swarm key can be
+	# on it), no /run (/run/savior/env holds the key), /media, /sys or
+	# /root, a read-only root and /etc, no network (the job asks for none),
+	# no new namespaces or mounts, and a seccomp filter (mode 2).
+	n=$(grep -r -h -x -E 'uid=1000[01]' "$W/outputs" 2>/dev/null | wc -l)
+	check "sandbox: all 4 tasks run as a slot uid 10000-10001 ($n/4: $(grep -r -h '^uid=' "$W/outputs" 2>/dev/null | sort | uniq -c | tr -s ' \n' ' '))" \
+		[ "$n" -eq 4 ]
+	for kv in 'cmdline=[]' media=absent run=absent sys=absent root=absent rootwrite=fail etcwrite=fail \
+		extranet=absent unshare=fail mount=fail seccomp=2; do
+		n=$(grep -r -h -x -F -- "$kv" "$W/outputs" 2>/dev/null | wc -l)
+		check "sandbox: all 4 tasks say $kv ($n/4: $(grep -r -h -- "^${kv%%=*}=" "$W/outputs" 2>/dev/null | sort | uniq -c | tr -s ' \n' ' '))" \
+			[ "$n" -eq 4 ]
+	done
 
 	# The display node: first a known black screen (mode color), then the
 	# text, which must match savior display render of the same spec pixel
@@ -991,6 +1548,9 @@ EOF
 	fi
 
 	check "identify all nodes" ctl identify --all --seconds 10
+
+	# The hive reboots and keeps its state (SAVIOR-DATA).
+	swarm_hive_reboot
 
 	# Duplicate node ID: a second machine with c1's MAC and UUID.
 	swarm_vm dup 52:54:00:77:00:02 "${U}02" "$W/dup.img" "$MEM"
@@ -1451,6 +2011,9 @@ for t in $TESTS; do
 	pxe-uefi) t_pxe_uefi ;;
 	screen) t_screen ;;
 	baked-conf) t_baked_conf ;;
+	mem-256) t_mem_256 ;;
+	wifi-conf) t_wifi_conf ;;
+	wifi) t_wifi ;;
 	swarm) t_swarm ;;
 	hive-pxe) t_hive_pxe ;;
 	hive-pxe-proxy) t_hive_pxe_proxy ;;

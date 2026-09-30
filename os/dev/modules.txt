@@ -118,3 +118,12 @@ optional: rtl8187
 optional: rtl8192ce
 optional: brcmsmac
 optional: b43
+# mac80211 gets its ciphers from the crypto API, which loads them on demand
+# (request_module "crypto-ccm(aes)"), so modules.dep does not name them:
+# without ccm no WPA2 (CCMP) key can be installed, and hostapd or
+# wpa_supplicant fail with "set_key failed". cmac is BIP (802.11w).
+optional: ccm
+optional: cmac
+# Simulated radios for the QEMU Wi-Fi test (qemu-test.sh wifi): loaded only
+# by that test, never by the coldplug (no hardware alias).
+optional: mac80211_hwsim

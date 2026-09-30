@@ -21,7 +21,8 @@
 # line follows once the agent has shown that it keeps running (or not):
 #
 #   SAVIOR-AGENT: up=<s> agent=up|crashing|down age=<s>|- starts=<n>
-#                 arch=<uname -m> ver=<version>
+#                 arch=<uname -m> ver=<version> mem_avail=<MB>|-
+#                 offer_mem=<MB>|-
 #
 # agent=up: a "savior node" process has written /run/savior/status.json and
 # has been running for AGENT_UP_S (10) s without a restart; crashing: the
@@ -29,6 +30,12 @@
 # s (time spent waiting for S20scratch does not count). age: how long that
 # process had been running; starts: run-node.starts. On i686, agent=up also
 # proves the SSE2/softfloat pick. scripts/qemu-smoke.sh (CI) expects it.
+# mem_avail: MemAvailable (/proc/meminfo) in MiB when the line is printed,
+# i.e. at idle with every role running (DESIGN 13.2: >= 150 on a 256 MB
+# machine with the display role). offer_mem: the memory in MiB the agent
+# offers for tasks (Total.mem_mb in status.json, DESIGN 10.3); 0 on a
+# compute node means that it never runs a task. New fields only ever go at
+# the end of a line.
 set -u
 # shellcheck source=lib.sh
 . /usr/libexec/savior/lib.sh
@@ -150,10 +157,19 @@ while [ "$n" -lt "$AGENT_WAIT_S" ] && [ "$w" -lt 1800 ]; do
 	sleep 1
 done
 ver=$(/usr/bin/savior version 2>/dev/null | awk '{ print $2 }')
+mem_avail=$(awk '$1 == "MemAvailable:" && $2 ~ /^[0-9]+$/ { print int($2 / 1024); exit }' /proc/meminfo 2>/dev/null)
+# The top-level "Total" object of the indented status JSON (the agent's
+# allocatable resources).
+offer_mem=$(awk '/^ "[Tt]otal": \{/ { t = 1; next }
+	t && /^ \}/ { exit }
+	t && /"mem_mb":/ { v = $2; gsub(/[^0-9]/, "", v); if (v != "") print v; exit }' \
+	"$RUN_DIR/status.json" 2>/dev/null)
 serial_mark "SAVIOR-AGENT: up=$(uptime_s)" \
 	"agent=$agent" \
 	"age=$age" \
 	"starts=$(node_starts)" \
 	"arch=$(uname -m 2>/dev/null || echo unknown)" \
-	"ver=${ver:-unknown}"
+	"ver=${ver:-unknown}" \
+	"mem_avail=${mem_avail:--}" \
+	"offer_mem=${offer_mem:--}"
 exit 0

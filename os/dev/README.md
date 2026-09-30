@@ -15,7 +15,8 @@ sudo apt-get install -y \
   grub-common grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
   mtools dosfstools xorriso ipxe \
   qemu-system-x86 ovmf \
-  dropbear-bin dnsmasq-base e2fsprogs jq curl python3
+  dropbear-bin dnsmasq-base e2fsprogs jq curl python3 \
+  openssh-client wpasupplicant hostapd iw
 ```
 
 - Go 1.24 is needed unless you pass `--savior` (`GOTOOLCHAIN=local` is used).
@@ -24,9 +25,15 @@ sudo apt-get install -y \
 - `ipxe` provides `undionly.kpxe` for BIOS netboot behind proxy DHCP. Without
   it, `build.sh` downloads the `ipxe` package.
 - `jq` is needed by the swarm and hive-pxe tests. `curl` is optional (a faster
-  hive API check). `python3` is needed by `hive-pxe-proxy`, and the swarm test
-  uses it to compare the display node's screen with `savior display render`.
-  Without it, the harness talks to the QEMU monitor through `nc -U`.
+  hive API check). `python3` is needed by `hive-pxe-proxy` and `wifi-conf`,
+  and the swarm test uses it to compare the display node's screen with
+  `savior display render`. Without it, the harness talks to the QEMU monitor
+  through `nc -U`.
+- `openssh-client` (`ssh`, `ssh-keygen`, `ssh-keyscan`) is needed by
+  `boot-bios`, `boot-uefi` and the swarm test, which log in with `ssh_key`.
+- `wpasupplicant`, `hostapd` and `iw` are needed by `wifi-conf` and `wifi`.
+  They are not part of the image: the `wifi` test puts this host's copies
+  into the guest with an extra initramfs archive.
 - These packages are fetched with `apt-get download`, so the host needs apt
   access to the Ubuntu archive (`noble-updates`):
   - the kernel: `linux-image-unsigned-V`, `linux-modules-V` and
@@ -115,13 +122,13 @@ What `build.sh` does:
 
 Typical sizes with 6.8.0-142: initrd 18.9 MiB, unpacked rootfs 26.4 MiB
 (savior 11 MiB; dnsmasq and its libraries about 8 MiB; the CA bundle 180 KiB),
-modloop 10.4 MiB (112 modules, and radeon's firmware: 5.3 MiB unpacked,
+modloop 10.4 MiB (115 modules, and radeon's firmware: 5.3 MiB unpacked,
 1.7 MiB in the modloop), USB image 105 MiB, ISO 45 MiB.
 
 ## QEMU tests
 
 ```sh
-os/dev/qemu-test.sh all             # all boot tests (about 9 minutes)
+os/dev/qemu-test.sh all             # all boot tests (about 15 minutes)
 os/dev/qemu-test.sh image boot-bios pxe-uefi
 os/dev/qemu-test.sh --swarm all     # also the multi-VM swarm and netboot tests
 os/dev/qemu-test.sh --expect-display screen
@@ -134,13 +141,16 @@ the payload over TFTP. Test VMs have 512 MiB of RAM (`--mem`) and one CPU.
 | Test | What boots | Main checks |
 |---|---|---|
 | `image` | nothing: it unpacks `initrd` and its modloop | every soft dependency of a module in the modloop is in it (`r8169` -> `realtek`); the image's BusyBox `modprobe -D` finds `realtek.ko` for a Realtek PHY's `mdio:` alias (in a chroot); `radeon` has every firmware file it asks for; the CA bundle has Mozilla's certificates and none of the build host's local CAs (`/usr/local/share/ca-certificates`) |
-| `boot-bios` | `savior.img` as a USB stick on EHCI, SeaBIOS | config from the stick (a test `swarm_key` is written into its `savior.conf` with mtools), DHCP address, console started, `/dev/fb0`, GRUB took `$root` from the core image prefix `(,msdos1)`, `/boot-options.cfg` is sourced, the node agent is up (below) and stays up: 30 s later it has still started only once, and nothing on the console says it exited or crashed |
+| `boot-bios` | `savior.img` as a USB stick on EHCI, SeaBIOS | config from the stick (a test `swarm_key` and `ssh_key` are written into its `savior.conf` with mtools), DHCP address, console started, `/dev/fb0`, GRUB took `$root` from the core image prefix `(,msdos1)`, `/boot-options.cfg` is sourced, the node agent is up (below) and stays up: 30 s later it has still started only once, and nothing on the console says it exited or crashed. SSH (dropbear, port 22 forwarded to the host): root logs in with the `ssh_key` key and `id -u` prints 0; another key is refused, and the server offers no method but `publickey` |
 | `boot-uefi` | the same stick, OVMF | the same checks |
 | `boot-iso-bios` | `savior.iso` as an IDE CD-ROM, SeaBIOS | config medium is `/dev/sr0` (matched by the ISO volume UUID); the agent stays up |
 | `boot-iso-uefi` | the ISO under OVMF, plus a plain FAT stick holding only `savior.conf` | a CD-booted machine takes the stick's config; the agent stays up |
 | `pxe-bios`, `pxe-uefi` | `netboot/` over QEMU's built-in TFTP (`core.0` / `core.efi`) | `savior.media=none`; the test key goes on the kernel command line (test only); the agent stays up |
 | `screen` | the stick with `-vga std` | `/dev/fb0`, the agent is up, a screendump saved as a PPM through the QEMU monitor; with `--expect-display`, at least 1% of the screen is not black |
 | `baked-conf` | a stick made with `mkimage.sh --conf`, with `savior.conf` deleted from it | the key comes from `/etc/savior/baked.conf` (second initrd `boot/savior-conf.cpio`); the agent is up |
+| `mem-256` | the stick on a 256 MB VM with `-vga std` (roles `auto`: compute and display) | the agent is up with the display role, and the `SAVIOR-AGENT` line's `mem_avail` (MemAvailable at idle) and `offer_mem` (memory offered for tasks) reach `MEM256_MIN_AVAIL` and `MEM256_MIN_OFFER` (environment variables; defaults 100 and 24 MB). The dev image measures 111-113 and 30-32: the Ubuntu kernel leaves a MemTotal of 207 MiB and the initramfs keeps 37 MiB in RAM, so it stays below DESIGN 13.2's production target (MemAvailable ≥ 150 MB) |
+| `wifi-conf` | nothing: `write_wpa_conf`, cut out of `S30network` and run by the image's BusyBox | an SSID with quotes, spaces and `Ü` (longer than a line of `od`) becomes `ssid=<UTF-8 hex>`; a passphrase with quotes, `$`, `\`, backticks and spaces becomes `psk=` + the PBKDF2-HMAC-SHA1 hash that python3 computes, and is not in the file; open networks get `key_mgmt=NONE`; `wifi_country`; without `wpa_passphrase` the passphrase is quoted, or refused if it holds `"`; mode 0600 |
+| `wifi` | the dev payload with no wired NIC (`-nic none`), direct kernel boot, plus an extra initramfs archive with this host's `hostapd`, `wpa_supplicant`, `wpa_passphrase` and `iw`, the Wi-Fi settings in `/etc/savior/baked.conf`, and an `S35dhcpd` that sets up the access point | `mac80211_hwsim` makes two radios. The second is moved into its own network namespace (a separate machine as far as the node can tell) with `hostapd` and `udhcpd` (10.66.0.100-200). `S30network` joins on the first: WPA2 with the SSID and passphrase of `wifi-conf`, then an open network. hostapd must log `AP-STA-CONNECTED` (and `EAPOL-4WAY-HS-COMPLETED` for WPA2), the node must get a lease from the access point, and the agent is up. `net=` in the boot report is that lease, or `none` when the join took longer than boot-report's 40 s |
 | `swarm` | see below | |
 | `hive-pxe` | a hive VM with `netboot = yes` and `dhcp_server = yes`, then two diskless VMs (SeaBIOS, OVMF) on a private LAN | each client PXE-boots from the hive (S65netboot: dnsmasq DHCP with the boot file chosen by client architecture, GRUB images over TFTP, kernel and initrd over HTTP from the hive's port 7702). Its agent comes up, its node joins keyless, is pending, and `savior ctl approve` brings it online |
 | `hive-pxe-proxy` | a "router" VM that hands out addresses (SaviorOS `udhcpd`, then a `dnsmasq` whose replies name itself as next-server), a hive with `netboot = yes` and `dhcp_server = no`, diskless VMs, then a second hive with `dhcp_server = yes` but `net = dhcp` | the hive answers PXE only, as a proxy DHCP server. A PXE probe on the LAN (python3) checks that plain BIOS PXE ROMs are offered iPXE (`undionly.kpxe`) and iPXE is offered `savior.ipxe`; BIOS and UEFI clients boot from the hive with the router's addresses and join; the second hive stays a proxy and says why |
@@ -179,10 +189,14 @@ A second line follows once `savior node` has written its status and kept
 running for 10 s without a restart, or has failed to:
 
 ```
-SAVIOR-AGENT: up=24.39 agent=up age=10 starts=1 arch=x86_64 ver=dev-1a2b3c4
+SAVIOR-AGENT: up=24.39 agent=up age=10 starts=1 arch=x86_64 ver=dev-1a2b3c4 mem_avail=360 offer_mem=197
 ```
 
 The boot tests require `agent=up`, `starts=1`, `arch=x86_64` and a `ver`.
+`mem_avail` is MemAvailable in MiB when the line is printed, and `offer_mem`
+is the memory in MiB that the agent offers for tasks (`Total.mem_mb` in
+`/run/savior/status.json`); `mem-256` checks both. New fields only ever go at
+the end of these lines.
 The run wrapper also sends the agent's own log (stderr) to the serial console,
 so the harness counts its starts (`savior node starting`) and sees its exits
 and crashes (`node agent stopped`, Go's `panic:`, `fatal error:` and
@@ -211,10 +225,11 @@ as every SaviorOS menu entry does.
   group and port per run. Every VM has its own MAC and `-uuid`.
 - **hive VM** (1 GiB):
   - `roles = hive,compute`, `net = static`, `ip = 10.77.0.1/24`,
-    `dhcp_server = yes`, and an `admin_token` from the test;
+    `dhcp_server = yes`, an `admin_token` and an `ssh_key` from the test;
   - a second NIC with QEMU user networking forwards
-    `127.0.0.1:<random port>` on the host to the hive's port 7700. With
-    `net = static`, extra wired NICs use DHCP;
+    `127.0.0.1:<random port>` on the host to the hive's port 7700, and
+    another port to its port 22. With `net = static`, extra wired NICs use
+    DHCP;
   - its stick copy has 2 GiB more (sparse) space, so `savior storage init-data`
     creates SAVIOR-DATA (blob uploads need 512 MiB free).
 - **c1, c2:** `roles = compute`, DHCP from the hive.
@@ -231,7 +246,12 @@ The steps:
    `task <i> of 4` into `out.txt`, and all four outputs must arrive with the
    right contents. Each task also counts the certificates in
    `/etc/ssl/certs/ca-certificates.crt`, which the runner binds into the
-   sandbox, and every task must see at least 100.
+   sandbox, and every task must see at least 100. Each task also probes its
+   sandbox, as `TestRealSandboxIsolation` in `internal/runner` does, and all
+   four must report: a slot uid (10000-10001: one CPU, two slots), no
+   `/proc/cmdline`, no `/run`, `/media`, `/sys` or `/root`, a read-only `/`
+   and `/etc`, no network interface but `lo`, `unshare -Un` and `mount`
+   failing, and `Seccomp: 2`.
 5. `savior ctl display <disp> color --bg 000000`, and the display VM's
    screendump must turn all black. Then
    `savior ctl display <disp> text --text "HELLO SWARM"`: the screen must not
@@ -239,7 +259,18 @@ The steps:
    draws on the host for the same spec (saved as `swarm-disp-ref.png`). A
    status screen that merely redraws does not pass.
 6. `savior ctl identify --all` succeeds.
-7. **Duplicate ID:** a fifth VM boots with c1's MAC and SMBIOS UUID, so it
+7. **Hive reboot:** `savior ctl info` must say `persistent` with a `data_dir`
+   below `/var/lib/savior/data` (SAVIOR-DATA). c2 is renamed `c2-renamed`,
+   root logs in to the hive with the `ssh_key` key, and its SSH host key is
+   noted. `savior ctl reboot` makes the hive's own node agent reboot the
+   machine (rcK stops the hive and unmounts SAVIOR-DATA; QEMU exits, as it
+   runs with `-no-reboot`), and the same stick boots again with the same MAC
+   and UUID. `savior ctl`, still pinned to the old certificate, must reach
+   it, and it must be the same certificate and still `persistent`. The job
+   must still be listed as succeeded, `savior ctl outputs` must return files
+   with the same contents, the 4 nodes must come back with c2 still named
+   `c2-renamed`, and the SSH host key must be the same.
+8. **Duplicate ID:** a fifth VM boots with c1's MAC and SMBIOS UUID, so it
    derives the same node ID, but with its own static address. Its console must
    report the `duplicate` state, and the hive must still list 4 online nodes.
 
@@ -294,7 +325,10 @@ because TFTP has no access control.
   modules, loaded by the `S05mdev` coldplug from the modloop.
 - The only firmware is radeon's (`firmware:` lines in `modules.txt`). There is
   no `wpa_supplicant`, no `ntpd` and no `zcip` (Ubuntu's busybox lacks them),
-  and dropbear and dnsmasq come from the host.
+  and dropbear and dnsmasq come from the host. The `wifi` test brings its own
+  `wpa_supplicant`. The modloop does have `mac80211_hwsim` for that test, and
+  `ccm` and `cmac`: mac80211 loads its WPA2 cipher through the crypto API, so
+  `modules.dep` does not name it.
 - The CA bundle is the same Mozilla set, but it comes from Ubuntu's
   `ca-certificates` package instead of Buildroot's.
 - The image is x86_64 only. The i686 payload and the 386 binaries come with
