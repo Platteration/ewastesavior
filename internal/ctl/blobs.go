@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 
@@ -201,10 +202,33 @@ func OutputPath(e proto.OutputEntry) (string, error) {
 	if e.Index < 0 || e.Index > proto.MaxTaskCount {
 		return "", fmt.Errorf("invalid task index %d", e.Index)
 	}
-	if !proto.ValidRelPath(e.Name) || !filepath.IsLocal(filepath.FromSlash(e.Name)) {
+	if !proto.ValidRelPath(e.Name) || !filepath.IsLocal(filepath.FromSlash(e.Name)) ||
+		runtime.GOOS == "windows" && hasWindowsDeviceName(e.Name) {
 		return "", fmt.Errorf("unsafe output name %q", truncate(sanitizeCell(e.Name), 120))
 	}
 	return path.Join("task-"+strconv.Itoa(e.Index), e.Name), nil
+}
+
+// hasWindowsDeviceName reports whether a segment of the slash-separated
+// path names a Windows device (CON, PRN, AUX, NUL, COM0-9, LPT0-9, the
+// console streams), with or without an extension: Windows before 11 opens
+// the device for "nul.txt" too, and filepath.IsLocal follows Windows 11.
+func hasWindowsDeviceName(name string) bool {
+	for _, seg := range strings.Split(name, "/") {
+		base, _, _ := strings.Cut(seg, ".")
+		base = strings.ToUpper(strings.TrimRight(base, " "))
+		switch base {
+		case "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$":
+			return true
+		}
+		if len(base) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && base[3] >= '0' && base[3] <= '9' {
+			return true
+		}
+		if r := []rune(base); len(r) == 4 && (strings.HasPrefix(base, "COM") || strings.HasPrefix(base, "LPT")) && strings.ContainsRune("¹²³", r[3]) {
+			return true
+		}
+	}
+	return false
 }
 
 // DownloadOutputs saves job outputs below dir as task-<index>/<name>. Names

@@ -309,3 +309,15 @@ func TestOutputsZipHasNoSizeCap(t *testing.T) {
 		t.Fatalf("TaskOutput of %d bytes: %v, want %v", int64(size), err, errTooLarge)
 	}
 }
+
+func TestWindowsDeviceNames(t *testing.T) {
+	for name, want := range map[string]bool{
+		"CON": true, "nul.txt": true, "a/aux": true, "out/Com1.log": true, "lpt9": true, "COM¹.x": true,
+		"conin$": true, "NUL .txt": true, "prn.tar.gz": true,
+		"console.txt": false, "nullable": false, "com10": false, "lpt": false, "a/b.nul": false, "auxiliary/x": false, "ok.txt": false,
+	} {
+		if got := hasWindowsDeviceName(name); got != want {
+			t.Errorf("hasWindowsDeviceName(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
