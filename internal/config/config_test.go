@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -198,7 +199,7 @@ func TestCLI(t *testing.T) {
 		t.Fatalf("dump rc=%d %s", rc, errb.String())
 	}
 	st, err := os.Stat(dst)
-	if err != nil || st.Mode().Perm() != 0o600 {
+	if err != nil || posixModes() && st.Mode().Perm() != 0o600 {
 		t.Fatalf("dump file: %v %v", st, err)
 	}
 	out.Reset()
@@ -267,3 +268,7 @@ func TestUnreadableFileIsWarning(t *testing.T) {
 		t.Errorf("config get: rc=%d out=%q err=%q", rc, out.String(), errb.String())
 	}
 }
+
+// posixModes reports whether file modes like 0600 are meaningful here:
+// Windows has ACLs instead, and Go reports its own mode bits there.
+func posixModes() bool { return runtime.GOOS != "windows" }

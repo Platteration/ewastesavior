@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -48,7 +49,7 @@ func TestBlobPutGetAndHeaders(t *testing.T) {
 	if st, raw := do(t, h.hc, "PUT", h.url+"/api/v1/blobs/"+sum, testAdmin, data, &info); st != 200 || info.Size != int64(len(data)) || info.SHA256 != sum {
 		t.Fatalf("put: %d %s", st, raw)
 	}
-	if fi, err := os.Stat(h.s.blobs.path(sum)); err != nil || fi.Size() != int64(len(data)) || !strings.Contains(h.s.blobs.path(sum), "/blobs/"+sum[:2]+"/") {
+	if fi, err := os.Stat(h.s.blobs.path(sum)); err != nil || fi.Size() != int64(len(data)) || !strings.Contains(filepath.ToSlash(h.s.blobs.path(sum)), "/blobs/"+sum[:2]+"/") {
 		t.Fatalf("layout: %v", err)
 	}
 	req, _ := http.NewRequest("GET", h.url+"/api/v1/blobs/"+sum, nil)

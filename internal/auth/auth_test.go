@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -108,7 +109,7 @@ func TestCertPersistenceAndPinning(t *testing.T) {
 	if err != nil || fp2 != fp || len(cert2.Certificate) == 0 {
 		t.Fatalf("reload changed cert: %v %s %s", err, fp, fp2)
 	}
-	if st, _ := os.Stat(filepath.Join(dir, "key.pem")); st.Mode().Perm() != 0o600 {
+	if st, _ := os.Stat(filepath.Join(dir, "key.pem")); posixModes() && st.Mode().Perm() != 0o600 {
 		t.Fatalf("key mode %v", st.Mode())
 	}
 
@@ -147,3 +148,7 @@ func TestCorruptCertIsAnError(t *testing.T) {
 		t.Fatal("corrupt cert silently replaced")
 	}
 }
+
+// posixModes reports whether file modes like 0600 are meaningful here:
+// Windows has ACLs instead, and Go reports its own mode bits there.
+func posixModes() bool { return runtime.GOOS != "windows" }

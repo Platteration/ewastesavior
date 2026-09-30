@@ -139,7 +139,7 @@ func TestLogTailKeepsLast64KiB(t *testing.T) {
 	n.succeed(tk)
 	h.s.io.flush()
 	fi, err := os.Stat(h.s.logPath(tk.ID))
-	if err != nil || fi.Size() != logTailSize || fi.Mode().Perm() != 0o600 {
+	if err != nil || fi.Size() != logTailSize || posixModes() && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("tail file: %v %v", fi, err)
 	}
 	resp, err := adminGet(h, "tasks/"+tk.ID+"/log?offset=0")

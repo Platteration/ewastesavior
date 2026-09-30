@@ -125,7 +125,7 @@ func TestDataDirResolution(t *testing.T) {
 	if err != nil || d.path != filepath.Join(root, "xdg", "savior", "hive") || d.warning != "" && !d.ram {
 		t.Fatalf("elsewhere: %+v %v", d, err)
 	}
-	if fi, err := os.Stat(d.path); err != nil || fi.Mode().Perm() != 0o700 {
+	if fi, err := os.Stat(d.path); err != nil || posixModes() && fi.Mode().Perm() != 0o700 {
 		t.Fatalf("data dir mode: %v %v", fi, err)
 	}
 	// On SaviorOS without the data partition: RAM with a warning.
@@ -157,7 +157,7 @@ func TestSecretsGeneratedAndStored(t *testing.T) {
 	}
 	for _, f := range []string{"swarm_key", "admin_token", "hive_id", "tls/key.pem"} {
 		fi, err := os.Stat(filepath.Join(dir, f))
-		if err != nil || fi.Mode().Perm() != 0o600 {
+		if err != nil || posixModes() && fi.Mode().Perm() != 0o600 {
 			t.Fatalf("%s: %v %v", f, fi, err)
 		}
 	}
@@ -228,7 +228,7 @@ func TestRunServesAndShutsDown(t *testing.T) {
 		var p StatusPanel
 		return err == nil && json.Unmarshal(data, &p) == nil && p.Fingerprint == s.Fingerprint() && len(p.PairCode) == 8
 	})
-	if fi, _ := os.Stat(statusFile); fi.Mode().Perm() != 0o600 {
+	if fi, _ := os.Stat(statusFile); posixModes() && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("status file mode %v", fi.Mode())
 	}
 	cancel()

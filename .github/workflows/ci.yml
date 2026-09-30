@@ -29,6 +29,31 @@ jobs:
         run: make test-race
       - name: go test (386, sse2 and softfloat)
         run: make test-386
+      # The real task sandbox (internal/runner/sandbox_root_linux_test.go:
+      # namespaces, pivot_root, dropped privileges, seccomp, cgroups) is only
+      # tested as root, so the steps above skip it. Run it with sudo, as
+      # amd64 and as 386 (the 386 shim and its native-only seccomp filter),
+      # and fail on any skip: a runner without namespaces, cgroup2 or
+      # seccomp must not pass silently.
+      - name: sandbox isolation tests as root (amd64, 386)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tests='TestReal|TestExecFailureIsTheCommands|TestSandboxEtcReadableUnderUmask077'
+          for a in amd64 386; do
+            log="$RUNNER_TEMP/sandbox-$a.log"
+            echo "::group::GOARCH=$a"
+            sudo env PATH="$PATH" HOME="$HOME" GOCACHE="$RUNNER_TEMP/gocache-root" \
+              GOMODCACHE="$(go env GOMODCACHE)" GOTOOLCHAIN=local GOARCH="$a" GO386=softfloat CGO_ENABLED=0 \
+              go test -count=1 -v -run "$tests" ./internal/runner/ 2>&1 | tee "$log"
+            echo "::endgroup::"
+            if grep -- '--- SKIP' "$log"; then
+              echo "::error::GOARCH=$a: sandbox tests skipped instead of running as root"
+              exit 1
+            fi
+            grep -q -- '--- PASS: TestRealSandboxIsolation ' "$log" ||
+              { echo "::error::GOARCH=$a: TestRealSandboxIsolation did not run"; exit 1; }
+          done
 
   cross:
     name: build ${{ matrix.name }}
@@ -66,6 +91,90 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # The hive and savior ctl are normal programs on macOS and Windows too
+  # (DESIGN 1, USER_GUIDE 2): run the tests of the packages they are built
+  # from there, and the hive itself (scripts/hive-smoke.sh: generated
+  # secrets, ctl info/node-config/upload, state kept across a restart).
+  hive-desktop:
+    name: hive and ctl on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      # Windows runners check out with CRLF line endings by default, which
+      # breaks the shell script and the tests that read repository files.
+      - name: Keep LF line endings
+        shell: bash
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      # Tests that assert POSIX file modes skip only that assertion on
+      # Windows (posixModes in the test helpers).
+      - name: go test (hive, ctl and their packages)
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -count=1 ./internal/hive/... ./internal/ctl/... ./internal/auth/... \
+            ./internal/config/... ./internal/discovery/... ./internal/imaging/... ./internal/proto/...
+      # Relative paths: no MSYS path conversion between Git Bash and savior.exe.
+      - name: hive smoke test
+        shell: bash
+        run: |
+          go build -o "build/savior$(go env GOEXE)" ./cmd/savior
+          sh scripts/hive-smoke.sh "build/savior$(go env GOEXE)" build/hive-smoke
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hive-smoke-${{ matrix.os }}
+          path: build/hive-smoke/hive.log
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # The dashboard in a real browser against a real hive and node agents
+  # (internal/hive/web/e2e_test.go, testdata/e2e.mjs): sign-in by pairing
+  # code, every page, node actions, a job with logs across a retry,
+  # downloads, walls, session expiry, keyboard focus. Missing tools fail.
+  web-e2e:
+    name: dashboard in Chromium (make test-web-e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: playwright-core and Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pw" && cd "$RUNNER_TEMP/pw"
+          npm init -y >/dev/null
+          npm install --no-audit --no-fund playwright-core@1.56
+          npx playwright-core install --with-deps chromium
+      - name: make test-web-e2e
+        run: make test-web-e2e SAVIOR_WEB_E2E=require SAVIOR_PLAYWRIGHT_DIR="$RUNNER_TEMP/pw"
+        env:
+          SAVIOR_E2E_OUT: ${{ runner.temp }}/e2e-out
+      - name: Upload screenshots
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-e2e-screenshots
+          path: ${{ runner.temp }}/e2e-out
+          if-no-files-found: ignore
+          retention-days: 14
+
   shell:
     name: shell scripts (shellcheck, self-tests)
     runs-on: ubuntu-latest
@@ -75,11 +184,27 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends shellcheck squashfs-tools xz-utils cpio curl
+          sudo apt-get install -y --no-install-recommends shellcheck squashfs-tools xz-utils cpio curl busybox-static
+      # test-scripts runs S50sshd in an `unshare -r` chroot with a static
+      # BusyBox; Ubuntu 24.04's AppArmor restricts unprivileged user
+      # namespaces by default.
+      - name: Allow unprivileged user namespaces
+        run: |
+          if [ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
       - name: make lint-sh
         run: make lint-sh
+      # Fail when a case skips for want of a tool: a skipped case tests nothing.
       - name: make test-scripts
-        run: make test-scripts
+        shell: bash
+        run: |
+          set -o pipefail
+          make test-scripts 2>&1 | tee "$RUNNER_TEMP/test-scripts.log"
+          if grep -n '^skip' "$RUNNER_TEMP/test-scripts.log"; then
+            echo "::error::test-scripts skipped the cases above"
+            exit 1
+          fi
 
   dev-image:
     name: dev image + QEMU boot tests
@@ -92,13 +217,15 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
+      # openssh-client: ssh_key logins (boot-bios, boot-uefi); wpasupplicant,
+      # hostapd, iw: the wifi-conf and wifi tests put them into the guest.
       - name: Install packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 ovmf busybox-static grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
             mtools dosfstools xorriso cpio xz-utils zstd kmod squashfs-tools dropbear-bin dnsmasq-base \
-            e2fsprogs jq python3
+            e2fsprogs jq python3 openssh-client wpasupplicant hostapd iw
       - name: Enable KVM when the runner has it
         run: |
           if [ -e /dev/kvm ]; then
@@ -133,13 +260,14 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: "1.24"
+      # openssh-client: the hive's SSH host key before and after its reboot.
       - name: Install packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             qemu-system-x86 ovmf busybox-static grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
             mtools dosfstools xorriso cpio xz-utils zstd kmod squashfs-tools dropbear-bin dnsmasq-base \
-            e2fsprogs jq python3
+            e2fsprogs jq python3 openssh-client
       - name: Enable KVM when the runner has it
         run: |
           if [ -e /dev/kvm ]; then
@@ -154,6 +282,50 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: swarm-test-logs
+          path: |
+            build/dev/**/*.log
+            build/dev/logs/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  netboot:
+    name: QEMU netboot tests (hive-pxe, hive-pxe-proxy)
+    needs: dev-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 ovmf busybox-static grub-pc-bin grub-efi-amd64-bin grub-efi-ia32-bin \
+            mtools dosfstools xorriso cpio xz-utils zstd kmod squashfs-tools dropbear-bin dnsmasq-base \
+            e2fsprogs jq python3 ipxe
+      - name: Enable KVM when the runner has it
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          fi
+      - name: make dev-image
+        run: make dev-image
+      # S65netboot (dnsmasq DHCP/proxy DHCP + TFTP, grub.cfg, savior.ipxe),
+      # the hive's netboot HTTP server, diskless BIOS and UEFI clients, and
+      # the keyless join: pending until `savior ctl approve`.
+      - name: netboot tests
+        run: sh os/dev/qemu-test.sh hive-pxe hive-pxe-proxy --out build/dev
+      - name: Upload logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netboot-test-logs
           path: |
             build/dev/**/*.log
             build/dev/logs/

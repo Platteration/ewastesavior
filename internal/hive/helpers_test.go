@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -374,3 +375,7 @@ func (h *testHive) putBlob(data []byte) string {
 	}
 	return sum
 }
+
+// posixModes reports whether file modes like 0600 are meaningful here:
+// Windows has ACLs instead, and Go reports its own mode bits there.
+func posixModes() bool { return runtime.GOOS != "windows" }

@@ -74,7 +74,7 @@ func TestJobSubmitPersistedSynchronously(t *testing.T) {
 		t.Fatalf("job not persisted before the response: %v", err)
 	}
 	fi, _ := os.Stat(filepath.Join(h.dir, "state.json"))
-	if fi.Mode().Perm() != 0o600 {
+	if posixModes() && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("state.json mode %v", fi.Mode())
 	}
 	// Liveness-only changes wait for the liveness interval.
