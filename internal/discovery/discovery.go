@@ -23,6 +23,18 @@ import (
 // MaxDatagram is the largest datagram we send or accept.
 const MaxDatagram = 1400
 
+// Beacons are unauthenticated and anyone on the LAN can send them, so what
+// a listener keeps is bounded.
+const (
+	// MaxCandidates is the most distinct hives Collect returns.
+	MaxCandidates = 32
+	// maxPerSource is the most of those one source address contributes, so
+	// a single flooding host can't crowd out the real hive.
+	maxPerSource = 4
+	// maxBeaconText bounds the free-form beacon fields (hive_id, version).
+	maxBeaconText = 64
+)
+
 // AnnounceOptions configures the hive side.
 type AnnounceOptions struct {
 	Port     int           // UDP port to send to and listen on for probes (default proto.DiscoveryPort)
@@ -214,27 +226,44 @@ func Discover(ctx context.Context, swarmHint string, o DiscoverOptions) (string,
 	return "", proto.Beacon{}, err
 }
 
-// Collect gathers every distinct hive (by URL) seen within window. Beacons
-// of any swarm are returned so callers can tell "wrong key" from "no hive".
+// Collect gathers every distinct hive (by URL and hive ID) seen within
+// window, at most MaxCandidates of them and at most maxPerSource from one
+// address (the first ones seen); later beacons are still read and dropped.
+// Beacons of any swarm are returned so callers can tell "wrong key" from
+// "no hive".
 func Collect(ctx context.Context, window time.Duration, o DiscoverOptions) ([]Candidate, error) {
 	ctx, cancel := context.WithTimeout(ctx, window)
 	defer cancel()
 	var mu sync.Mutex
 	var out []Candidate
 	seen := map[string]bool{}
+	perSource := map[string]int{}
 	err := Listen(ctx, o, func(c Candidate) bool {
 		mu.Lock()
 		defer mu.Unlock()
-		if !seen[c.URL+"|"+c.Beacon.HiveID] {
-			seen[c.URL+"|"+c.Beacon.HiveID] = true
-			out = append(out, c)
+		key := c.URL + "|" + c.Beacon.HiveID
+		src := sourceOf(c.URL)
+		if len(out) >= MaxCandidates || seen[key] || perSource[src] >= maxPerSource {
+			return true
 		}
+		seen[key] = true
+		perSource[src]++
+		out = append(out, c)
 		return true
 	})
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		err = nil
 	}
 	return out, err
+}
+
+// sourceOf returns the host of a candidate URL (the beacon's source IP).
+func sourceOf(u string) string {
+	host, _, err := net.SplitHostPort(strings.TrimPrefix(u, "https://"))
+	if err != nil {
+		return u
+	}
+	return host
 }
 
 // Listen sends probes and calls fn for every valid beacon until fn returns
@@ -329,7 +358,35 @@ func ParseBeacon(data []byte) (proto.Beacon, bool) {
 	if b.Svc != proto.BeaconService || b.V != proto.APIVersion || b.Port < 1 || b.Port > 65535 {
 		return b, false
 	}
+	if len(b.HiveID) > maxBeaconText || len(b.Version) > maxBeaconText ||
+		!validHint(b.SwarmHint) || !validFingerprint(b.Fingerprint) {
+		return b, false
+	}
 	return b, true
+}
+
+// validHint accepts an empty swarm hint or 8 lowercase hex characters
+// (auth.Secret.SwarmHint).
+func validHint(h string) bool {
+	if h == "" {
+		return true
+	}
+	if len(h) != 8 {
+		return false
+	}
+	for i := 0; i < len(h); i++ {
+		if c := h[i]; !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+// validFingerprint accepts an empty fingerprint or "sha256:" and 64
+// lowercase hex characters (auth.Fingerprint).
+func validFingerprint(fp string) bool {
+	digits, ok := strings.CutPrefix(fp, "sha256:")
+	return fp == "" || ok && proto.ValidSHA256(digits)
 }
 
 // BroadcastTargets returns 255.255.255.255:port plus the directed broadcast

@@ -75,9 +75,12 @@ func (a *Agent) nodeStatus() proto.NodeStatus {
 	m := a.metrics()
 	// Never call into the display controller while holding a.mu: its render
 	// loop calls back into statusInfo, which takes a.mu.
+	a.mu.Lock()
+	disp := a.disp
+	a.mu.Unlock()
 	var ds proto.DisplayState
-	if a.disp != nil {
-		ds = a.disp.State()
+	if disp != nil {
+		ds = disp.State()
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
@@ -241,24 +244,34 @@ func (a *Agent) runAction(act proto.ActionDirective) {
 		}
 	case proto.ActionReboot, proto.ActionPoweroff:
 		a.log.Warn("hive requested "+act.Action, "id", act.ID)
-		if !manage {
-			return
+		sys := a.opt.SystemAction
+		if sys == nil {
+			if !manage {
+				return
+			}
+			sys = systemAction
 		}
-		// Ack in a heartbeat first so the hive drops the action, then act.
+		// Ack in a heartbeat first so the hive drops the action (it re-sends
+		// unacked ones), then act.
 		go func() {
 			a.sendAckNow()
 			a.shutdownTasks()
-			cmd := "/sbin/reboot"
-			if act.Action == proto.ActionPoweroff {
-				cmd = "/sbin/poweroff"
-			}
-			if err := exec.Command(cmd).Run(); err != nil {
+			if err := sys(act.Action); err != nil {
 				a.log.Error(act.Action+" failed", "err", err)
 			}
 		}()
 	default:
 		a.log.Warn("unknown action", "action", act.Action)
 	}
+}
+
+// systemAction reboots or powers off the machine.
+func systemAction(action string) error {
+	cmd := "/sbin/reboot"
+	if action == proto.ActionPoweroff {
+		cmd = "/sbin/poweroff"
+	}
+	return exec.Command(cmd).Run()
 }
 
 // sendAckNow sends one immediate heartbeat carrying pending acks.

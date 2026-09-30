@@ -8,12 +8,16 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/png"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +28,7 @@ import (
 	"github.com/platteration/ewastesavior/internal/config"
 	"github.com/platteration/ewastesavior/internal/display"
 	"github.com/platteration/ewastesavior/internal/hive"
+	"github.com/platteration/ewastesavior/internal/hwinfo"
 	"github.com/platteration/ewastesavior/internal/proto"
 )
 
@@ -140,6 +145,33 @@ func (h *testHive) get(path string) []byte {
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	return b
+}
+
+// putBlob uploads data as an admin blob and returns its hash.
+func (h *testHive) putBlob(data []byte) string {
+	h.t.Helper()
+	sum := sha256Hex(data)
+	req, _ := http.NewRequest(http.MethodPut, h.url()+"/api/v1/blobs/"+sum, bytes.NewReader(data))
+	req.Header.Set("Authorization", "Bearer "+h.srv.AdminToken())
+	resp, err := h.admin.Do(req)
+	if err != nil {
+		h.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		h.t.Fatalf("put blob: %d %s", resp.StatusCode, b)
+	}
+	return sum
+}
+
+func (h *testHive) nodeView(ref string) proto.NodeView {
+	h.t.Helper()
+	var v proto.NodeView
+	if code := h.api(http.MethodGet, "/api/v1/admin/nodes/"+ref, nil, &v); code != http.StatusOK {
+		h.t.Fatalf("node %s: %d", ref, code)
+	}
+	return v
 }
 
 type testNode struct {
@@ -485,5 +517,248 @@ func TestHiveRestartReadoptsRunningTask(t *testing.T) {
 	h2.api(http.MethodGet, "/api/v1/admin/jobs/"+id+"/tasks", nil, &page)
 	if len(page.Tasks) != 1 || page.Tasks[0].Attempt != 1 {
 		t.Fatalf("task was re-run instead of re-adopted: %+v", page.Tasks)
+	}
+}
+
+// screenAt returns a pixel of the node's (logical) screen.
+func (n *testNode) screenAt(x, y int) color.RGBA { return n.disp.DecodeLogical().RGBAAt(x, y) }
+
+var (
+	red   = color.RGBA{255, 0, 0, 255}
+	blue  = color.RGBA{0, 0, 255, 255}
+	white = color.RGBA{255, 255, 255, 255}
+)
+
+// Uploaded images reach the screen through the hive's render endpoint (node
+// token scope, exact geometry, pixel-for-pixel decode), and the spec's
+// background fills the letterbox (SPEC-RUNTIME-10, DISPLAY-HW-1/5).
+func TestBlobImageOnScreen(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	h := startHive(t, t.TempDir(), "")
+	defer h.stop()
+	n := startNode(t, h, "lobby", nil)
+	waitFor(t, "lobby connected", 30*time.Second, func() bool { return n.link() == proto.LinkConnected })
+
+	// 400×100 red on the 320×240 screen: contain puts it at y 80..160.
+	img := image.NewRGBA(image.Rect(0, 0, 400, 100))
+	for i := range img.Pix {
+		img.Pix[i] = []byte{255, 0, 0, 255}[i%4]
+	}
+	var b bytes.Buffer
+	png.Encode(&b, img)
+	sum := h.putBlob(b.Bytes())
+	spec := proto.DisplaySpec{Mode: proto.DisplayImage, Image: &proto.Media{Blob: sum}, BG: "#ffffff", Fit: "contain"}
+	if code := h.api(http.MethodPatch, "/api/v1/admin/nodes/lobby", proto.NodePatch{Display: &spec}, nil); code != 200 {
+		t.Fatalf("patch display: %d", code)
+	}
+	waitFor(t, "image on screen", 30*time.Second, func() bool {
+		st := n.agent.disp.State()
+		return st.Mode == proto.DisplayImage && st.Ready && n.screenAt(160, 120) == red
+	})
+	if c := n.screenAt(10, 10); c != white {
+		t.Errorf("letterbox %v, want the spec's bg #ffffff", c)
+	}
+	if st := n.agent.disp.State(); len(st.MediaErrors) != 0 {
+		t.Errorf("media errors %v", st.MediaErrors)
+	}
+}
+
+// A video wall across two real agents: each shows its part of an uploaded
+// image, follows content changes, and returns to its status screen when
+// the wall is deleted (DESIGN 15, E2E-GAPS-13).
+func TestWallAcrossAgents(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	h := startHive(t, t.TempDir(), "")
+	defer h.stop()
+	left := startNode(t, h, "wall-a", nil)
+	right := startNode(t, h, "wall-b", nil)
+	waitFor(t, "both connected", 30*time.Second, func() bool {
+		return left.link() == proto.LinkConnected && right.link() == proto.LinkConnected
+	})
+	both := []*testNode{left, right}
+
+	// 1×2 wall of 320×240 mm cells (1 mm = 1 screen pixel), 640×240
+	// image: left half red, right half blue.
+	sum := h.putBlob(splitPNG(t, 640, 240))
+	wall := proto.WallSpec{Name: "lobby", Rows: 1, Cols: 2,
+		Cells: []proto.WallCell{
+			{Node: "wall-a", Row: 0, Col: 0, WidthMM: 320, HeightMM: 240},
+			{Node: "wall-b", Row: 0, Col: 1, WidthMM: 320, HeightMM: 240},
+		},
+		Content: proto.DisplaySpec{Mode: proto.DisplayImage, Image: &proto.Media{Blob: sum}, Fit: "stretch"}}
+	var saved proto.WallSpec
+	if code := h.api(http.MethodPost, "/api/v1/admin/walls", wall, &saved); code != 200 || saved.ID == "" {
+		t.Fatalf("create wall: %d %+v", code, saved)
+	}
+	waitFor(t, "each screen shows its half", 30*time.Second, func() bool {
+		return left.screenAt(160, 120) == red && right.screenAt(160, 120) == blue &&
+			left.screenAt(310, 120) == red && right.screenAt(10, 120) == blue
+	})
+	for _, n := range both {
+		if st := n.agent.disp.State(); st.Mode != proto.DisplayWall || len(st.MediaErrors) != 0 {
+			t.Errorf("%s: display state %+v", n.agent.name, st)
+		}
+	}
+
+	// contain with a bg: the image (4:1 on the 8:3 canvas) leaves bands
+	// at the top and bottom of both screens in the spec's colour.
+	wide := h.putBlob(splitPNG(t, 400, 100))
+	saved.Content = proto.DisplaySpec{Mode: proto.DisplayImage, Image: &proto.Media{Blob: wide}, Fit: "contain", BG: "#ffffff"}
+	if code := h.api(http.MethodPut, "/api/v1/admin/walls/"+saved.ID, saved, &saved); code != 200 {
+		t.Fatalf("update wall: %d", code)
+	}
+	waitFor(t, "letterboxed wall", 30*time.Second, func() bool {
+		return left.screenAt(160, 120) == red && right.screenAt(160, 120) == blue &&
+			left.screenAt(160, 10) == white && right.screenAt(160, 230) == white
+	})
+
+	// New content reaches both screens.
+	before := [][]byte{left.disp.DecodeLogical().Pix, right.disp.DecodeLogical().Pix}
+	saved.Content = proto.DisplaySpec{Mode: proto.DisplayTest}
+	if code := h.api(http.MethodPut, "/api/v1/admin/walls/"+saved.ID, saved, &saved); code != 200 {
+		t.Fatalf("update wall: %d", code)
+	}
+	waitFor(t, "test pattern on both", 30*time.Second, func() bool {
+		for i, n := range both {
+			if bytes.Equal(n.disp.DecodeLogical().Pix, before[i]) || n.screenAt(160, 10) == white {
+				return false
+			}
+		}
+		return true
+	})
+
+	if code := h.api(http.MethodDelete, "/api/v1/admin/walls/"+saved.ID, nil, nil); code != 200 {
+		t.Fatalf("delete wall: %d", code)
+	}
+	waitFor(t, "status screens again", 30*time.Second, func() bool {
+		return left.agent.disp.State().Mode == proto.DisplayStatus && right.agent.disp.State().Mode == proto.DisplayStatus
+	})
+}
+
+// identify shows on the node's screen, and reboot is acked to the real
+// hive before the agent acts on it (SPEC-RUNTIME-09).
+func TestNodeActions(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	h := startHive(t, t.TempDir(), "")
+	defer h.stop()
+	var agent atomic.Pointer[Agent]
+	type sysCall struct {
+		action      string
+		stillQueued bool // the hive still sends the action after the ack
+		ackPending  int
+	}
+	calls := make(chan sysCall, 4)
+	n := startNode(t, h, "actor", func(_ *config.Config, o *Options) {
+		o.SystemAction = func(action string) error {
+			a := agent.Load()
+			a.mu.Lock()
+			hc, pending := a.hc, len(a.ackPending)
+			a.mu.Unlock()
+			// Ask the hive what it still wants, acking nothing.
+			st := a.nodeStatus()
+			st.AckedActions = nil
+			resp, err := hc.heartbeat(context.Background(), &proto.HeartbeatRequest{Status: st})
+			queued := err != nil
+			for _, act := range resp.Directives.Actions {
+				queued = queued || act.Action == action
+			}
+			calls <- sysCall{action, queued, pending}
+			return nil
+		}
+	})
+	agent.Store(n.agent)
+	waitFor(t, "actor connected", 30*time.Second, func() bool { return n.link() == proto.LinkConnected })
+	green := proto.DisplaySpec{Mode: proto.DisplayColor, BG: "#00ff00"}
+	if code := h.api(http.MethodPatch, "/api/v1/admin/nodes/actor", proto.NodePatch{Display: &green}, nil); code != 200 {
+		t.Fatalf("patch display: %d", code)
+	}
+	waitFor(t, "green screen", 20*time.Second, func() bool { return n.screenAt(160, 120) == color.RGBA{0, 255, 0, 255} })
+
+	if code := h.api(http.MethodPost, "/api/v1/admin/nodes/actor/action", proto.NodeAction{Action: proto.ActionIdentify, Seconds: 5}, nil); code != 200 {
+		t.Fatalf("identify: %d", code)
+	}
+	// The overlay panel (inset 15 px on 320×240) flashes yellow and dark.
+	waitFor(t, "identify overlay", 20*time.Second, func() bool {
+		c := n.screenAt(22, 22)
+		return c == color.RGBA{0xff, 0xd4, 0x00, 0xff} || c == color.RGBA{0x10, 0x10, 0x10, 0xff}
+	})
+
+	if code := h.api(http.MethodPost, "/api/v1/admin/nodes/actor/action", proto.NodeAction{Action: proto.ActionReboot}, nil); code != 200 {
+		t.Fatalf("reboot: %d", code)
+	}
+	var c sysCall
+	select {
+	case c = <-calls:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the agent never acted on the reboot")
+	}
+	if c.action != proto.ActionReboot || c.stillQueued || c.ackPending != 0 {
+		t.Fatalf("reboot ran as %+v; want it acked to the hive first", c)
+	}
+	// The hive no longer sends it, and the agent doesn't run it again.
+	select {
+	case c = <-calls:
+		t.Fatalf("second system action %+v", c)
+	case <-time.After(3 * time.Second):
+	}
+}
+
+// roles=auto: a display that appears after the agent started enables the
+// display role, and the node registers again with it (DESIGN 5.3,
+// SPEC-CORE-4).
+func TestLateDisplayEnablesRole(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration")
+	}
+	h := startHive(t, t.TempDir(), "")
+	defer h.stop()
+	root := t.TempDir() // an empty /sys: no DRM card or framebuffer yet
+	n := startNode(t, h, "late", func(c *config.Config, o *Options) {
+		c.Roles = []string{"auto"}
+		o.DisplayProbe = func() bool { return hwinfo.HasDisplay(root) }
+		o.DisplayPoll = 100 * time.Millisecond
+	})
+	waitFor(t, "late connected", 30*time.Second, func() bool { return n.link() == proto.LinkConnected })
+	if roles := h.nodeView("late").Roles; !slices.Equal(roles, []proto.Role{proto.RoleCompute}) {
+		t.Fatalf("roles before a display: %v", roles)
+	}
+	// A spec set before the display exists is shown once it does.
+	text := proto.DisplaySpec{Mode: proto.DisplayText, Text: "HELLO", BG: "#003366"}
+	if code := h.api(http.MethodPatch, "/api/v1/admin/nodes/late", proto.NodePatch{Display: &text}, nil); code != 200 {
+		t.Fatalf("patch display: %d", code)
+	}
+	time.Sleep(2 * time.Second) // a heartbeat or two delivers it to the display-less agent
+	n.agent.mu.Lock()
+	early := n.agent.disp
+	n.agent.mu.Unlock()
+	if early != nil {
+		t.Fatal("display controller started without a display")
+	}
+
+	if err := os.MkdirAll(filepath.Join(root, "sys/class/graphics/fb0"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "display role registered", 30*time.Second, func() bool {
+		v := h.nodeView("late")
+		return slices.Equal(v.Roles, []proto.Role{proto.RoleCompute, proto.RoleDisplay}) && v.Liveness == proto.NodeOnline
+	})
+	waitFor(t, "late connected again", 30*time.Second, func() bool { return n.link() == proto.LinkConnected })
+	waitFor(t, "text on the new screen", 30*time.Second, func() bool {
+		n.agent.mu.Lock()
+		disp := n.agent.disp
+		n.agent.mu.Unlock()
+		return disp != nil && disp.State().Mode == proto.DisplayText && n.screenAt(2, 2) == color.RGBA{0x00, 0x33, 0x66, 0xff}
+	})
+	n.agent.mu.Lock()
+	reserved := n.agent.total.MemMB
+	n.agent.mu.Unlock()
+	if v := h.nodeView("late"); v.Status.Total.MemMB != reserved {
+		t.Errorf("hive sees %d MB for tasks, agent offers %d", v.Status.Total.MemMB, reserved)
 	}
 }

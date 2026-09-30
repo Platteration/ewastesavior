@@ -18,8 +18,9 @@ import (
 	"github.com/platteration/ewastesavior/internal/version"
 )
 
-// setupDisplay creates the display controller with the local default scene.
-func (a *Agent) setupDisplay() {
+// newDisplay creates the display controller with the local default scene
+// (and the URL media fetcher it uses). The caller stores it in a.disp.
+func (a *Agent) newDisplay() *display.Controller {
 	open := a.opt.OpenDisplay
 	if open == nil {
 		dev := a.cfg.DisplayDevice
@@ -42,13 +43,14 @@ func (a *Agent) setupDisplay() {
 		Fetch:    a.fetchMedia,
 		Location: loc,
 	}
-	a.disp = display.NewController(open, env, a.log.With("component", "display"))
-	a.disp.SetCache(cache)
+	disp := display.NewController(open, env, a.log.With("component", "display"))
+	disp.SetCache(cache)
 	if a.cfg.DisplayIdleOff > 0 {
-		a.disp.SetIdleOff(time.Duration(a.cfg.DisplayIdleOff) * time.Minute)
+		disp.SetIdleOff(time.Duration(a.cfg.DisplayIdleOff) * time.Minute)
 	}
-	a.disp.SetRotate(a.cfg.DisplayRotate)
-	a.disp.Apply(a.localDisplaySpec())
+	disp.SetRotate(a.cfg.DisplayRotate)
+	disp.Apply(a.localDisplaySpec())
+	return disp
 }
 
 // localDisplaySpec is the screen before the hive says otherwise.
@@ -138,7 +140,7 @@ func (a *Agent) statusInfo() display.StatusInfo {
 		Inventory:    a.inv,
 		RunningTasks: len(a.tasks),
 		PowerReason:  a.decision.Reason,
-		Hive:         readHivePanel(),
+		Hive:         readHivePanel(a.hivePanelPath()),
 	}
 }
 
@@ -155,13 +157,21 @@ type consoleStatus struct {
 	TaskNames []string `json:"tasks"`
 }
 
-// writeStatus atomically writes the status file (0644: no secrets in it).
+// writeStatus atomically writes the status file. It is 0644, so it holds
+// no secrets: the hive's pairing code is left out (HivePanel.PairCode is
+// never serialized, and it is cleared here too); `savior console` reads the
+// code from the hive's own 0600 file.
 func (a *Agent) writeStatus() {
 	path := a.statusPath()
 	if path == "" {
 		return
 	}
 	si := a.statusInfo()
+	if si.Hive != nil {
+		h := *si.Hive
+		h.PairCode = ""
+		si.Hive = &h
+	}
 	a.mu.Lock()
 	cs := consoleStatus{
 		StatusInfo: si,
@@ -197,11 +207,15 @@ func (a *Agent) writeStatus() {
 
 // hivePanelFile is written by a hive running on this machine (roles=hive;
 // see hive.DefaultStatusFile) so the status screen and console can show how
-// to reach it.
+// to reach it. It is 0600: it holds the dashboard pairing code.
 const hivePanelFile = "/run/savior/hive-status.json"
 
-func readHivePanel() *display.HivePanel {
-	b, err := os.ReadFile(hivePanelFile)
+func (a *Agent) hivePanelPath() string { return orDefault(a.opt.HivePanelFile, hivePanelFile) }
+
+// readHivePanel reads a hive's status panel file (nil when there is none
+// or it is unreadable).
+func readHivePanel(path string) *display.HivePanel {
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}

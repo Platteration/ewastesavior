@@ -87,7 +87,10 @@ type StatusInfo struct {
 type HivePanel struct {
 	URLs        []string
 	Fingerprint string
-	PairCode    string
+	// PairCode redeems for a dashboard admin session: it is drawn on the
+	// hive's own screen but never serialized, so it can't leak through the
+	// node's world-readable status file.
+	PairCode    string `json:"-"`
 	NodesOnline int
 	Persistent  bool
 }

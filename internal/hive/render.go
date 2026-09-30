@@ -31,7 +31,7 @@ const (
 type renderParams struct {
 	cw, ch, x, y, w, h, pw, ph int
 	fit                        string
-	bg                         color.RGBA
+	bg                         color.RGBA // uncovered canvas; zero (transparent) without bg=
 	bgHex                      string
 }
 
@@ -71,7 +71,10 @@ func parseRenderParams(q map[string][]string) (renderParams, error) {
 	default:
 		return p, fmt.Errorf("fit must be contain, cover or stretch")
 	}
-	p.bg = color.RGBA{A: 255}
+	// Without bg, canvas areas the image doesn't cover stay transparent
+	// (the PNG keeps alpha): the node composites the frame over its own
+	// spec's background, as it does for URL media and local decodes.
+	p.bg = color.RGBA{}
 	if v := get("bg"); v != "" {
 		r, g, b, ok := proto.ParseColor("#" + v)
 		if !ok {

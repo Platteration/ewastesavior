@@ -11,6 +11,7 @@ import (
 	"hash/crc32"
 	"image"
 	"image/color"
+	"image/jpeg"
 	"image/png"
 	"net/http"
 	"net/http/httptest"
@@ -351,5 +352,69 @@ func TestDecodeFrame(t *testing.T) {
 	}
 	if _, err := DecodeFrame(bytes.NewReader(data), FetchRequest{}, nil); err == nil {
 		t.Fatal("invalid request accepted")
+	}
+}
+
+// jpegWithMetadata encodes a small JPEG and inserts n APP2 segments of size
+// bytes each right after SOI (like large ICC or XMP blocks), so the frame
+// header comes after them. declW×declH, when set, replace the dimensions in
+// the frame header: DecodeConfig reports them although the data is small.
+func jpegWithMetadata(t testing.TB, n, size, declW, declH int) []byte {
+	t.Helper()
+	img := image.NewRGBA(image.Rect(0, 0, 32, 16))
+	fill(img, img.Rect, rgb(0, 200, 0))
+	var b bytes.Buffer
+	if err := jpeg.Encode(&b, img, nil); err != nil {
+		t.Fatal(err)
+	}
+	enc := b.Bytes()
+	if declW > 0 {
+		sof := bytes.Index(enc, []byte{0xff, 0xc0})
+		if sof < 0 {
+			t.Fatal("no SOF0 marker")
+		}
+		binary.BigEndian.PutUint16(enc[sof+5:], uint16(declH))
+		binary.BigEndian.PutUint16(enc[sof+7:], uint16(declW))
+	}
+	var out bytes.Buffer
+	out.Write(enc[:2]) // SOI
+	for range n {
+		out.Write([]byte{0xff, 0xe2})
+		binary.Write(&out, binary.BigEndian, uint16(size+2))
+		out.Write(bytes.Repeat([]byte{'m'}, size))
+	}
+	out.Write(enc[2:])
+	return out.Bytes()
+}
+
+// The w*h*8 <= 25% of MemAvailable guard (DESIGN 11.5) must also hold for
+// JPEGs whose frame header comes after more than 64 KiB of metadata
+// (DISPLAY-HW-2).
+func TestMemoryGuardAfterLargeMetadata(t *testing.T) {
+	avail := func() int64 { return 100 << 20 }
+	for _, n := range []int{0, 2} { // 0: header in the first 64 KiB; 2: at ~120 KiB
+		data := jpegWithMetadata(t, n, 60000, 4000, 3000) // needs 91 MiB > 25 MiB
+		_, err := DecodeFrame(bytes.NewReader(data), screenReq(10, 10), avail)
+		if !errors.Is(err, imaging.ErrTooLarge) || !strings.Contains(err.Error(), "MiB available") {
+			t.Errorf("%d metadata segments: err = %v, want the memory guard", n, err)
+		}
+	}
+	// Large metadata alone is fine: a small image still decodes.
+	img, err := DecodeFrame(bytes.NewReader(jpegWithMetadata(t, 2, 60000, 0, 0)), screenReq(8, 4), avail)
+	if err != nil {
+		t.Fatalf("small JPEG after 120 KiB of metadata: %v", err)
+	}
+	if c := img.(*image.RGBA).RGBAAt(4, 2); c.G < 150 || c.R > 60 {
+		t.Fatalf("decoded pixel %v", c)
+	}
+	// URL media go through the same guard.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write(jpegWithMetadata(t, 2, 60000, 4000, 3000))
+	}))
+	defer srv.Close()
+	f := newTestFetcher()
+	f.MemAvailable = avail
+	if _, err := f.Fetch(context.Background(), proto.Media{URL: srv.URL + "/big.jpg"}, screenReq(10, 10)); !errors.Is(err, imaging.ErrTooLarge) {
+		t.Fatalf("URL media: err = %v, want the memory guard", err)
 	}
 }

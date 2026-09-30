@@ -109,7 +109,7 @@ func ConsoleMain(args []string) int {
 	out := os.Stdout
 	for {
 		var b strings.Builder
-		renderConsole(&b, *statusFile, time.Now())
+		renderConsole(&b, *statusFile, hivePanelFile, time.Now())
 		if *once {
 			fmt.Fprint(out, b.String())
 			return 0
@@ -120,8 +120,10 @@ func ConsoleMain(args []string) int {
 	}
 }
 
-// renderConsole writes the console text for the given status file.
-func renderConsole(w io.Writer, statusFile string, now time.Time) {
+// renderConsole writes the console text for the given status file. The
+// pairing code isn't in the status file (it is world-readable): it comes
+// from the hive's own panel file, which only root can read.
+func renderConsole(w io.Writer, statusFile, hivePanel string, now time.Time) {
 	fmt.Fprintf(w, "SaviorOS %s\n\n", version.Version)
 	raw, err := os.ReadFile(statusFile)
 	if err != nil {
@@ -160,8 +162,8 @@ func renderConsole(w io.Writer, statusFile string, now time.Time) {
 			fmt.Fprintf(w, "    %s\n", san(u))
 		}
 		fmt.Fprintf(w, "    fingerprint %s\n", san(st.Hive.Fingerprint))
-		if st.Hive.PairCode != "" {
-			fmt.Fprintf(w, "    pairing code %s (enter it in the web dashboard)\n", san(st.Hive.PairCode))
+		if p := readHivePanel(hivePanel); p != nil && p.PairCode != "" {
+			fmt.Fprintf(w, "    pairing code %s (enter it in the web dashboard)\n", san(p.PairCode))
 		}
 		fmt.Fprintf(w, "    nodes online %d\n", st.Hive.NodesOnline)
 		if !st.Hive.Persistent {

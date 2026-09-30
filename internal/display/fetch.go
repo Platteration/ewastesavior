@@ -1,8 +1,6 @@
 package display
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -188,29 +186,42 @@ func (f *URLFetcher) get(ctx context.Context, url string) (io.ReadCloser, error)
 	return resp.Body, nil
 }
 
-// decode checks the declared dimensions against available memory, then
-// decodes with imaging.DecodeLimited (dimension and byte limits).
+// decode decodes with imaging.DecodeLimited (dimension and byte limits)
+// and refuses an image needing more than a quarter of the available memory
+// (w*h*8), checked on the same header DecodeLimited parses, however far
+// into the file it is.
 func (f *URLFetcher) decode(r io.Reader) (image.Image, error) {
-	br := bufio.NewReaderSize(r, 64<<10)
-	head, _ := br.Peek(64 << 10)
 	lim := f.limits()
-	if cfg, _, err := image.DecodeConfig(bytes.NewReader(head)); err == nil &&
-		cfg.Width > 0 && cfg.Height > 0 && cfg.Width <= lim.MaxSide && cfg.Height <= lim.MaxSide {
-		need := int64(cfg.Width) * int64(cfg.Height) * 8
-		avail := int64(0)
-		if f.MemAvailable != nil {
-			avail = f.MemAvailable()
+	if next := lim.Check; next != nil {
+		lim.Check = func(c image.Config) error {
+			if err := f.checkMemory(c); err != nil {
+				return err
+			}
+			return next(c)
 		}
-		if avail > 0 && need > avail/4 {
-			return nil, fmt.Errorf("%w: %dx%d needs %d MiB to decode, only %d MiB available",
-				imaging.ErrTooLarge, cfg.Width, cfg.Height, need>>20, avail>>20)
-		}
+	} else {
+		lim.Check = f.checkMemory
 	}
-	img, _, err := imaging.DecodeLimited(br, lim)
+	img, _, err := imaging.DecodeLimited(r, lim)
 	if err != nil {
 		return nil, fmt.Errorf("decode: %w", err)
 	}
 	return img, nil
+}
+
+// checkMemory refuses an image whose decode would need more than a quarter
+// of the available memory (DESIGN 11.5).
+func (f *URLFetcher) checkMemory(cfg image.Config) error {
+	need := int64(cfg.Width) * int64(cfg.Height) * 8
+	avail := int64(0)
+	if f.MemAvailable != nil {
+		avail = f.MemAvailable()
+	}
+	if avail > 0 && need > avail/4 {
+		return fmt.Errorf("%w: %dx%d needs %d MiB to decode, only %d MiB available",
+			imaging.ErrTooLarge, cfg.Width, cfg.Height, need>>20, avail>>20)
+	}
+	return nil
 }
 
 // DecodeFrame decodes an image from r with the DESIGN 11.5 guards

@@ -26,6 +26,10 @@ type Limits struct {
 	MaxSide   int   // max width or height in pixels
 	MaxPixels int   // max width*height
 	MaxBytes  int64 // max encoded size read from the stream
+	// Check, when set, vets the header DecodeLimited parsed (after the
+	// dimension limits, before any pixel is decoded); an error refuses the
+	// image. The node uses it for its available-memory guard.
+	Check func(image.Config) error
 }
 
 // DefaultLimits matches proto.MaxMediaSide/MaxMediaPixels/MaxMediaBytes.
@@ -72,6 +76,11 @@ func DecodeLimited(r io.Reader, lim Limits) (image.Image, string, error) {
 	}
 	if err := checkDims(cfg.Width, cfg.Height, lim); err != nil {
 		return nil, format, err
+	}
+	if lim.Check != nil {
+		if err := lim.Check(cfg); err != nil {
+			return nil, format, err
+		}
 	}
 	cr := &countingReader{r: br, max: lim.MaxBytes}
 	img, format, err := image.Decode(cr)
@@ -181,6 +190,11 @@ func RenderRegion(img image.Image, cw, ch int, fit string, region image.Rectangl
 }
 
 // RenderRegionInto is RenderRegion drawing into dr of an existing image.
+//
+// Every output pixel samples the source where its own centre lands on the
+// canvas, in exact integer arithmetic. Rounding the source window to whole
+// pixels instead would shift and stretch each wall tile by up to half a
+// source pixel, in opposite directions on the two sides of a bezel.
 func RenderRegionInto(dst *image.RGBA, dr image.Rectangle, img image.Image, cw, ch int, fit string, region image.Rectangle, bg color.RGBA) {
 	draw.Draw(dst, dr, image.NewUniform(bg), image.Point{}, draw.Src)
 	if img == nil || region.Empty() || dr.Empty() {
@@ -192,109 +206,143 @@ func RenderRegionInto(dst *image.RGBA, dr image.Rectangle, img image.Image, cw, 
 	if in.Empty() {
 		return
 	}
-	rw, rh := int64(region.Dx()), int64(region.Dy())
-	pw, ph := int64(dr.Dx()), int64(dr.Dy())
-	// Output rectangle for the intersection.
+	// The output pixels whose centres lie on the placed image.
 	o := image.Rect(
-		dr.Min.X+int(int64(in.Min.X-region.Min.X)*pw/rw),
-		dr.Min.Y+int(int64(in.Min.Y-region.Min.Y)*ph/rh),
-		dr.Min.X+int(int64(in.Max.X-region.Min.X)*pw/rw),
-		dr.Min.Y+int(int64(in.Max.Y-region.Min.Y)*ph/rh),
-	)
-	// Source rectangle for the intersection.
-	iw, ih := int64(sb.Dx()), int64(sb.Dy())
-	pdx, pdy := int64(p.Dx()), int64(p.Dy())
-	s := image.Rect(
-		sb.Min.X+int(int64(in.Min.X-p.Min.X)*iw/pdx),
-		sb.Min.Y+int(int64(in.Min.Y-p.Min.Y)*ih/pdy),
-		sb.Min.X+int((int64(in.Max.X-p.Min.X)*iw+pdx-1)/pdx),
-		sb.Min.Y+int((int64(in.Max.Y-p.Min.Y)*ih+pdy-1)/pdy),
-	).Intersect(sb)
-	if o.Empty() || s.Empty() {
+		dr.Min.X+centreIndex(in.Min.X-region.Min.X, region.Dx(), dr.Dx()),
+		dr.Min.Y+centreIndex(in.Min.Y-region.Min.Y, region.Dy(), dr.Dy()),
+		dr.Min.X+centreIndex(in.Max.X-region.Min.X, region.Dx(), dr.Dx()),
+		dr.Min.Y+centreIndex(in.Max.Y-region.Min.Y, region.Dy(), dr.Dy()),
+	).Intersect(dr).Intersect(dst.Bounds())
+	if o.Empty() {
 		return
 	}
-	Scale(dst, o, img, s)
+	// Output position t (from dr.Min) is canvas position
+	// region.Min + t*rw/pw, which is source position
+	// sb.Min + (canvas - p.Min)*iw/pdx.
+	xm := axisMap{
+		num:  (int64(region.Min.X) - int64(p.Min.X)) * int64(dr.Dx()) * int64(sb.Dx()),
+		step: int64(region.Dx()) * int64(sb.Dx()),
+		den:  int64(dr.Dx()) * int64(p.Dx()),
+		min:  sb.Min.X, max: sb.Max.X,
+	}
+	ym := axisMap{
+		num:  (int64(region.Min.Y) - int64(p.Min.Y)) * int64(dr.Dy()) * int64(sb.Dy()),
+		step: int64(region.Dy()) * int64(sb.Dy()),
+		den:  int64(dr.Dy()) * int64(p.Dy()),
+		min:  sb.Min.Y, max: sb.Max.Y,
+	}
+	scaleMapped(dst, o, img, xm, ym, o.Min.X-dr.Min.X, o.Min.Y-dr.Min.Y)
+}
+
+// centreIndex returns the first output pixel (of pw spanning rw canvas
+// units) whose centre lies at or after canvas offset k, clamped to [0, pw].
+func centreIndex(k, rw, pw int) int {
+	// Smallest t with (t+0.5)*rw/pw >= k.
+	t := ceilDiv(2*int64(k)*int64(pw)-int64(rw), 2*int64(rw))
+	return int(min(max(t, 0), int64(pw)))
+}
+
+func floorDiv(a, b int64) int64 {
+	q := a / b
+	if (a%b != 0) && ((a < 0) != (b < 0)) {
+		q--
+	}
+	return q
+}
+
+func ceilDiv(a, b int64) int64 { return -floorDiv(-a, b) }
+
+// axisMap maps output positions on one axis to source positions: output
+// position τ (counted from the origin the map was built for) lands on source
+// position min + (num + τ*step)/den. Source pixels are [min, max).
+type axisMap struct {
+	num, step, den int64
+	min, max       int
+}
+
+// spans returns, for n output pixels starting at index t0, the source
+// pixels [lo[i], hi[i]) each one averages: all the pixels it covers when
+// the axis shrinks (box filter), else the one under its centre (nearest).
+func (m axisMap) spans(t0, n int) (lo, hi []int, box bool) {
+	lo, hi = make([]int, n), make([]int, n)
+	box = m.step > m.den
+	clamp := func(v, a, b int64) int { return int(min(max(v, a), b)) }
+	smin, smax := int64(m.min), int64(m.max)
+	for i := range n {
+		t := int64(t0 + i)
+		if !box {
+			c := clamp(smin+floorDiv(2*m.num+(2*t+1)*m.step, 2*m.den), smin, smax-1)
+			lo[i], hi[i] = c, c+1
+			continue
+		}
+		a := clamp(smin+floorDiv(m.num+t*m.step, m.den), smin, smax-1)
+		b := clamp(smin+floorDiv(m.num+(t+1)*m.step, m.den), smin, smax)
+		if b <= a {
+			b = a + 1
+		}
+		lo[i], hi[i] = a, b
+	}
+	return lo, hi, box
 }
 
 // Scale draws src's rectangle sr into dst's rectangle dr using integer
-// arithmetic only: an area-averaging box filter when shrinking and nearest
-// neighbor when enlarging.
+// arithmetic only: an area-averaging box filter on an axis that shrinks and
+// nearest neighbor on one that enlarges. Parts of dr outside dst are
+// clipped without changing the mapping.
 func Scale(dst *image.RGBA, dr image.Rectangle, src image.Image, sr image.Rectangle) {
-	dr = dr.Intersect(dst.Bounds())
 	sr = sr.Intersect(src.Bounds())
-	if dr.Empty() || sr.Empty() {
+	o := dr.Intersect(dst.Bounds())
+	if o.Empty() || sr.Empty() {
 		return
 	}
-	if sr.Dx() > dr.Dx() || sr.Dy() > dr.Dy() {
-		scaleBox(dst, dr, src, sr)
-		return
-	}
-	scaleNearest(dst, dr, src, sr)
+	xm := axisMap{step: int64(sr.Dx()), den: int64(dr.Dx()), min: sr.Min.X, max: sr.Max.X}
+	ym := axisMap{step: int64(sr.Dy()), den: int64(dr.Dy()), min: sr.Min.Y, max: sr.Max.Y}
+	scaleMapped(dst, o, src, xm, ym, o.Min.X-dr.Min.X, o.Min.Y-dr.Min.Y)
 }
 
-func scaleNearest(dst *image.RGBA, dr image.Rectangle, src image.Image, sr image.Rectangle) {
-	dw, dh := dr.Dx(), dr.Dy()
-	sw, sh := sr.Dx(), sr.Dy()
-	xs := make([]int, dw)
-	for x := 0; x < dw; x++ {
-		xs[x] = sr.Min.X + (2*x+1)*sw/(2*dw)
-	}
+// scaleMapped fills dst's rectangle o from src through the axis maps; o's
+// first column and row are output indices tx and ty of the maps.
+func scaleMapped(dst *image.RGBA, o image.Rectangle, src image.Image, xm, ym axisMap, tx, ty int) {
+	dw, dh := o.Dx(), o.Dy()
+	xlo, xhi, xbox := xm.spans(tx, dw)
+	ylo, yhi, ybox := ym.spans(ty, dh)
 	get := pixelGetter(src)
-	for y := 0; y < dh; y++ {
-		sy := sr.Min.Y + (2*y+1)*sh/(2*dh)
-		row := dst.Pix[dst.PixOffset(dr.Min.X, dr.Min.Y+y):]
-		for x := 0; x < dw; x++ {
-			r, g, b, a := get(xs[x], sy)
-			i := 4 * x
-			row[i], row[i+1], row[i+2], row[i+3] = r, g, b, a
+	if !xbox && !ybox {
+		for y := 0; y < dh; y++ {
+			sy := ylo[y]
+			row := dst.Pix[dst.PixOffset(o.Min.X, o.Min.Y+y):]
+			for x := 0; x < dw; x++ {
+				r, g, b, a := get(xlo[x], sy)
+				i := 4 * x
+				row[i], row[i+1], row[i+2], row[i+3] = r, g, b, a
+			}
 		}
+		return
 	}
-}
-
-// scaleBox averages all source pixels that map onto each destination pixel.
-// Each axis is handled independently (separable), which is exact for
-// integer ratios and a good approximation otherwise.
-func scaleBox(dst *image.RGBA, dr image.Rectangle, src image.Image, sr image.Rectangle) {
-	dw, dh := dr.Dx(), dr.Dy()
-	sw, sh := sr.Dx(), sr.Dy()
-	x0 := make([]int, dw+1)
-	for x := 0; x <= dw; x++ {
-		x0[x] = sr.Min.X + x*sw/dw
-	}
-	get := pixelGetter(src)
+	// Box filter: each axis is handled independently (separable), which is
+	// exact for integer ratios and a good approximation otherwise.
 	acc := make([]uint32, 4*dw)
 	for y := 0; y < dh; y++ {
-		sy0 := sr.Min.Y + y*sh/dh
-		sy1 := sr.Min.Y + (y+1)*sh/dh
-		if sy1 <= sy0 {
-			sy1 = sy0 + 1
-		}
-		for i := range acc {
-			acc[i] = 0
-		}
-		rows := uint32(sy1 - sy0)
-		for sy := sy0; sy < sy1; sy++ {
+		clear(acc)
+		rows := uint32(yhi[y] - ylo[y])
+		for sy := ylo[y]; sy < yhi[y]; sy++ {
 			for x := 0; x < dw; x++ {
-				a, b := x0[x], x0[x+1]
-				if b <= a {
-					b = a + 1
-				}
-				var sr_, sg, sb_, sa uint32
-				for sx := a; sx < b; sx++ {
-					r, g, bb, aa := get(sx, sy)
-					sr_ += uint32(r)
+				var sr, sg, sb, sa uint32
+				for sx := xlo[x]; sx < xhi[x]; sx++ {
+					r, g, b, a := get(sx, sy)
+					sr += uint32(r)
 					sg += uint32(g)
-					sb_ += uint32(bb)
-					sa += uint32(aa)
+					sb += uint32(b)
+					sa += uint32(a)
 				}
-				n := uint32(b - a)
-				acc[4*x] += sr_ / n
+				n := uint32(xhi[x] - xlo[x])
+				acc[4*x] += sr / n
 				acc[4*x+1] += sg / n
-				acc[4*x+2] += sb_ / n
+				acc[4*x+2] += sb / n
 				acc[4*x+3] += sa / n
 			}
 		}
-		row := dst.Pix[dst.PixOffset(dr.Min.X, dr.Min.Y+y):]
+		row := dst.Pix[dst.PixOffset(o.Min.X, o.Min.Y+y):]
 		for i := 0; i < 4*dw; i++ {
 			row[i] = uint8(acc[i] / rows)
 		}

@@ -201,13 +201,28 @@ func wrapText(st fontStyle, size int, s string, maxW int) []string {
 
 // fitWrapped finds the largest size in [minSize, maxSize] at which s,
 // wrapped to maxW, fits maxH. Sizes are integers in the caller's unit
-// (pixels, or canvas units for walls).
+// (pixels, or canvas units for walls). Words are never broken when a size
+// in range keeps the widest one on a line; only a word too wide even at
+// minSize is split.
 func fitWrapped(st fontStyle, s string, maxW, maxH, minSize, maxSize int) (int, []string) {
 	if minSize < 1 {
 		minSize = 1
 	}
 	if maxSize < minSize {
 		maxSize = minSize
+	}
+	if f := fontFor(st); f != nil && maxW > 0 {
+		var widest int64
+		for _, w := range strings.Fields(s) {
+			widest = max(widest, textUnits(st, w))
+		}
+		// wrapUnits splits a word only when it is wider than
+		// maxW*upem/size units, so up to this size none is split.
+		if widest > 0 {
+			if whole := int64(maxW) * int64(f.upem) / widest; whole >= int64(minSize) {
+				maxSize = int(min(int64(maxSize), whole))
+			}
+		}
 	}
 	fits := func(size int) ([]string, bool) {
 		lines := wrapText(st, size, s, maxW)
