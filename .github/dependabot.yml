@@ -1,0 +1,14 @@
+# Weekly update checks. Security updates are opened as soon as an advisory is
+# published, whatever this schedule says.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5

@@ -61,10 +61,10 @@ jobs:
       matrix:
         arch: [x86_64, i686]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.24"
       - name: Install host packages
@@ -83,13 +83,13 @@ jobs:
             sudo udevadm trigger --name-match=kvm
           fi
       - name: Cache Buildroot downloads
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: build/br-cache/dl
           key: br-dl-${{ hashFiles('Makefile', 'os/buildroot/configs/*') }}
           restore-keys: br-dl-
       - name: Cache ccache
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.buildroot-ccache
           key: br-ccache-${{ matrix.arch }}-${{ github.sha }}
@@ -170,14 +170,14 @@ jobs:
           cp build/images/${{ matrix.arch }}/savior-${{ matrix.arch }}.img build/images/${{ matrix.arch }}/savior-${{ matrix.arch }}.iso "$d/media/"
           tar -C build/images/${{ matrix.arch }} -czf "$d/media/savior-${{ matrix.arch }}-netboot.tar.gz" netboot
           mv build/images/${{ matrix.arch }}/savior-${{ matrix.arch }}-legal-info.tar build/images/${{ matrix.arch }}/host-packages.txt dist-legal/${{ matrix.arch }}/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: image-${{ matrix.arch }}
           path: dist/${{ matrix.arch }}/
           if-no-files-found: error
           retention-days: 30
       # Separate: the e2e jobs need the images, not the sources.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: legal-${{ matrix.arch }}
           path: dist-legal/${{ matrix.arch }}/
@@ -186,7 +186,7 @@ jobs:
           compression-level: 0
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: logs-${{ matrix.arch }}
           path: |
@@ -214,10 +214,10 @@ jobs:
       matrix:
         arch: [x86_64, i686]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0 # git describe: the version the images must report
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.24"
       - name: Install host packages
@@ -232,7 +232,7 @@ jobs:
             sudo udevadm control --reload-rules
             sudo udevadm trigger --name-match=kvm
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: image-${{ matrix.arch }}
           path: dist/${{ matrix.arch }}
@@ -264,7 +264,7 @@ jobs:
           --out build/logs/e2e -- --marker "$BOOT_MARKER" $BOOT_EXPECT
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: logs-e2e-${{ matrix.arch }}
           path: build/logs/
@@ -277,10 +277,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 300
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version: "1.24"
       # deb-src: scripts/legal-info.sh host-sources fetches the source of
@@ -299,19 +299,19 @@ jobs:
             sudo udevadm control --reload-rules
             sudo udevadm trigger --name-match=kvm
           fi
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: image-x86_64
           path: dist/x86_64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: image-i686
           path: dist/i686
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: legal-x86_64
           path: dist/legal-x86_64
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: legal-i686
           path: dist/legal-i686
@@ -378,7 +378,7 @@ jobs:
             dist/legal-x86_64/host-packages.txt dist/legal-i686/host-packages.txt
           (cd release && sha256sum -- * >SHA256SUMS)
           cat release/SHA256SUMS >>"$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release
           path: release/
@@ -386,7 +386,7 @@ jobs:
           retention-days: 30
       - name: Upload logs
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: logs-universal
           path: build/logs/
@@ -402,13 +402,13 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: release
           path: release
       - name: Verify checksums
         run: cd release && sha256sum -c SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: release/*
           fail_on_unmatched_files: true
