@@ -17,8 +17,10 @@ const maxLogOffset = 1 << 50
 // follower that sees the attempt change must start over from offset 0.
 const logAttemptHd = "X-Savior-Log-Attempt"
 
-// logRing keeps the most recent output of one assignment in memory. Offsets
-// count every byte the node ever sent for the lease (DESIGN 8.5).
+// logRing keeps the most recent output of one assignment in memory: at
+// least the last limit bytes the hive gives it (logLimitLocked), in a
+// buffer of at most limit + limit/4. Offsets count every byte the node ever
+// sent for the lease (DESIGN 8.5).
 type logRing struct {
 	data  []byte // stream bytes [base, total)
 	base  int64
@@ -31,7 +33,7 @@ func newLogRing() *logRing { return &logRing{wake: make(chan struct{})} }
 // append adds p, which starts at stream offset off. Bytes the ring already
 // has are dropped, so retried uploads are idempotent. A gap (off beyond the
 // end, e.g. after a hive restart) is skipped.
-func (l *logRing) append(off int64, p []byte) {
+func (l *logRing) append(off int64, p []byte, limit int) {
 	if off > l.total {
 		l.data = l.data[:0]
 		l.base, l.total = off, off
@@ -41,16 +43,36 @@ func (l *logRing) append(off int64, p []byte) {
 		return
 	}
 	p = p[skip:]
-	l.data = append(l.data, p...)
 	l.total += int64(len(p))
-	if len(l.data) > logRingSize+logRingSize/4 {
-		keep := make([]byte, logRingSize, logRingSize+logRingSize/4)
-		copy(keep, l.data[len(l.data)-logRingSize:])
-		l.base += int64(len(l.data) - logRingSize)
-		l.data = keep
+	if len(p) > limit {
+		p = p[len(p)-limit:]
+		l.data = l.data[:0]
 	}
+	l.fit(limit, len(p))
+	l.data = append(l.data, p...)
+	l.base = l.total - int64(len(l.data))
 	close(l.wake)
 	l.wake = make(chan struct{})
+}
+
+// fit makes room for n more bytes (n <= limit) in a buffer of at most
+// limit + limit/4 bytes, dropping the oldest bytes (keeping limit - n)
+// when they would not fit. It allocates only to grow or shrink the buffer,
+// never on every trim.
+func (l *logRing) fit(limit, n int) {
+	most := limit + limit/4
+	if len(l.data)+n > most {
+		keep := limit - n
+		copy(l.data, l.data[len(l.data)-keep:])
+		l.data = l.data[:keep]
+	}
+	need := len(l.data) + n
+	if need <= cap(l.data) && cap(l.data) <= most {
+		return
+	}
+	nd := make([]byte, len(l.data), min(max(2*cap(l.data), need, 4<<10), most))
+	copy(nd, l.data)
+	l.data = nd
 }
 
 // read returns up to max bytes from off (clamped to what is retained) and
@@ -78,35 +100,113 @@ func (l *logRing) tailBytes(n int) ([]byte, int64) {
 	return append([]byte(nil), l.data[len(l.data)-n:]...), l.total - int64(n)
 }
 
-// finishLogLocked moves an ended assignment's log into its tail file
-// (last 64 KiB, <data>/logs/<task>.log), written outside the lock.
-func (s *Server) finishLogLocked(t *task) {
+// The log rings of all running tasks share one memory budget
+// (tune.logBudget, DESIGN 8.5): each keeps an equal share, between
+// minLogRing and logRingSize.
+
+// logLimitLocked is how many bytes each ring keeps now.
+func (s *Server) logLimitLocked() int {
+	share := s.cfg.tune.logBudget / int64(max(len(s.logRings), 1)) * 4 / 5 // buffers hold up to 1.25x
+	return int(min(max(share, minLogRing), logRingSize))
+}
+
+// ringLocked returns t's log ring, creating it.
+func (s *Server) ringLocked(t *task) *logRing {
+	if t.log == nil {
+		t.log = newLogRing()
+		s.logRings[t] = struct{}{}
+	}
+	return t.log
+}
+
+// appendLogLocked adds a chunk to t's ring within the budget. A new ring
+// lowers every ring's share; once the rings hold more than they may, the
+// ones above the share are trimmed to it, keeping their latest bytes.
+func (s *Server) appendLogLocked(t *task, off int64, p []byte) *logRing {
+	l := s.ringLocked(t)
+	limit := s.logLimitLocked()
+	most := limit + limit/4
+	before := cap(l.data)
+	l.append(off, p, limit)
+	s.logMem += int64(cap(l.data) - before)
+	if s.logMem > max(s.cfg.tune.logBudget, int64(len(s.logRings))*int64(most)) {
+		for x := range s.logRings {
+			if r := x.log; cap(r.data) > most {
+				before := cap(r.data)
+				r.fit(limit, 0)
+				r.base = r.total - int64(len(r.data))
+				s.logMem += int64(cap(r.data) - before)
+			}
+		}
+	}
+	return l
+}
+
+// dropLogLocked detaches t's ring (its assignment ended) and returns it.
+func (s *Server) dropLogLocked(t *task) *logRing {
 	l := t.log
+	if l != nil {
+		t.log = nil
+		delete(s.logRings, t)
+		s.logMem -= int64(cap(l.data))
+	}
+	return l
+}
+
+// finishLogLocked moves an ended assignment's log into its tail file
+// (last 64 KiB, <data>/logs/<task>.log). The io queue writes it; until
+// then readers get it from s.tails. Neither the write nor clearing the
+// pending tail takes the state mutex, and the file is not fsynced (logs
+// are best effort): a tail costs the io queue one small write, so it keeps
+// up with hundreds of task completions a second.
+func (s *Server) finishLogLocked(t *task) {
+	l := s.dropLogLocked(t)
 	if l == nil {
 		return
 	}
-	t.log = nil
 	close(l.wake) // wake long-polling readers; they fall through to the tail
 	tail, base := l.tailBytes(logTailSize)
 	t.LogBase, t.LogEnd = base, l.total
+	id := t.ID
+	s.tailMu.Lock()
 	if len(tail) == 0 {
-		t.tail = nil
+		delete(s.tails, id)
+	} else {
+		s.tails[id] = tail
+	}
+	s.tailMu.Unlock()
+	if len(tail) == 0 {
 		return
 	}
-	t.tail = tail
-	path, id := s.logPath(t.ID), t.ID
+	path := s.logPath(id)
 	s.io.push(func() {
-		err := writeFileAtomic(path, tail, 0o600)
-		if err != nil {
+		if err := writeFile(path, tail, 0o600, false); err != nil {
 			s.log.Warn("could not write task log tail", "task", id, "err", err)
 			return
 		}
-		s.mu.Lock()
-		if cur := s.tasks[id]; cur != nil && len(cur.tail) > 0 && &cur.tail[0] == &tail[0] {
-			cur.tail = nil
+		s.tailMu.Lock()
+		if cur := s.tails[id]; len(cur) > 0 && &cur[0] == &tail[0] {
+			delete(s.tails, id)
 		}
-		s.mu.Unlock()
+		s.tailMu.Unlock()
 	})
+}
+
+// pendingTail returns the log tail of a task that is not in its file yet.
+func (s *Server) pendingTail(id string) []byte {
+	s.tailMu.Lock()
+	defer s.tailMu.Unlock()
+	return s.tails[id]
+}
+
+// dropTail forgets a pending tail (the task is dispatched again or
+// deleted); a queued write of it still happens.
+func (s *Server) dropTail(id string) bool {
+	s.tailMu.Lock()
+	defer s.tailMu.Unlock()
+	_, ok := s.tails[id]
+	delete(s.tails, id)
+	return ok
 }
 
 func (s *Server) handleLogAppend(w http.ResponseWriter, r *http.Request, tok string) {
@@ -118,7 +218,19 @@ func (s *Server) handleLogAppend(w http.ResponseWriter, r *http.Request, tok str
 		writeErr(w, http.StatusBadRequest, "need lease and an offset in 0..%d", int64(maxLogOffset))
 		return
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxLogChunk))
+	if r.ContentLength > maxLogChunk {
+		writeErr(w, http.StatusRequestEntityTooLarge, "log chunk larger than %d bytes", maxLogChunk)
+		return
+	}
+	var body []byte
+	if r.ContentLength >= 0 {
+		// One allocation of the chunk's size (io.ReadAll grows from 512
+		// bytes by doubling).
+		body = make([]byte, r.ContentLength)
+		_, err = io.ReadFull(r.Body, body)
+	} else {
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, maxLogChunk))
+	}
 	if err != nil {
 		writeErr(w, http.StatusRequestEntityTooLarge, "log chunk larger than %d bytes", maxLogChunk)
 		return
@@ -136,11 +248,7 @@ func (s *Server) handleLogAppend(w http.ResponseWriter, r *http.Request, tok str
 		if t == nil || !t.active() || t.Node != n.ID || t.Lease != lease {
 			return http.StatusConflict, 0
 		}
-		if t.log == nil {
-			t.log = newLogRing()
-		}
-		t.log.append(off, body)
-		return http.StatusOK, t.log.total
+		return http.StatusOK, s.appendLogLocked(t, off, body).total
 	}()
 	switch status {
 	case http.StatusUnauthorized:
@@ -193,17 +301,15 @@ func (s *Server) handleTaskLog(w http.ResponseWriter, r *http.Request, _ adminCt
 		}
 		attempt := t.Attempt
 		if t.active() {
-			if t.log == nil {
-				t.log = newLogRing()
-			}
-			data, next := t.log.read(off, logRingSize)
+			l := s.ringLocked(t)
+			data, next := l.read(off, logRingSize)
 			remaining := time.Until(deadline)
-			if len(data) > 0 || remaining <= 0 || off > t.log.total {
+			if len(data) > 0 || remaining <= 0 || off > l.total {
 				s.mu.Unlock()
 				writeLog(w, data, next, attempt)
 				return
 			}
-			wake := t.log.wake
+			wake := l.wake
 			s.mu.Unlock()
 			timer := time.NewTimer(remaining)
 			select {
@@ -220,7 +326,7 @@ func (s *Server) handleTaskLog(w http.ResponseWriter, r *http.Request, _ adminCt
 			timer.Stop()
 			continue
 		}
-		base, end, tail := t.LogBase, t.LogEnd, t.tail
+		base, end, tail := t.LogBase, t.LogEnd, s.pendingTail(t.ID)
 		path := s.logPath(t.ID)
 		s.mu.Unlock()
 		if off < base {

@@ -322,6 +322,38 @@ func TestRunOutputsAndSubdirGlob(t *testing.T) {
 	}
 }
 
+// retryTransfer breaks off each upload once, half way, and starts it over
+// from the beginning, as the node agent does after a lost connection.
+type retryTransfer struct{ *fakeTransfer }
+
+func (r retryTransfer) UploadBlob(ctx context.Context, sha string, size int64, rd io.Reader) error {
+	rs, ok := rd.(io.ReadSeeker)
+	if !ok {
+		return fmt.Errorf("the upload reader (%T) can't be rewound for a retry", rd)
+	}
+	if _, err := io.CopyN(io.Discard, rs, size/2); err != nil {
+		return err
+	}
+	if _, err := rs.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return r.fakeTransfer.UploadBlob(ctx, sha, size, rs)
+}
+
+func TestRunOutputUploadCanStartOver(t *testing.T) {
+	tr := retryTransfer{newFakeTransfer()}
+	r := newTestRunner(t, ModeNone, tr)
+	task := scriptTask("tretry", "seq 1 5000 > out.txt")
+	task.Outputs = []string{"out.txt"}
+	rep, logs := runTask(t, r, task)
+	if rep.State != proto.TaskSucceeded || len(rep.Outputs) != 1 {
+		t.Fatalf("state %s err %q outputs %+v logs %s", rep.State, rep.Error, rep.Outputs, logs)
+	}
+	if b := tr.uploaded[rep.Outputs[0].Blob]; int64(len(b)) != rep.Outputs[0].Size || rep.Outputs[0].Size < 20000 {
+		t.Fatalf("uploaded %d bytes for %+v", len(b), rep.Outputs[0])
+	}
+}
+
 func TestRunOutputsRefuseUnsafe(t *testing.T) {
 	tr := newFakeTransfer()
 	r := newTestRunner(t, ModeNone, tr)

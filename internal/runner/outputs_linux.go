@@ -137,16 +137,17 @@ func (r *Runner) uploadOne(ctx context.Context, tk *taskDir, ts *taskState, name
 	if _, err := f.Seek(0, io.SeekStart); err != nil {
 		return proto.Output{}, false, fmt.Errorf("output %q: %w", name, err)
 	}
-	rd := countReader{r: io.LimitReader(f, size), fn: ts.addXfer}
+	rd := countReader{r: io.NewSectionReader(f, 0, size), fn: ts.addXfer}
 	if err := r.tr.UploadBlob(ctx, sum, size, rd); err != nil {
 		return proto.Output{}, false, fmt.Errorf("upload output %q: %w", name, err)
 	}
 	return proto.Output{Name: name, Blob: sum, Size: size}, true, nil
 }
 
-// countReader reports every read to fn (upload progress).
+// countReader reports every read to fn (upload progress). The transfer
+// may Seek it back to the start to retry an upload.
 type countReader struct {
-	r  io.Reader
+	r  io.ReadSeeker
 	fn func(int64)
 }
 
@@ -157,6 +158,8 @@ func (c countReader) Read(p []byte) (int, error) {
 	}
 	return n, err
 }
+
+func (c countReader) Seek(off int64, whence int) (int64, error) { return c.r.Seek(off, whence) }
 
 // removeAllIn removes name and its contents inside root, never following a
 // symlink out of root.

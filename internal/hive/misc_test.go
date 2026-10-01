@@ -457,7 +457,7 @@ func TestRunShutdownEndsLongPolls(t *testing.T) {
 	eventually(t, "long-polls in flight", func() bool {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.nodes[n.req.NodeID].claims == 1 && s.tasks[tk.ID].log != nil
+		return s.nodes[n.req.NodeID].claims.Load() == 1 && s.tasks[tk.ID].log != nil
 	})
 
 	start := time.Now()

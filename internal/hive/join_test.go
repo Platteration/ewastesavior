@@ -29,7 +29,7 @@ func TestJoinHandshake(t *testing.T) {
 	n := h.newNode(func(r *proto.RegisterRequest) { r.Name = "Lab-PC" })
 	resp := n.register() // also verifies hive_proof against our fingerprint
 	if resp.NodeID != n.req.NodeID || resp.Name != "lab-pc" || resp.ShortCode != proto.ShortCode(n.req.NodeID) ||
-		len(resp.Token) != 64 || resp.Pending || resp.HeartbeatIntervalS != 5 || resp.Directives.Name != "lab-pc" {
+		len(resp.Token) != len(nodeTokenPrefix)+64 || !strings.HasPrefix(resp.Token, nodeTokenPrefix) || resp.Pending || resp.HeartbeatIntervalS != 5 || resp.Directives.Name != "lab-pc" {
 		t.Fatalf("register response: %+v", resp)
 	}
 	hb := n.heartbeat()
@@ -212,6 +212,38 @@ func TestDuplicateNodeID(t *testing.T) {
 	// The old session's token no longer works.
 	if code, _ := a.api("POST", "heartbeat", proto.HeartbeatRequest{}, nil); code != http.StatusUnauthorized {
 		t.Fatalf("old token: %d", code)
+	}
+}
+
+// An agent respawned on the same machine (same kernel boot_id, a new
+// per-process nonce, DESIGN 10.1) replaces its old session at once; until
+// the old one is offline it would otherwise get 409 and back off, idling
+// the machine (chaos soak: 31 s). Its old assignments are requeued.
+func TestRespawnedAgentReplacesItsSession(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil) // OfflineAfter 20 s
+	a := h.newNode(func(r *proto.RegisterRequest) { r.BootID = "9f1c2b7e-5d4a-4b8e-a0c1-3e2f6d7a8b90:aaaa" })
+	a.register()
+	h.submit(scriptJob(1, nil))
+	tk := a.claim(1)
+	a.heartbeat(running(tk...)...)
+	respawn := h.newNode(func(r *proto.RegisterRequest) { *r = a.req; r.BootID = "9f1c2b7e-5d4a-4b8e-a0c1-3e2f6d7a8b90:bbbb" })
+	if st, raw, _ := respawn.tryRegister(swarmSecret(), "", false); st != 200 {
+		t.Fatalf("respawned agent on the same boot: %d %s", st, raw)
+	}
+	if code, _ := a.api("POST", "heartbeat", proto.HeartbeatRequest{}, nil); code != http.StatusUnauthorized {
+		t.Fatalf("old process's token: %d", code)
+	}
+	if v := h.task(tk[0].ID); v.State != proto.TaskPending || v.History[0].Outcome != "lost" {
+		t.Fatalf("old process's task: %s %+v", v.State, v.History)
+	}
+	// Another machine (another boot_id) with the same node ID is still a
+	// duplicate, and so is a BootID without a machine part.
+	for _, boot := range []string{"0d5e8c3a-1b2f-4c6d-9e7a-8b9c0d1e2f3a:bbbb", ":bbbb", "bbbb"} {
+		other := h.newNode(func(r *proto.RegisterRequest) { *r = a.req; r.BootID = boot })
+		if st, raw, _ := other.tryRegister(swarmSecret(), "", false); st != http.StatusConflict {
+			t.Fatalf("BootID %q: %d %s", boot, st, raw)
+		}
 	}
 }
 

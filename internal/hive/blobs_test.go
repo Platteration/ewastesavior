@@ -217,17 +217,21 @@ func TestBlobReferencesAndGC(t *testing.T) {
 	n.report(tk, proto.TaskReport{State: proto.TaskSucceeded, Outputs: []proto.Output{{Name: "r.txt", Blob: sha(outData), Size: 6}}})
 	time.Sleep(150 * time.Millisecond)
 	h.s.mu.Lock()
-	deleted, _ := h.s.gcLocked(true, time.Now())
+	victims, _ := h.s.gcLocked(true, time.Now())
 	h.s.mu.Unlock()
-	if deleted != 0 {
+	if len(victims) != 0 {
 		t.Fatal("referenced output collected")
 	}
 	h.mustAdmin("DELETE", "jobs/"+d.ID, nil, nil)
 	h.s.mu.Lock()
-	deleted, _ = h.s.gcLocked(true, time.Now())
+	victims, _ = h.s.gcLocked(true, time.Now())
 	h.s.mu.Unlock()
-	if deleted != 1 { // the output; the admin-uploaded input stays for manual GC
-		t.Fatalf("auto gc after job delete: %d", deleted)
+	if len(victims) != 1 { // the output; the admin-uploaded input stays for manual GC
+		t.Fatalf("auto gc after job delete: %v", victims)
+	}
+	h.s.unlinkBlobs(victims)
+	if _, err := os.Stat(h.s.blobs.path(sha(outData))); !os.IsNotExist(err) {
+		t.Fatal("gc left the output file")
 	}
 	if st := h.admin("DELETE", "blobs/"+in, nil, nil); st != 200 {
 		t.Fatalf("delete unreferenced: %d", st)
@@ -438,5 +442,112 @@ func TestStorageLowHoldsJobsWithOutputs(t *testing.T) {
 	h.mustAdmin("GET", "info", nil, &info)
 	if strings.Contains(strings.Join(info.Warnings, "\n"), "storage") {
 		t.Errorf("warning kept after space was freed: %v", info.Warnings)
+	}
+}
+
+// Blob references of retained records are counted as they are recorded
+// and deleted, not searched for: answering BlobInfo.Referenced on every
+// output upload used to walk every retained output under the state mutex.
+// The counts follow an output and an input shared by two jobs through job
+// deletion and a restart.
+func TestBlobRefCounts(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	h := startHive(t, dir, nil)
+	n := h.newNode(nil)
+	n.register()
+	in := h.putBlob([]byte("shared input"))
+	out := []byte("same output")
+	var jobs []string
+	for i := 0; i < 2; i++ {
+		d := h.submit(scriptJob(1, func(s *proto.JobSpec) { s.Inputs = []proto.Input{{Name: "in", Blob: in}} }))
+		tk := n.claim(1)[0]
+		var info proto.BlobInfo
+		if code, raw := n.api("PUT", "blobs/"+sha(out), out, &info); code != http.StatusOK {
+			t.Fatalf("upload: %d %s", code, raw)
+		}
+		if info.Referenced != (i == 1) { // the second upload: already the first job's output
+			t.Fatalf("upload %d: referenced %v", i, info.Referenced)
+		}
+		if code := n.report(tk, proto.TaskReport{State: proto.TaskSucceeded,
+			Outputs: []proto.Output{{Name: "o", Blob: sha(out), Size: int64(len(out))}}}); code != http.StatusOK {
+			t.Fatalf("report: %d", code)
+		}
+		jobs = append(jobs, d.ID)
+	}
+	referenced := func(hh *testHive) map[string]bool {
+		var list []proto.BlobInfo
+		hh.mustAdmin("GET", "blobs", nil, &list)
+		m := map[string]bool{}
+		for _, b := range list {
+			m[b.SHA256] = b.Referenced
+		}
+		return m
+	}
+	counts := func(hh *testHive) (int, int) {
+		hh.s.mu.Lock()
+		defer hh.s.mu.Unlock()
+		return hh.s.blobRefs[in], hh.s.blobRefs[sha(out)]
+	}
+	if a, b := counts(h); a != 2 || b != 2 {
+		t.Fatalf("counts %d %d, want 2 2", a, b)
+	}
+	h.mustAdmin("DELETE", "jobs/"+jobs[0], nil, nil)
+	if r := referenced(h); !r[in] || !r[sha(out)] {
+		t.Fatalf("after deleting one job: %v", r)
+	}
+	h.stop()
+	h2 := startHive(t, dir, nil)
+	if a, b := counts(h2); a != 1 || b != 1 {
+		t.Fatalf("counts after restart %d %d, want 1 1", a, b)
+	}
+	st, raw := do(t, h2.hc, "DELETE", h2.url+"/api/v1/admin/blobs/"+sha(out), testAdmin, nil, nil)
+	if st != http.StatusConflict || !strings.Contains(string(raw), "output o of task") {
+		t.Fatalf("delete of a referenced output: %d %s", st, raw)
+	}
+	h2.mustAdmin("DELETE", "jobs/"+jobs[1], nil, nil)
+	if r := referenced(h2); r[in] || r[sha(out)] {
+		t.Fatalf("after deleting both jobs: %v", r)
+	}
+	h2.s.mu.Lock()
+	left := len(h2.s.blobRefs)
+	h2.s.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d counted references left", left)
+	}
+}
+
+// Blob GC removes files outside the state mutex (load harness: one pass
+// after a 100k-output job was deleted held it for 1.44 s): gcLocked only
+// drops the metadata, unlinkBlobs removes the files afterwards, except a
+// blob stored again in between.
+func TestBlobGCUnlinksOutsideMutex(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	a := h.putBlob([]byte("garbage a"))
+	b := h.putBlob([]byte("garbage b"))
+	h.s.mu.Lock()
+	old := time.Now().Add(-2 * time.Hour)
+	for _, sum := range []string{a, b} {
+		h.s.blobMeta[sum].touchedMono = old
+	}
+	victims, freed := h.s.gcLocked(false, time.Now())
+	for _, sum := range []string{a, b} {
+		if _, err := os.Stat(h.s.blobs.path(sum)); err != nil {
+			h.s.mu.Unlock()
+			t.Fatalf("gc removed a file while holding the state mutex: %v", err)
+		}
+	}
+	h.s.mu.Unlock()
+	if len(victims) != 2 || freed != int64(len("garbage a")+len("garbage b")) {
+		t.Fatalf("collected %v, %d bytes", victims, freed)
+	}
+	h.putBlob([]byte("garbage b")) // stored again before its file goes
+	h.s.unlinkBlobs(victims)
+	if _, err := os.Stat(h.s.blobs.path(a)); !os.IsNotExist(err) {
+		t.Fatalf("collected blob's file: %v", err)
+	}
+	if st, raw := do(t, h.hc, "GET", h.url+"/api/v1/blobs/"+b, testAdmin, nil, nil); st != http.StatusOK || string(raw) != "garbage b" {
+		t.Fatalf("blob stored again during the gc: %d %q", st, raw)
 	}
 }

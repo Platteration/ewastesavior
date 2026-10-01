@@ -4,11 +4,15 @@ package node
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -495,33 +499,129 @@ func (a *Agent) enableDisplay() *display.Controller {
 // transfer adapts the current hive session for the runner.
 type transfer struct{ a *Agent }
 
+var (
+	errNoSession    = errors.New("not connected to the hive")
+	errStaleSession = errors.New("the hive no longer knows this node's session; waiting for the node to register again")
+)
+
+// Blob transfers are retried (DESIGN 10.5): a broken connection, a 5xx or
+// 429, no hive session, or a 401 while the node registers again with a
+// restarted hive would otherwise fail the task as an input or output node
+// error and count against a healthy machine. Retries back off from
+// transferBackoff, doubling up to transferBackoffMax, for at most
+// transferRetryFor, which is less than the hive's 5 min transfer-stall
+// deadline. The hive's other answers (400 hash mismatch, 403 no such
+// assignment, 404, 413) fail at once.
+var (
+	transferBackoff    = time.Second
+	transferBackoffMax = 15 * time.Second
+	transferRetryFor   = 4 * time.Minute
+)
+
 func (t transfer) client() (*hiveClient, error) {
 	t.a.mu.Lock()
 	defer t.a.mu.Unlock()
 	if t.a.hc == nil {
-		return nil, errors.New("not connected to the hive")
+		return nil, errNoSession
 	}
 	return t.a.hc, nil
 }
 
-func (t transfer) FetchBlob(ctx context.Context, sha string, w io.Writer) (int64, error) {
-	c, err := t.client()
-	if err != nil {
-		return 0, err
+// transientTransferErr reports whether another attempt may succeed.
+func transientTransferErr(err error) bool {
+	if code := statusOf(err); code != 0 {
+		return code == http.StatusUnauthorized || code == http.StatusTooManyRequests || code >= 500
 	}
-	return c.FetchBlob(ctx, sha, w)
+	var ne netError
+	var ue *url.Error // anything net/http's client ran into: dial, TLS, a dropped connection
+	return errors.Is(err, errNoSession) || errors.Is(err, errStaleSession) || errors.As(err, &ne) || errors.As(err, &ue)
+}
+
+// retry runs op with the current hive session until it succeeds, fails
+// for good, ctx ends or transferRetryFor has passed. After a 401 it waits
+// for the next session instead of sending the old token again.
+func (t transfer) retry(ctx context.Context, what, sha string, op func(*hiveClient) error) error {
+	start := time.Now()
+	wait := transferBackoff
+	var stale *hiveClient
+	for attempt := 1; ; attempt++ {
+		c, err := t.client()
+		if err == nil && c == stale {
+			err = errStaleSession
+		}
+		if err == nil {
+			if err = op(c); err == nil {
+				return nil
+			}
+			if statusOf(err) == http.StatusUnauthorized {
+				stale = c
+			}
+		}
+		if ctx.Err() != nil || !transientTransferErr(err) || time.Since(start)+wait > transferRetryFor {
+			return err
+		}
+		t.a.log.Info("blob "+what+" failed; retrying", "sha256", sha, "attempt", attempt, "in", wait, "err", err)
+		sleep(ctx, wait)
+		wait = min(2*wait, transferBackoffMax)
+	}
+}
+
+// FetchBlob streams a blob into w and verifies its hash. An interrupted
+// download resumes where it broke off.
+func (t transfer) FetchBlob(ctx context.Context, sha string, w io.Writer) (int64, error) {
+	if !proto.ValidSHA256(sha) {
+		return 0, errors.New("invalid blob hash")
+	}
+	h := sha256.New()
+	cw := &sizeWriter{w: io.MultiWriter(w, h)}
+	err := t.retry(ctx, "download", sha, func(c *hiveClient) error {
+		_, err := c.fetchBlob(ctx, sha, cw.n, cw)
+		return err
+	})
+	if err != nil {
+		return cw.n, err
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != sha {
+		return cw.n, fmt.Errorf("blob hash mismatch: got %s", got)
+	}
+	return cw.n, nil
+}
+
+// sizeWriter counts what was written through it.
+type sizeWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (s *sizeWriter) Write(p []byte) (int, error) {
+	n, err := s.w.Write(p)
+	s.n += int64(n)
+	return n, err
 }
 
 func (t transfer) FetchURL(ctx context.Context, u string, maxBytes int64, w io.Writer) (int64, error) {
 	return fetchURL(ctx, u, maxBytes, w)
 }
 
+// UploadBlob uploads size bytes from r as blob sha. Uploads are content
+// addressed, so an attempt that reached the hive does no harm when it is
+// repeated; r is rewound for each attempt (one attempt only when it can't
+// be).
 func (t transfer) UploadBlob(ctx context.Context, sha string, size int64, r io.Reader) error {
-	c, err := t.client()
-	if err != nil {
-		return err
+	rs, ok := r.(io.Seeker)
+	if !ok {
+		c, err := t.client()
+		if err != nil {
+			return err
+		}
+		return c.UploadBlob(ctx, sha, size, r)
 	}
-	return c.UploadBlob(ctx, sha, size, r)
+	return t.retry(ctx, "upload", sha, func(c *hiveClient) error {
+		if _, err := rs.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		return c.UploadBlob(ctx, sha, size, r)
+	})
 }
 
 // statusPath returns the status file path, creating its directory.

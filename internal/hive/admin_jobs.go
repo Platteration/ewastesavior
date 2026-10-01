@@ -158,6 +158,7 @@ func (s *Server) handleJobSubmit(w http.ResponseWriter, r *http.Request, _ admin
 	s.nextSeq++
 	j.counts.Pending = spec.Count
 	s.jobs[id] = j
+	s.addJobRefsLocked(j, 1)
 	i := sort.Search(len(s.queue), func(k int) bool { return queueLess(j, s.queue[k]) })
 	s.queue = append(s.queue, nil)
 	copy(s.queue[i+1:], s.queue[i:])
@@ -349,6 +350,9 @@ func (s *Server) handleJobCancel(w http.ResponseWriter, r *http.Request, _ admin
 	s.cancelJobLocked(j)
 	v := s.jobViewLocked(j)
 	s.mu.Unlock()
+	// Saved before it is answered (DESIGN 9): a hive that loses power right
+	// after must not come back running the job.
+	s.persistSync()
 	s.log.Info("job canceled", "job", v.ID)
 	writeJSON(w, http.StatusOK, v)
 }
@@ -368,6 +372,7 @@ func (s *Server) handleJobDelete(w http.ResponseWriter, r *http.Request, _ admin
 	}
 	s.deleteJobLocked(j)
 	s.mu.Unlock()
+	s.persistSync()
 	writeOK(w)
 }
 

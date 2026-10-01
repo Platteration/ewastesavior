@@ -138,7 +138,7 @@ func (s *Server) register(req proto.RegisterRequest, keyless bool, addr string) 
 		return proto.RegisterResponse{}, http.StatusForbidden,
 			"node " + req.NodeID + " joined with the swarm key; a keyless join can't use its record (forget the node on the hive first)"
 	}
-	if n != nil && n.isOnline(now, s.cfg.OfflineAfter) && n.BootID != bootID {
+	if n != nil && n.isOnline(now, s.cfg.OfflineAfter) && n.BootID != bootID && !sameBoot(n.BootID, bootID) {
 		return proto.RegisterResponse{}, http.StatusConflict, "duplicate node id: another online machine uses " + req.NodeID
 	}
 	var takeover *node
@@ -214,7 +214,7 @@ func (s *Server) register(req proto.RegisterRequest, keyless bool, addr string) 
 	}
 	n.Warnings = warnings
 
-	token := auth.NewToken()
+	token := nodeTokenPrefix + auth.NewToken()
 	if n.tokenHash != "" {
 		delete(s.tokens, n.tokenHash)
 	}
@@ -243,6 +243,16 @@ func (s *Server) register(req proto.RegisterRequest, keyless bool, addr string) 
 		Directives:         s.directivesLocked(n, nil, now),
 		AdoptedTasks:       adopted,
 	}, http.StatusOK, ""
+}
+
+// sameBoot reports whether two BootIDs (kernel boot_id + ":" + a nonce per
+// agent process, DESIGN 10.1) come from the same boot of one machine: an
+// agent that crashed and was respawned there replaces its old session at
+// once instead of being refused as a duplicate until the old process
+// counts as offline. Another machine has another boot_id.
+func sameBoot(a, b string) bool {
+	i, k := strings.LastIndexByte(a, ':'), strings.LastIndexByte(b, ':')
+	return i > 0 && k > 0 && a[:i] == b[:k]
 }
 
 func heartbeatSeconds(d time.Duration) int {
@@ -294,12 +304,32 @@ func (s *Server) adoptLocked(n *node, running []proto.RunningTask, now time.Time
 			s.releaseLocked(n, id)
 		}
 	}
+	// The node kills what it lists and the hive did not adopt.
+	for id, rt := range listed {
+		if t := s.tasks[id]; t != nil && !adopted[id] {
+			s.holdListedLocked(n, t, rt.Lease)
+		}
+	}
 	out := make([]string, 0, len(adopted))
 	for id := range adopted {
 		out = append(out, id)
 	}
 	sort.Strings(out)
 	return out
+}
+
+// holdListedLocked keeps charging n for an assignment of t (lease) that
+// the node still runs although the hive no longer wants it, and so keeps t
+// from being dispatched to n again (DESIGN 8.2: never a task the node
+// still lists), until the node stops listing it (reconcileLocked). After a
+// hive crash lost a dispatch, the restored task is pending with the old
+// attempt number while the node still tears down the lost assignment:
+// given back to that node, the same attempt would collide with the old
+// run's <task_id>.<attempt> workdir.
+func (s *Server) holdListedLocked(n *node, t *task, lease string) {
+	if _, ok := n.held[t.ID]; !ok && lease != "" {
+		n.held[t.ID] = heldTask{lease: lease, charge: charge(t.job.Spec.Resources, n.ScratchInRAM)}
+	}
 }
 
 // takeoverCandidateLocked finds the most recently seen offline record
@@ -490,10 +520,11 @@ func (s *Server) heartbeat(tok string, st proto.NodeStatus, addr string) (proto.
 	if st.Total != (proto.Resources{}) {
 		if t := clampTotal(st.Total, n.Inventory); t != n.Total {
 			n.Total = t
+			s.dirty = true
 			s.notifyLocked()
 		}
 	}
-	s.liveDirty = true
+	s.liveDirty = true // last_seen, metrics, address: live.json
 	if len(st.AckedActions) > 0 && len(n.actions) > 0 {
 		kept := n.actions[:0:0]
 		for _, a := range n.actions {
@@ -515,6 +546,7 @@ func (s *Server) reconcileLocked(n *node, running []proto.RunningTask, now time.
 		listed[rt.ID] = rt
 	}
 	var cancel []proto.TaskRef
+	var unwanted []proto.RunningTask
 	released := false
 	for id, rt := range listed {
 		t := s.tasks[id]
@@ -530,6 +562,7 @@ func (s *Server) reconcileLocked(n *node, running []proto.RunningTask, now time.
 			continue
 		}
 		cancel = append(cancel, proto.TaskRef{ID: id, Lease: rt.Lease})
+		unwanted = append(unwanted, rt)
 	}
 	for id, h := range n.held {
 		if rt, ok := listed[id]; ok && rt.Lease == h.lease {
@@ -548,6 +581,11 @@ func (s *Server) reconcileLocked(n *node, running []proto.RunningTask, now time.
 		default:
 			s.releaseLocked(n, id)
 			released = true
+		}
+	}
+	for _, rt := range unwanted {
+		if t := s.tasks[rt.ID]; t != nil {
+			s.holdListedLocked(n, t, rt.Lease)
 		}
 	}
 	if released {

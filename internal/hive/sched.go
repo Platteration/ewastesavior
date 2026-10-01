@@ -36,11 +36,11 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, tok string)
 		}
 		return
 	}
-	defer func() {
-		s.mu.Lock()
-		node.claims--
-		s.mu.Unlock()
-	}()
+	// Not under s.mu: net/http sends the response only when the handler
+	// returns, and the tasks it carries are already assigned (their
+	// MissingAfter clock runs). A node must not wait for the state mutex
+	// once more to receive them.
+	defer node.claims.Add(-1)
 
 	deadline := time.Now().Add(wait)
 	first := true
@@ -79,7 +79,8 @@ func (s *Server) handleClaim(w http.ResponseWriter, r *http.Request, tok string)
 }
 
 // startClaim authenticates a claim and counts it against the per-node
-// limit of concurrent claims (DESIGN 6.3).
+// limit of concurrent claims (DESIGN 6.3). Claims are counted up only
+// under s.mu, so the check and the increment are one step.
 func (s *Server) startClaim(tok string) (*node, int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -87,10 +88,10 @@ func (s *Server) startClaim(tok string) (*node, int) {
 	if n == nil {
 		return nil, http.StatusUnauthorized
 	}
-	if n.claims >= maxClaimsPerNode {
+	if n.claims.Load() >= maxClaimsPerNode {
 		return nil, http.StatusTooManyRequests
 	}
-	n.claims++
+	n.claims.Add(1)
 	return n, 0
 }
 
@@ -309,7 +310,8 @@ func (s *Server) dispatchOneLocked(n *node, t *task, now time.Time) {
 	t.assignedMono, t.xferMono = now, now
 	t.seen, t.unconfirmed = false, false
 	t.phase, t.runS, t.xfer, t.uploaded = "", 0, 0, 0
-	t.log, t.tail = nil, nil
+	s.dropLogLocked(t)
+	s.dropTail(t.ID)
 	j.adjust(t.bucket(), 1)
 	if j.StartedAt == nil {
 		j.StartedAt = timePtr(wall)

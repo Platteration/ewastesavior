@@ -251,3 +251,47 @@ func TestWriteJSONEncodeError(t *testing.T) {
 		t.Fatalf("normal value: %d %q %v", rec.Code, rec.Body, rec.Header())
 	}
 }
+
+// A node token the hive no longer knows (it restarted; the node has not
+// registered again yet) on node-or-admin endpoints is answered 401
+// "register again" and never counts as a failed admin login: the node's
+// uploads right after a restart must not lock its address, which local
+// admin tools or other nodes behind one NAT share, out of the admin API
+// (chaos soak). Wrong admin credentials there still count.
+func TestStaleNodeTokenIsNotAFailedAdminLogin(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	h := startHive(t, dir, nil)
+	n := h.newNode(nil)
+	n.register()
+	h.stop()
+	h2 := startHive(t, dir, nil)
+	n.h = h2
+	data := []byte("output")
+	for i := 0; i < 8; i++ {
+		code, raw := n.api("PUT", "blobs/"+sha(data), data, nil)
+		if code != http.StatusUnauthorized || !strings.Contains(string(raw), "register again") {
+			t.Fatalf("stale node token %d: %d %s", i, code, raw)
+		}
+		if code, _ := n.api("GET", "blobs/"+sha(data), nil, nil); code != http.StatusUnauthorized {
+			t.Fatalf("stale node token GET %d: %d", i, code)
+		}
+	}
+	if st := h2.admin("GET", "info", nil, nil); st != http.StatusOK {
+		t.Fatalf("admin after stale node tokens from the same address: %d", st)
+	}
+	n.register()
+	if code, _ := n.api("GET", "stats", nil, nil); code != http.StatusOK {
+		t.Fatalf("node after registering again: %d", code)
+	}
+	// Guessing admin credentials through a node-or-admin endpoint is still
+	// rate limited.
+	for i := 0; i < 5; i++ {
+		if st, _ := do(t, h2.hc, "GET", h2.url+"/api/v1/blobs/"+sha(data), "wrong-token", nil, nil); st != http.StatusUnauthorized {
+			t.Fatalf("wrong bearer %d: %d", i, st)
+		}
+	}
+	if st := h2.admin("GET", "info", nil, nil); st != http.StatusTooManyRequests {
+		t.Fatalf("wrong admin bearers on a node-or-admin endpoint not limited: %d", st)
+	}
+}

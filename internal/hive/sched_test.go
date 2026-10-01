@@ -274,7 +274,7 @@ func TestClaimLongPollAndConcurrencyLimit(t *testing.T) {
 	eventually(t, "4 claims in flight", func() bool {
 		h.s.mu.Lock()
 		defer h.s.mu.Unlock()
-		return h.s.nodes[n.req.NodeID].claims == 4
+		return h.s.nodes[n.req.NodeID].claims.Load() == 4
 	})
 	if code, _ := n.api("POST", "claim", proto.ClaimRequest{ClaimID: "5th", Max: 1}, nil); code != http.StatusTooManyRequests {
 		t.Fatalf("fifth claim: %d", code)

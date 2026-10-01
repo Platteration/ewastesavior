@@ -214,10 +214,22 @@ type requester struct {
 
 func (q requester) isAdmin() bool { return q.nodeToken == "" }
 
+// nodeTokenPrefix starts every node token, so a node token the hive no
+// longer knows (it restarted, the node has not registered again yet) is
+// never mistaken for wrong admin credentials on node-or-admin endpoints:
+// counted as failed admin logins, a node's uploads right after a hive
+// restart would lock its address (shared with local admin tools on a hive
+// machine, or by nodes behind one NAT) out of the admin API (DESIGN 6.3).
+const nodeTokenPrefix = "node-"
+
 func (s *Server) nodeOrAdmin(h func(http.ResponseWriter, *http.Request, requester)) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if hash, ok := s.nodeToken(r); ok {
 			h(w, r, requester{nodeToken: hash})
+			return
+		}
+		if tok, ok := auth.BearerToken(r.Header.Get("Authorization")); ok && strings.HasPrefix(tok, nodeTokenPrefix) {
+			writeErr(w, http.StatusUnauthorized, "unknown node token; register again")
 			return
 		}
 		if _, status, msg := s.authenticateAdmin(r); status != 0 {

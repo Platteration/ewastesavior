@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -53,7 +54,9 @@ const ClientTimeHeader = "X-Savior-Client-Time"
 const (
 	maxJSONBody       = 1 << 20
 	maxLogChunk       = 256 << 10
-	logRingSize       = 1 << 20
+	logRingSize       = 1 << 20  // most a running task's log ring keeps
+	minLogRing        = 16 << 10 // least, when the log budget is shared by many
+	maxLogBudget      = 64 << 20
 	logTailSize       = 64 << 10
 	maxHistory        = 10
 	maxFinishedJobs   = 500
@@ -140,6 +143,7 @@ type tuning struct {
 	pairTTL         time.Duration
 	quarantineWin   time.Duration
 	livenessPersist time.Duration
+	logBudget       int64 // memory for the log rings of all running tasks
 	minPersist      time.Duration
 	blobGCEvery     time.Duration
 	maxBlob         int64
@@ -211,6 +215,9 @@ func (c *Config) setDefaults() {
 	def(&t.quarantineWin, 10*time.Minute)
 	def(&t.livenessPersist, 60*time.Second)
 	def(&t.blobGCEvery, 5*time.Minute)
+	if t.logBudget <= 0 {
+		t.logBudget = defaultLogBudget(debug.SetMemoryLimit(-1))
+	}
 	if t.maxBlob <= 0 {
 		t.maxBlob = proto.MaxBlobBytes
 	}
@@ -270,6 +277,9 @@ type Server struct {
 	tasks         map[string]*task
 	walls         map[string]*proto.WallSpec
 	blobMeta      map[string]*blob
+	blobRefs      map[string]int     // blob -> retained job inputs and task outputs using it
+	logRings      map[*task]struct{} // tasks with a log ring
+	logMem        int64              // buffer bytes of all log rings
 	nextSeq       uint64
 	nextDoneSeq   uint64 // next jobRecord.DoneSeq
 	taskRecords   int
@@ -283,6 +293,7 @@ type Server struct {
 	recovering    bool
 	recoveryUntil time.Time
 	reservation   *reservation
+	archiveDel    []string // deleted jobs whose jobs/<id>.json the next save removes
 	headKey       string
 	headSince     time.Time
 	warnings      map[string]string
@@ -297,10 +308,17 @@ type Server struct {
 	lastStatus    string
 	closing       bool // shutting down: nothing is dispatched any more
 
-	persistMu    sync.Mutex
-	lastWrite    time.Time // monotonic
-	lastWriteDur time.Duration
-	persistErr   error
+	tailMu sync.Mutex
+	tails  map[string][]byte // task ID -> log tail its file doesn't have yet
+
+	gcMu      sync.Mutex          // blob GC unlinks vs. storing the same blob again
+	gcPending map[string]struct{} // collected blobs whose files are still to be removed
+
+	persistMu     sync.Mutex
+	lastWrite     time.Time // monotonic
+	lastWriteDur  time.Duration
+	lastLiveWrite time.Time // monotonic; live.json or a full write
+	persistErr    error
 
 	listenAddr   atomic.Value // net.Addr
 	stop         context.CancelFunc
@@ -341,6 +359,10 @@ func New(cfg Config) (*Server, error) {
 		tasks:       map[string]*task{},
 		walls:       map[string]*proto.WallSpec{},
 		blobMeta:    map[string]*blob{},
+		blobRefs:    map[string]int{},
+		logRings:    map[*task]struct{}{},
+		tails:       map[string][]byte{},
+		gcPending:   map[string]struct{}{},
 		nextSeq:     1,
 		nextDoneSeq: 1,
 		sessions:    map[string]*session{},
@@ -362,7 +384,7 @@ func New(cfg Config) (*Server, error) {
 	if dd.vfat && s.maxBlob > vfatMaxBlob {
 		s.maxBlob = vfatMaxBlob
 	}
-	for _, sub := range []string{"blobs", "cache", "logs"} {
+	for _, sub := range []string{"blobs", "cache", "logs", jobsDir} {
 		if err := os.MkdirAll(filepath.Join(dd.path, sub), 0o700); err != nil {
 			return nil, fmt.Errorf("create hive data dir: %w", err)
 		}
@@ -475,18 +497,21 @@ func (s *Server) Addr() net.Addr {
 	return a
 }
 
-// Close stops dispatching and background work, waits for pending file
-// writes and saves the state. It is safe to call more than once.
+// Close stops dispatching and background work, saves the state and waits
+// for pending file writes. It is safe to call more than once.
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
 		s.beginShutdown()
 		s.stop()
 		<-s.bgDone
-		s.io.close()
+		// Save first: the io queue may hold a backlog of log tails and
+		// blob removals, which the state doesn't depend on, and a service
+		// manager that runs out of patience must not cost the final save.
 		s.mu.Lock()
 		s.dirty = true
 		s.mu.Unlock()
 		s.closeErr = s.persist(true)
+		s.io.close()
 	})
 	return s.closeErr
 }
@@ -558,6 +583,12 @@ func loadOrCreateSecret(path string, gen func() string, minLen int) (val string,
 
 // writeFileAtomic writes data to path via a synced temp file and rename.
 func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
+	return writeFile(path, data, mode, true)
+}
+
+// writeFile writes data to path via a temp file and rename, so readers
+// never see a partial file; with sync it is on disk before the rename.
+func writeFile(path string, data []byte, mode os.FileMode, sync bool) error {
 	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp*")
 	if err != nil {
 		return err
@@ -576,8 +607,10 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	if _, err := f.Write(data); err != nil {
 		return err
 	}
-	if err := f.Sync(); err != nil {
-		return err
+	if sync {
+		if err := f.Sync(); err != nil {
+			return err
+		}
 	}
 	if err := f.Close(); err != nil {
 		return err
@@ -587,6 +620,12 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 	}
 	ok = true
 	return nil
+}
+
+// defaultLogBudget is the log ring budget for a soft memory limit
+// (main.go sets a quarter of MemTotal): a quarter of it, 4-64 MiB.
+func defaultLogBudget(memLimit int64) int64 {
+	return min(max(memLimit/4, 4<<20), maxLogBudget)
 }
 
 // versionString is the hive version for Hello/HiveInfo/beacons.

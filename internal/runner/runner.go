@@ -22,7 +22,9 @@ import (
 )
 
 // Transfer moves bytes between the node and the hive (or the web, for URL
-// inputs). The node agent implements it with its hive session.
+// inputs). The node agent implements it with its hive session and retries
+// what a broken connection interrupted. The reader UploadBlob gets is an
+// io.ReadSeeker, so an upload can start over.
 type Transfer interface {
 	FetchBlob(ctx context.Context, sha256 string, w io.Writer) (int64, error)
 	FetchURL(ctx context.Context, url string, maxBytes int64, w io.Writer) (int64, error)

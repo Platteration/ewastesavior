@@ -32,7 +32,7 @@ func TestPauseEndWakesClaim(t *testing.T) {
 	eventually(t, "claim waiting", func() bool {
 		h.s.mu.Lock()
 		defer h.s.mu.Unlock()
-		return h.s.nodes[n.req.NodeID].claims == 1
+		return h.s.nodes[n.req.NodeID].claims.Load() == 1
 	})
 	select {
 	case r := <-done:

@@ -121,7 +121,7 @@ func (s *Server) applyReportLocked(n *node, id string, rep proto.TaskReport, now
 		t.RunS, t.CPUSeconds, t.MaxMemMB = rep.RunS, rep.CPUSeconds, rep.MaxMemMB
 		s.cpuTotal += rep.CPUSeconds
 		if len(rep.Outputs) > 0 && s.checkOutputsLocked(rep.Outputs) == nil {
-			t.Outputs = rep.Outputs
+			s.setOutputsLocked(t, rep.Outputs)
 		}
 		t.DoneLease, t.DoneState = rep.Lease, rep.State
 		s.settleCanceledLocked(t)
@@ -342,7 +342,7 @@ func (s *Server) succeedLocked(t *task, rep proto.TaskReport) {
 	t.FinishedAt = timePtr(s.now())
 	t.ExitCode = &exit
 	t.ErrorKind, t.Error = "", ""
-	t.Outputs = rep.Outputs
+	s.setOutputsLocked(t, rep.Outputs)
 	t.Lease = ""
 	j.adjust(t.bucket(), 1)
 	s.completed++
@@ -495,20 +495,24 @@ func (s *Server) enforceRetentionLocked(just *job) {
 // deleteJobLocked removes a finished job, its task records and log tails.
 // Blobs it referenced become garbage for the next GC.
 func (s *Server) deleteJobLocked(j *job) {
+	s.addJobRefsLocked(j, -1)
 	var logs []string
 	for _, t := range j.tasks {
 		delete(s.tasks, t.ID)
 		// Any dispatched task may have a tail file, even when its last
 		// attempt wrote no output (LogEnd is reset on every dispatch). The
 		// removal goes through the io queue, after any pending tail write.
-		if t.Attempt > 0 || t.LogEnd > 0 || t.tail != nil {
+		if s.dropTail(t.ID) || t.Attempt > 0 || t.LogEnd > 0 {
 			logs = append(logs, s.logPath(t.ID))
 		}
-		t.log, t.tail = nil, nil
+		s.dropLogLocked(t)
 	}
 	s.taskRecords -= len(j.tasks)
 	delete(s.jobs, j.ID)
 	s.removeFromQueueLocked(j)
+	if j.archived {
+		s.archiveDel = append(s.archiveDel, j.ID)
+	}
 	s.dirty = true
 	if len(logs) > 0 {
 		s.io.push(func() {

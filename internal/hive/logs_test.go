@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -16,24 +17,24 @@ import (
 func TestLogRing(t *testing.T) {
 	t.Parallel()
 	l := newLogRing()
-	l.append(0, []byte("hello "))
-	l.append(3, []byte("lo world")) // overlapping retry
-	l.append(0, []byte("hel"))      // fully known
+	l.append(0, []byte("hello "), logRingSize)
+	l.append(3, []byte("lo world"), logRingSize) // overlapping retry
+	l.append(0, []byte("hel"), logRingSize)      // fully known
 	if d, next := l.read(0, 100); string(d) != "hello world" || next != 11 {
 		t.Fatalf("read: %q %d", d, next)
 	}
 	if d, next := l.read(6, 3); string(d) != "wor" || next != 9 {
 		t.Fatalf("partial: %q %d", d, next)
 	}
-	l.append(20, []byte("after gap"))
+	l.append(20, []byte("after gap"), logRingSize)
 	if d, next := l.read(0, 100); string(d) != "after gap" || next != 29 {
 		t.Fatalf("gap: %q %d", d, next)
 	}
 	// The ring keeps about the last 1 MiB.
 	big := bytes.Repeat([]byte("x"), 700<<10)
-	l.append(29, big)
-	l.append(29+int64(len(big)), big)
-	if len(l.data) > logRingSize+logRingSize/4 || l.total != 29+2*int64(len(big)) {
+	l.append(29, big, logRingSize)
+	l.append(29+int64(len(big)), big, logRingSize)
+	if cap(l.data) > logRingSize+logRingSize/4 || len(l.data) < logRingSize || l.total != 29+2*int64(len(big)) {
 		t.Fatalf("ring size %d total %d", len(l.data), l.total)
 	}
 	d, next := l.read(0, logRingSize)
@@ -282,4 +283,139 @@ func TestTaskLogAcrossAttempts(t *testing.T) {
 	if body, next, att, _ := read(0, 5); body != second+"more\n" || next != int64(len(second)+5) || att != "2" {
 		t.Fatalf("finished: %q next %d attempt %q", body, next, att)
 	}
+}
+
+// The log rings of all running tasks share one budget: a new ring lowers
+// every ring's share, and once the rings hold more than the budget the
+// ones above it are trimmed, keeping their latest bytes.
+func TestLogRingsShareBudget(t *testing.T) {
+	t.Parallel()
+	const budget = 1 << 20
+	h := newHive(t, func(c *Config) { c.tune.logBudget = budget })
+	s := h.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	j := &job{jobRecord: jobRecord{ID: "jlogs", Spec: proto.JobSpec{Count: 64}}}
+	chunk := bytes.Repeat([]byte("0123456789abcdef"), 16<<10) // 256 KiB
+	var ts []*task
+	for i := 0; i < 64; i++ {
+		tk := &task{taskRecord: taskRecord{ID: "t" + strconv.Itoa(i), Index: i, State: proto.TaskRunning}, job: j}
+		ts = append(ts, tk)
+		for k := 0; k < 4; k++ {
+			s.appendLogLocked(tk, int64(k*len(chunk)), chunk)
+		}
+		var sum int64
+		for _, x := range ts {
+			sum += int64(cap(x.log.data))
+			if got := x.log.total; got != 4*int64(len(chunk)) {
+				t.Fatalf("ring %s at offset %d", x.ID, got)
+			}
+			if d := x.log.data; len(d) < minLogRing || !bytes.HasSuffix(chunk, d[len(d)-minLogRing:]) {
+				t.Fatalf("ring %s lost its latest bytes", x.ID)
+			}
+		}
+		if sum != s.logMem {
+			t.Fatalf("accounted %d bytes, rings hold %d", s.logMem, sum)
+		}
+		if limit := int64(len(ts)) * (minLogRing + minLogRing/4); sum > max(budget, limit) {
+			t.Fatalf("%d rings hold %d bytes; budget %d", len(ts), sum, budget)
+		}
+	}
+	for _, x := range ts {
+		s.finishLogLocked(x)
+	}
+	if s.logMem != 0 || len(s.logRings) != 0 {
+		t.Fatalf("after the tasks ended: %d bytes in %d rings", s.logMem, len(s.logRings))
+	}
+}
+
+// A finished task's log tail is written by the io queue without the state
+// mutex: under a lock convoy (load harness: seconds per acquisition) the
+// queue waited for it once per tail, and 2000 tails piled up in memory and
+// delayed the hive's shutdown by 32 s.
+func TestLogTailWriteNeedsNoStateMutex(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	n := h.newNode(nil)
+	n.register()
+	h.submit(scriptJob(12, nil))
+	gate := make(chan struct{})
+	h.s.io.push(func() { <-gate }) // the tails pile up behind this
+	opened := false
+	defer func() {
+		if !opened {
+			close(gate)
+		}
+	}()
+	var done []proto.Task
+	for len(done) < 12 {
+		tk := n.claim(1)[0]
+		line := "output of " + tk.ID + "\n"
+		if code, _ := n.api("POST", "tasks/"+tk.ID+"/log?lease="+tk.Lease+"&offset=0", line, nil); code != http.StatusOK {
+			t.Fatalf("log: %d", code)
+		}
+		n.succeed(tk)
+		done = append(done, tk)
+	}
+	h.s.mu.Lock() // busy for as long as the queue needs
+	close(gate)
+	opened = true
+	flushed := make(chan struct{})
+	go func() { h.s.io.flush(); close(flushed) }()
+	select {
+	case <-flushed:
+		h.s.mu.Unlock()
+	case <-time.After(5 * time.Second):
+		h.s.mu.Unlock()
+		t.Fatal("writing log tails waited for the state mutex")
+	}
+	for _, tk := range done {
+		want := "output of " + tk.ID + "\n"
+		if b, err := os.ReadFile(h.s.logPath(tk.ID)); err != nil || string(b) != want {
+			t.Fatalf("tail file of %s: %q %v", tk.ID, b, err)
+		}
+		if h.s.pendingTail(tk.ID) != nil {
+			t.Fatalf("tail of %s still pending after its write", tk.ID)
+		}
+		st, raw := do(t, h.hc, "GET", h.url+"/api/v1/admin/tasks/"+tk.ID+"/log", testAdmin, nil, nil)
+		if st != http.StatusOK || string(raw) != want {
+			t.Fatalf("log of %s: %d %q", tk.ID, st, raw)
+		}
+	}
+}
+
+// Close saves the state before it waits for the io queue: a backlog of
+// log tails (load harness: 32 s of them) must not delay the final save
+// past a service manager's patience.
+func TestCloseSavesBeforeDrainingIO(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	h := startHive(t, dir, func(c *Config) { c.tune.minPersist = time.Hour })
+	if err := h.s.persist(true); err != nil {
+		t.Fatal(err)
+	}
+	n := h.newNode(nil)
+	n.register() // a structural change, not saved yet
+	gate := make(chan struct{})
+	h.s.io.push(func() { <-gate })
+	opened := false
+	defer func() {
+		if !opened {
+			close(gate)
+		}
+	}()
+	closed := make(chan struct{})
+	go func() { h.stop(); close(closed) }()
+	eventually(t, "the final save", func() bool {
+		b, _ := os.ReadFile(filepath.Join(dir, stateFile))
+		return bytes.Contains(b, []byte(n.req.NodeID))
+	})
+	select {
+	case <-closed:
+		t.Fatal("Close returned before the io queue drained")
+	default:
+	}
+	close(gate)
+	opened = true
+	<-closed
 }

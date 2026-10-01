@@ -182,15 +182,15 @@ func (s *Server) reconcileBlobs() error {
 	return nil
 }
 
-func (s *Server) blobInfoLocked(b *blob, refs map[string]string) proto.BlobInfo {
-	_, referenced := refs[b.SHA256]
+func blobInfo(b *blob, referenced bool) proto.BlobInfo {
 	return proto.BlobInfo{SHA256: b.SHA256, Size: b.Size, CreatedAt: b.CreatedAt, LastTouched: b.LastTouched, Referenced: referenced}
 }
 
+// touchLocked marks a blob as used now. LastTouched is display-only (GC
+// uses the monotonic time) and is saved with the next structural write.
 func (s *Server) touchLocked(b *blob) {
 	b.LastTouched = s.now()
 	b.touchedMono = time.Now()
-	s.liveDirty = true
 }
 
 // nodeMayReadLocked implements the node token scope for blob reads
@@ -234,23 +234,57 @@ func forEachMedia(d *proto.DisplaySpec, fn func(proto.Media)) {
 	}
 }
 
-// blobRefsLocked maps every referenced blob to a description of its first
-// reference. These are the GC roots of DESIGN 8.5 (besides recent touches).
-func (s *Server) blobRefsLocked() map[string]string {
+// The GC roots of DESIGN 8.5 (besides recent touches) are the inputs of
+// retained jobs, the outputs of retained tasks, display specs and walls.
+// Inputs and outputs, which grow with the retained history, are counted in
+// s.blobRefs as they are recorded and deleted, so checking one blob costs
+// O(1) rather than a walk over every retained record (an output upload
+// used to make that walk under the state mutex). Display specs and walls
+// are few and are walked.
+
+// addBlobRefLocked adds d to sha's count of input and output references.
+func (s *Server) addBlobRefLocked(sha string, d int) {
+	if sha == "" {
+		return
+	}
+	if n := s.blobRefs[sha] + d; n > 0 {
+		s.blobRefs[sha] = n
+	} else {
+		delete(s.blobRefs, sha)
+	}
+}
+
+// addJobRefsLocked counts (d = 1) or uncounts (d = -1) a job's inputs and
+// the outputs of its task records.
+func (s *Server) addJobRefsLocked(j *job, d int) {
+	for _, in := range j.Spec.Inputs {
+		s.addBlobRefLocked(in.Blob, d)
+	}
+	for _, t := range j.tasks {
+		for _, o := range t.Outputs {
+			s.addBlobRefLocked(o.Blob, d)
+		}
+	}
+}
+
+// setOutputsLocked records a task's outputs, keeping the counts.
+func (s *Server) setOutputsLocked(t *task, outs []proto.Output) {
+	for _, o := range t.Outputs {
+		s.addBlobRefLocked(o.Blob, -1)
+	}
+	t.Outputs = outs
+	for _, o := range outs {
+		s.addBlobRefLocked(o.Blob, 1)
+	}
+}
+
+// mediaRefsLocked maps the blobs of display specs and walls to a
+// description of their first reference.
+func (s *Server) mediaRefsLocked() map[string]string {
 	refs := map[string]string{}
 	add := func(sha, what string) {
 		if _, ok := refs[sha]; !ok && sha != "" {
 			refs[sha] = what
-		}
-	}
-	for _, j := range s.jobs {
-		for _, in := range j.Spec.Inputs {
-			add(in.Blob, fmt.Sprintf("input %s of job %s", in.Name, j.ID))
-		}
-		for _, t := range j.tasks {
-			for _, o := range t.Outputs {
-				add(o.Blob, fmt.Sprintf("output %s of task %s", o.Name, t.ID))
-			}
 		}
 	}
 	for _, n := range s.nodes {
@@ -263,15 +297,57 @@ func (s *Server) blobRefsLocked() map[string]string {
 	return refs
 }
 
-// gcLocked deletes unreferenced blobs not touched within the touch window.
-// With nodeUploadsOnly it only collects blobs uploaded by nodes (outputs
-// of deleted jobs, abandoned uploads), which is what runs automatically.
-func (s *Server) gcLocked(nodeUploadsOnly bool, now time.Time) (int, int64) {
-	refs := s.blobRefsLocked()
-	var deleted int
+// blobReferencedLocked reports whether sha is a GC root.
+func (s *Server) blobReferencedLocked(sha string) bool {
+	if s.blobRefs[sha] > 0 {
+		return true
+	}
+	found := false
+	for _, n := range s.nodes {
+		forEachMedia(n.Display, func(m proto.Media) { found = found || m.Blob == sha })
+	}
+	for _, w := range s.walls {
+		c := w.Content
+		forEachMedia(&c, func(m proto.Media) { found = found || m.Blob == sha })
+	}
+	return found
+}
+
+// blobRefLocked describes the first reference to sha, for an admin's
+// refused delete. It walks every retained record.
+func (s *Server) blobRefLocked(sha string) (string, bool) {
+	if s.blobRefs[sha] > 0 {
+		for _, j := range s.jobs {
+			for _, in := range j.Spec.Inputs {
+				if in.Blob == sha {
+					return fmt.Sprintf("input %s of job %s", in.Name, j.ID), true
+				}
+			}
+			for _, t := range j.tasks {
+				for _, o := range t.Outputs {
+					if o.Blob == sha {
+						return fmt.Sprintf("output %s of task %s", o.Name, t.ID), true
+					}
+				}
+			}
+		}
+	}
+	what, ok := s.mediaRefsLocked()[sha]
+	return what, ok
+}
+
+// gcLocked collects unreferenced blobs not touched within the touch
+// window: it drops their metadata and returns them with the bytes they
+// free. Their files are removed by unlinkBlobs, outside the state mutex
+// (one pass after a big job is deleted unlinks 100k files). With
+// nodeUploadsOnly it only collects blobs uploaded by nodes (outputs of
+// deleted jobs, abandoned uploads), which is what runs automatically.
+func (s *Server) gcLocked(nodeUploadsOnly bool, now time.Time) ([]string, int64) {
+	media := s.mediaRefsLocked()
+	var victims []string
 	var freed int64
 	for sha, b := range s.blobMeta {
-		if _, ok := refs[sha]; ok {
+		if _, ok := media[sha]; ok || s.blobRefs[sha] > 0 {
 			continue
 		}
 		if now.Sub(b.touchedMono) < s.cfg.tune.blobTouch {
@@ -280,16 +356,43 @@ func (s *Server) gcLocked(nodeUploadsOnly bool, now time.Time) (int, int64) {
 		if nodeUploadsOnly && (!b.NodeUpload || now.Sub(b.uploadedMono) < s.cfg.tune.uploadGC) {
 			continue
 		}
-		if err := os.Remove(s.blobs.path(sha)); err != nil && !errors.Is(err, os.ErrNotExist) {
-			s.log.Warn("blob gc: remove failed", "blob", sha, "err", err)
-			continue
-		}
 		delete(s.blobMeta, sha)
-		deleted++
+		victims = append(victims, sha)
 		freed += b.Size
 		s.dirty = true
 	}
-	return deleted, freed
+	if len(victims) > 0 {
+		s.gcMu.Lock()
+		for _, sha := range victims {
+			s.gcPending[sha] = struct{}{}
+		}
+		s.gcMu.Unlock()
+	}
+	return victims, freed
+}
+
+// unlinkBlobs removes the files of blobs gcLocked collected, except one
+// stored again meanwhile (storeBlob cancels its removal).
+func (s *Server) unlinkBlobs(victims []string) {
+	for _, sha := range victims {
+		s.gcMu.Lock()
+		if _, ok := s.gcPending[sha]; ok {
+			delete(s.gcPending, sha)
+			if err := os.Remove(s.blobs.path(sha)); err != nil && !errors.Is(err, os.ErrNotExist) {
+				s.log.Warn("blob gc: remove failed", "blob", sha, "err", err)
+			}
+		}
+		s.gcMu.Unlock()
+	}
+}
+
+// storeBlob moves a received temp file into place, cancelling a pending GC
+// removal of the same blob.
+func (s *Server) storeBlob(tmp, sha string) error {
+	s.gcMu.Lock()
+	defer s.gcMu.Unlock()
+	delete(s.gcPending, sha)
+	return s.blobs.commit(tmp, sha)
 }
 
 func (s *Server) serveBlobFile(w http.ResponseWriter, r *http.Request, sha, filename string, size int64) {
@@ -388,7 +491,7 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request, who reque
 		// Content-addressed: already stored, nothing to transfer.
 		s.touchLocked(b)
 		s.settleChargeLocked(ch, 0)
-		info := s.blobInfoLocked(b, s.blobRefsLocked())
+		info := blobInfo(b, s.blobReferencedLocked(sha))
 		s.mu.Unlock()
 		writeJSON(w, http.StatusOK, info)
 		return
@@ -489,7 +592,7 @@ func (s *Server) receiveBlob(w http.ResponseWriter, r *http.Request, want string
 	now := time.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if err := s.blobs.commit(tmp, sum); err != nil {
+	if err := s.storeBlob(tmp, sum); err != nil {
 		return proto.BlobInfo{}, http.StatusInternalServerError, fmt.Errorf("store blob: %w", err)
 	}
 	b := s.blobMeta[sum]
@@ -501,7 +604,7 @@ func (s *Server) receiveBlob(w http.ResponseWriter, r *http.Request, want string
 	b.Size = size
 	s.touchLocked(b)
 	s.dirty = true
-	return s.blobInfoLocked(b, s.blobRefsLocked()), http.StatusOK, nil
+	return blobInfo(b, s.blobReferencedLocked(sum)), http.StatusOK, nil
 }
 
 func (s *Server) handleBlobPost(w http.ResponseWriter, r *http.Request, _ adminCtx) {
@@ -519,10 +622,11 @@ func (s *Server) handleBlobPost(w http.ResponseWriter, r *http.Request, _ adminC
 
 func (s *Server) handleBlobList(w http.ResponseWriter, r *http.Request, _ adminCtx) {
 	s.mu.Lock()
-	refs := s.blobRefsLocked()
+	media := s.mediaRefsLocked()
 	out := make([]proto.BlobInfo, 0, len(s.blobMeta))
-	for _, b := range s.blobMeta {
-		out = append(out, s.blobInfoLocked(b, refs))
+	for sha, b := range s.blobMeta {
+		_, ok := media[sha]
+		out = append(out, blobInfo(b, ok || s.blobRefs[sha] > 0))
 	}
 	s.mu.Unlock()
 	sort.Slice(out, func(i, k int) bool {
@@ -546,7 +650,7 @@ func (s *Server) handleBlobDelete(w http.ResponseWriter, r *http.Request, _ admi
 		writeErr(w, http.StatusNotFound, "blob not found")
 		return
 	}
-	if ref, ok := s.blobRefsLocked()[sha]; ok {
+	if ref, ok := s.blobRefLocked(sha); ok {
 		writeErr(w, http.StatusConflict, "blob is referenced by %s", ref)
 		return
 	}
@@ -561,9 +665,10 @@ func (s *Server) handleBlobDelete(w http.ResponseWriter, r *http.Request, _ admi
 
 func (s *Server) handleBlobGC(w http.ResponseWriter, r *http.Request, _ adminCtx) {
 	s.mu.Lock()
-	n, freed := s.gcLocked(false, time.Now())
+	victims, freed := s.gcLocked(false, time.Now())
 	s.mu.Unlock()
-	writeJSON(w, http.StatusOK, map[string]int64{"deleted": int64(n), "freed_bytes": freed})
+	s.unlinkBlobs(victims)
+	writeJSON(w, http.StatusOK, map[string]int64{"deleted": int64(len(victims)), "freed_bytes": freed})
 }
 
 // fillMediaDims validates that a spec's blob media exist and records their

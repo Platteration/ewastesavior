@@ -2,6 +2,7 @@ package hive
 
 import (
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/platteration/ewastesavior/internal/proto"
@@ -56,7 +57,7 @@ type node struct {
 	held        map[string]heldTask // task ID -> charged assignment
 	claimID     string
 	claimTasks  []proto.TaskRef
-	claims      int
+	claims      atomic.Int32 // claims in progress; incremented under the state mutex only
 	actions     []*action
 	nodeErrs    []time.Time          // node errors (monotonic) on tasks that then succeeded elsewhere, within the quarantine window
 	fastFails   map[string]time.Time // task ID -> failure time, for tasks that ran < 10 s
@@ -165,6 +166,7 @@ type job struct {
 	counts   proto.TaskCounts
 	tasks    []*task // records, in index order
 	requeued []*task // pending records, FIFO
+	archived bool    // settled and saved in jobs/<id>.json; state.json leaves it out
 }
 
 func (j *job) adjust(st proto.TaskState, d int) {
@@ -275,8 +277,7 @@ type task struct {
 	uploaded     int64                // bytes charged against leaseUploadCap this lease
 	fastFailedOn map[string]time.Time // node ID -> when this task failed there within 10 s
 	nodeErrOn    map[string]nodeErr   // node ID -> the node error this task had there
-	log          *logRing
-	tail         []byte // last log tail, until written to disk
+	log          *logRing             // the assignment's log; see ringLocked
 }
 
 // nodeErr is a node error a task had on some node, kept as possible
@@ -345,16 +346,20 @@ type otherHive struct {
 
 // snapshot is the persisted state (state.json).
 type snapshot struct {
+	snapshotHeader
+	Nodes []nodeRecord     `json:"nodes"`
+	Jobs  []jobSnapshot    `json:"jobs"` // jobs not yet in jobs/<id>.json
+	Walls []proto.WallSpec `json:"walls"`
+	Blobs []blobRecord     `json:"blobs"`
+}
+
+type snapshotHeader struct {
 	Format  int       `json:"format"`
 	HiveID  string    `json:"hive_id"`
 	SavedAt time.Time `json:"saved_at"`
 	NextSeq uint64    `json:"next_seq"`
 	// NextDoneSeq is the next jobRecord.DoneSeq.
-	NextDoneSeq uint64           `json:"next_done_seq,omitempty"`
-	Nodes       []nodeRecord     `json:"nodes"`
-	Jobs        []jobSnapshot    `json:"jobs"`
-	Walls       []proto.WallSpec `json:"walls"`
-	Blobs       []blobRecord     `json:"blobs"`
+	NextDoneSeq uint64 `json:"next_done_seq,omitempty"`
 }
 
 type jobSnapshot struct {
@@ -364,37 +369,52 @@ type jobSnapshot struct {
 
 const snapshotFormat = 1
 
-// snapshotLocked copies the state for serialization outside the lock.
+// snapshotLocked copies the state for serialization outside the lock:
+// everything but the settled jobs, which have their own files. Sorting
+// happens outside the lock too (sortSnapshot).
 func (s *Server) snapshotLocked() *snapshot {
-	snap := &snapshot{Format: snapshotFormat, HiveID: s.hiveID, SavedAt: s.now(), NextSeq: s.nextSeq, NextDoneSeq: s.nextDoneSeq}
+	snap := &snapshot{snapshotHeader: snapshotHeader{Format: snapshotFormat, HiveID: s.hiveID, SavedAt: s.now(),
+		NextSeq: s.nextSeq, NextDoneSeq: s.nextDoneSeq}}
 	snap.Nodes = make([]nodeRecord, 0, len(s.nodes))
 	for _, n := range s.nodes {
 		snap.Nodes = append(snap.Nodes, n.nodeRecord)
 	}
-	sort.Slice(snap.Nodes, func(i, k int) bool { return snap.Nodes[i].ID < snap.Nodes[k].ID })
-	snap.Jobs = make([]jobSnapshot, 0, len(s.jobs))
+	snap.Jobs = make([]jobSnapshot, 0, len(s.queue))
 	for _, j := range s.jobs {
-		js := jobSnapshot{jobRecord: j.jobRecord, Tasks: make([]taskRecord, len(j.tasks))}
-		for i, t := range j.tasks {
-			r := t.taskRecord
-			r.FailedNodes = append([]string(nil), r.FailedNodes...)
-			r.History = append([]proto.AttemptView(nil), r.History...)
-			js.Tasks[i] = r
+		if !j.archived {
+			snap.Jobs = append(snap.Jobs, jobSnapshotOf(j))
 		}
-		snap.Jobs = append(snap.Jobs, js)
 	}
-	sort.Slice(snap.Jobs, func(i, k int) bool { return snap.Jobs[i].Seq < snap.Jobs[k].Seq })
 	snap.Walls = make([]proto.WallSpec, 0, len(s.walls))
 	for _, w := range s.walls {
 		snap.Walls = append(snap.Walls, *w)
 	}
-	sort.Slice(snap.Walls, func(i, k int) bool { return snap.Walls[i].ID < snap.Walls[k].ID })
 	snap.Blobs = make([]blobRecord, 0, len(s.blobMeta))
 	for _, b := range s.blobMeta {
 		snap.Blobs = append(snap.Blobs, b.blobRecord)
 	}
-	sort.Slice(snap.Blobs, func(i, k int) bool { return snap.Blobs[i].SHA256 < snap.Blobs[k].SHA256 })
 	return snap
+}
+
+// jobSnapshotOf copies a job's records. The slices that are appended to or
+// modified in place (FailedNodes, History) are cloned.
+func jobSnapshotOf(j *job) jobSnapshot {
+	js := jobSnapshot{jobRecord: j.jobRecord, Tasks: make([]taskRecord, len(j.tasks))}
+	for i, t := range j.tasks {
+		r := t.taskRecord
+		r.FailedNodes = append([]string(nil), r.FailedNodes...)
+		r.History = append([]proto.AttemptView(nil), r.History...)
+		js.Tasks[i] = r
+	}
+	return js
+}
+
+// sortSnapshot puts a snapshot in a stable order (IDs, job Seq).
+func sortSnapshot(snap *snapshot) {
+	sort.Slice(snap.Nodes, func(i, k int) bool { return snap.Nodes[i].ID < snap.Nodes[k].ID })
+	sort.Slice(snap.Jobs, func(i, k int) bool { return snap.Jobs[i].Seq < snap.Jobs[k].Seq })
+	sort.Slice(snap.Walls, func(i, k int) bool { return snap.Walls[i].ID < snap.Walls[k].ID })
+	sort.Slice(snap.Blobs, func(i, k int) bool { return snap.Blobs[i].SHA256 < snap.Blobs[k].SHA256 })
 }
 
 func containsStr(list []string, s string) bool {

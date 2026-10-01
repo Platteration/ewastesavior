@@ -3,8 +3,6 @@ package node
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -116,13 +114,18 @@ func (c *hiveClient) close() {
 	}
 }
 
-func (c *hiveClient) do(ctx context.Context, method, path string, body io.Reader, contentType string, size int64) (*http.Response, error) {
+// do sends a request with the node token; hdr adds header name, value
+// pairs.
+func (c *hiveClient) do(ctx context.Context, method, path string, body io.Reader, contentType string, size int64, hdr ...string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, c.base+path, body)
 	if err != nil {
 		return nil, err
 	}
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
+	}
+	for i := 0; i+1 < len(hdr); i += 2 {
+		req.Header.Set(hdr[i], hdr[i+1])
 	}
 	if size >= 0 && body != nil {
 		req.ContentLength = size
@@ -236,41 +239,95 @@ func (c *hiveClient) stats(ctx context.Context) (*proto.SwarmStats, error) {
 	return &s, nil
 }
 
-// FetchBlob streams a blob into w and verifies its hash (runner.Transfer).
-func (c *hiveClient) FetchBlob(ctx context.Context, sha string, w io.Writer) (int64, error) {
-	if !proto.ValidSHA256(sha) {
-		return 0, fmt.Errorf("invalid blob hash")
+// netError marks a broken connection to the hive while a response body
+// was read: another attempt may succeed.
+type netError struct{ error }
+
+func (e netError) Unwrap() error { return e.error }
+
+// netReader marks read errors other than io.EOF as netError, so they can
+// be told apart from the writer's errors (disk full, size limit).
+type netReader struct{ r io.Reader }
+
+func (n netReader) Read(p []byte) (int, error) {
+	k, err := n.r.Read(p)
+	if err != nil && err != io.EOF {
+		err = netError{err}
 	}
-	resp, err := c.do(ctx, http.MethodGet, "/api/v1/blobs/"+sha, nil, "", -1)
+	return k, err
+}
+
+// fetchBlob streams blob sha from byte off on into w (a Range request when
+// off > 0, to resume an interrupted download). The caller verifies the
+// hash of the whole blob.
+func (c *hiveClient) fetchBlob(ctx context.Context, sha string, off int64, w io.Writer) (int64, error) {
+	var hdr []string
+	if off > 0 {
+		hdr = []string{"Range", "bytes=" + strconv.FormatInt(off, 10) + "-"}
+	}
+	resp, err := c.do(ctx, http.MethodGet, "/api/v1/blobs/"+sha, nil, "", -1, hdr...)
 	if err != nil {
 		return 0, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		if _, err := io.CopyN(io.Discard, netReader{resp.Body}, off); err != nil {
+			return 0, err
+		}
+	case resp.StatusCode == http.StatusPartialContent && off > 0:
+		if !strings.HasPrefix(resp.Header.Get("Content-Range"), "bytes "+strconv.FormatInt(off, 10)+"-") {
+			return 0, fmt.Errorf("hive answered range %q for offset %d", resp.Header.Get("Content-Range"), off)
+		}
+	default:
 		return 0, decodeResponse(resp, nil)
 	}
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(w, h), io.LimitReader(resp.Body, proto.MaxBlobBytes+1))
+	n, err := io.Copy(w, netReader{io.LimitReader(resp.Body, proto.MaxBlobBytes+1-off)})
 	if err != nil {
 		return n, err
 	}
-	if n > proto.MaxBlobBytes {
+	if off+n > proto.MaxBlobBytes {
 		return n, fmt.Errorf("blob larger than %d bytes", int64(proto.MaxBlobBytes))
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != sha {
-		return n, fmt.Errorf("blob hash mismatch: got %s", got)
 	}
 	return n, nil
 }
 
-// UploadBlob PUTs size bytes from r as blob sha256 (runner.Transfer).
+// UploadBlob PUTs size bytes from r as blob sha256. The HTTP transport
+// may still read a request body after Do returns (a hive that answered
+// before it read all of it); r is cut off before UploadBlob returns, so
+// the caller may rewind it for another attempt.
 func (c *hiveClient) UploadBlob(ctx context.Context, sha string, size int64, r io.Reader) error {
-	resp, err := c.do(ctx, http.MethodPut, "/api/v1/blobs/"+sha, io.NopCloser(r), "application/octet-stream", size)
+	body := &gatedBody{r: r}
+	defer body.Close()
+	resp, err := c.do(ctx, http.MethodPut, "/api/v1/blobs/"+sha, body, "application/octet-stream", size)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	return decodeResponse(resp, nil)
+}
+
+// gatedBody passes reads through until it is closed.
+type gatedBody struct {
+	mu     sync.Mutex
+	r      io.Reader
+	closed bool
+}
+
+func (b *gatedBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return 0, errors.New("upload attempt ended")
+	}
+	return b.r.Read(p)
+}
+
+func (b *gatedBody) Close() error {
+	b.mu.Lock()
+	b.closed = true
+	b.mu.Unlock()
+	return nil
 }
 
 // renderBlob asks the hive to fit, crop and scale a blob image for us.

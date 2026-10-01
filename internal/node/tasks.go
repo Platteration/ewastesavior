@@ -225,9 +225,7 @@ func (a *Agent) sendReports(ctx context.Context, hc *hiveClient) {
 		code := statusOf(err)
 		if err == nil || code == 409 || code == 404 {
 			// 2xx: done. 409: stale lease (hive moved on). Either way drop it.
-			a.mu.Lock()
-			delete(a.tasks, t.t.Lease)
-			a.mu.Unlock()
+			a.forgetTask(t)
 			if code == 409 {
 				a.log.Info("hive discarded a stale task report", "task", t.t.ID)
 			}
@@ -258,9 +256,7 @@ func (a *Agent) cancelTask(ref proto.TaskRef, why string) {
 	t.mu.Unlock()
 	if reporting {
 		// The hive no longer wants the result; stop listing it.
-		a.mu.Lock()
-		delete(a.tasks, ref.Lease)
-		a.mu.Unlock()
+		a.forgetTask(t)
 		return
 	}
 	a.log.Info("canceling task", "task", ref.ID, "why", why)
@@ -281,16 +277,30 @@ func (a *Agent) dropUnadopted(adopted map[string]bool) {
 		a.cancelTask(r, "not adopted by the hive after re-registration")
 		// Held but unwanted: also forget any pending report.
 		a.mu.Lock()
-		if t, ok := a.tasks[r.Lease]; ok {
+		t := a.tasks[r.Lease]
+		a.mu.Unlock()
+		if t != nil {
 			t.mu.Lock()
 			rep := t.report != nil
 			t.mu.Unlock()
 			if rep {
-				delete(a.tasks, r.Lease)
+				a.forgetTask(t)
 			}
 		}
-		a.mu.Unlock()
 	}
+}
+
+// forgetTask stops holding t: its final report was answered or is no
+// longer wanted. Ending its context stops its log shipper, which would
+// otherwise retry a log tail the hive refuses or never got for as long as
+// the process runs, with whatever session the agent last had.
+func (a *Agent) forgetTask(t *task) {
+	a.mu.Lock()
+	if a.tasks[t.t.Lease] == t {
+		delete(a.tasks, t.t.Lease)
+	}
+	a.mu.Unlock()
+	t.cancel()
 }
 
 // activeTasks lists held tasks that have no final report yet.

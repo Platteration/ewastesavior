@@ -66,8 +66,9 @@ func (s *Server) tickLocked(now time.Time) {
 	s.purgeNoncesLocked(now)
 	if now.Sub(s.lastBlobGC) >= s.cfg.tune.blobGCEvery {
 		s.lastBlobGC = now
-		if n, freed := s.gcLocked(true, now); n > 0 {
-			s.log.Info("blob gc", "deleted", n, "freed_bytes", freed)
+		if victims, freed := s.gcLocked(true, now); len(victims) > 0 {
+			s.log.Info("blob gc", "deleted", len(victims), "freed_bytes", freed)
+			s.io.push(func() { s.unlinkBlobs(victims) })
 		}
 	}
 	if now.Sub(s.lastNTPCheck) >= time.Minute {

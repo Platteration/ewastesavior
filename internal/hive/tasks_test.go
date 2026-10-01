@@ -536,3 +536,41 @@ func TestRequeuedTaskWaitsForOldLease(t *testing.T) {
 		t.Fatalf("still allocated: %+v", v.Allocated)
 	}
 }
+
+// A node lists an assignment the hive has already let go of (a heartbeat
+// sent before the node's final report was answered, or after a hive crash
+// lost the dispatch): until the node stops listing it, the task is not
+// given back to that node (DESIGN 8.2) and its resources stay charged.
+func TestListedOldLeaseBlocksRedispatch(t *testing.T) {
+	t.Parallel()
+	h := newHive(t, nil)
+	n := h.newNode(nil)
+	n.register()
+	h.submit(scriptJob(1, nil)) // retries 1
+	tk := n.claim(1)[0]
+	if code := n.report(tk, proto.TaskReport{State: proto.TaskFailed, ErrorKind: proto.ErrExit, ExitCode: 3, RunS: 20}); code != 200 {
+		t.Fatalf("report: %d", code)
+	}
+	if v := h.task(tk.ID); v.State != proto.TaskPending || v.Failures != 1 {
+		t.Fatalf("after the failure: %+v", v)
+	}
+	old := proto.RunningTask{ID: tk.ID, Lease: tk.Lease, Phase: proto.PhaseReporting, RunS: 20}
+	for i := 0; i < 2; i++ {
+		if hb := n.heartbeat(old); len(hb.Directives.CancelTasks) != 1 {
+			t.Fatalf("old lease not canceled: %v", hb.Directives.CancelTasks)
+		}
+		if got := n.claim(1); len(got) != 0 {
+			t.Fatalf("task given back to the node that still lists lease %s: %+v", tk.Lease, got)
+		}
+		if v := h.nodeView(n.req.NodeID); v.Allocated.Cores != 1 {
+			t.Fatalf("listed old lease not charged: %+v", v.Allocated)
+		}
+	}
+	n.heartbeat()
+	if v := h.nodeView(n.req.NodeID); v.Allocated.Cores != 0 {
+		t.Fatalf("still allocated: %+v", v.Allocated)
+	}
+	if got := n.claim(1); len(got) != 1 || got[0].ID != tk.ID || got[0].Attempt != 2 {
+		t.Fatalf("redispatch after the node let go: %+v", got)
+	}
+}
