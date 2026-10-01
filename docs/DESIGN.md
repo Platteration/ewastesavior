@@ -318,6 +318,13 @@ Swarm hint (beacons): `K.SwarmHint()`, 8 hex chars (32 bits). It is not in `Hell
   buckets for register, admin and pair, keyed by IPv4 /32 or IPv6 /64: after 5
   failures in a minute that source gets 429 for 60 s. Maps are capped at 10k
   entries (evict oldest). At most 4 concurrent claims per node token.
+  A `node-` bearer on a node-or-admin endpoint is never counted as a failed
+  admin login (7.1), so a node's stale token after a hive restart can't lock
+  its address out of the admin API (an address may be shared by a hive
+  machine's own agent and local admin tools, or by nodes behind one NAT).
+  Other wrong bearers on those endpoints count in the admin bucket. An
+  admin_token starting with `node-` is not accepted on node-or-admin
+  endpoints.
 * **Server:** `http.Server{ReadHeaderTimeout: 10s, IdleTimeout: 120s, MaxHeaderBytes: 16 KiB}`.
   There is no global Read/WriteTimeout; handlers set deadlines with
   `http.ResponseController` (claims wait_s + 15 s, JSON 30 s, blobs by size).
@@ -438,7 +445,7 @@ capped at 1 MiB, except blob uploads and log chunks (256 KiB).
 | Method + path | Auth | Request → Response |
 |---|---|---|
 | `GET /api/v1/hello` | none | → `Hello` |
-| `POST /api/v1/register` | proof (or keyless) | `RegisterRequest` → `RegisterResponse`; 409 `duplicate node id` if the ID is online with another BootID; 403 bad proof, keyless joins disabled, or a keyless join for a node ID that joined with the key; 426 when `api_version` (0 = v1) differs |
+| `POST /api/v1/register` | proof (or keyless) | `RegisterRequest` → `RegisterResponse`; 409 `duplicate node id` if the ID is online with a BootID from another boot (the kernel boot_id before the last `:` differs or is missing). A new agent process on the same boot replaces the old session at once, and the old session's assignments that the new process doesn't list are requeued as `lost`; 403 bad proof, keyless joins disabled, or a keyless join for a node ID that joined with the key; 426 when `api_version` (0 = v1) differs |
 | `POST /api/v1/heartbeat` | node | `HeartbeatRequest` → `HeartbeatResponse` |
 | `POST /api/v1/claim` | node | `ClaimRequest` → `ClaimResponse` (long-poll ≤ 30 s) |
 | `POST /api/v1/tasks/{id}/report` | node | `TaskReport` → `{}`; 409 `stale lease` |
@@ -449,6 +456,10 @@ capped at 1 MiB, except blob uploads and log chunks (256 KiB).
 | `GET /api/v1/stats` | node or admin | → `SwarmStats` |
 
 A node token for a node the hive no longer knows gets 401, and the node re-joins.
+Node tokens start with `node-`. On node-or-admin endpoints (blob GET/PUT,
+render, stats), a bearer with that prefix is checked only as a node token.
+An unknown one (for example right after a hive restart) gets 401 `unknown
+node token; register again` and never counts as a failed admin login (6.3).
 
 ### 7.2 Admin endpoints
 
@@ -474,8 +485,8 @@ or bearer) or the admin token (bearer).
 | `GET jobs/{id}/tasks?state=&offset=&limit=` | → `TaskPage` (limit ≤ 1000) |
 | `GET jobs/{id}/outputs` | → `[]OutputEntry` |
 | `GET jobs/{id}/outputs.zip` | streamed zip, entries `task-<index>/<name>`, method Store |
-| `POST jobs/{id}/cancel` | → `JobView` |
-| `DELETE jobs/{id}` | → `{}` (finished jobs only) |
+| `POST jobs/{id}/cancel` | → `JobView` (persisted before responding) |
+| `DELETE jobs/{id}` | → `{}` (finished jobs only; persisted before responding) |
 | `GET tasks/{id}` | → `TaskView` |
 | `GET tasks/{id}/log?offset=N&wait_s=W` | → text from offset N of the task's current (or last) attempt; headers `X-Savior-Log-Offset: <next>` and `X-Savior-Log-Attempt: <attempt>`; long-polls up to W s (≤ 25) when no new data. Every dispatch starts a new stream at offset 0: an N past the end of the current attempt's stream is answered at once (with next < N), and a follower that sees the attempt change starts over at offset 0 (`savior ctl logs -f` prints `--- log restarted (attempt N) ---` on stderr, the dashboard a `--- attempt N ---` line). |
 | `GET tasks/{id}/outputs/{name}` | → file with Content-Disposition attachment |
@@ -609,7 +620,13 @@ requirements together) gets `JobView.Warning`. It stays queued, since nodes may 
   assignments:
   * an entry whose (id, lease) is not the node's live assignment, is
     cancel-requested, or is past its deadline goes into `CancelTasks`. This
-    repeats on every heartbeat until the node stops listing it;
+    repeats on every heartbeat until the node stops listing it. Until then
+    the entry stays charged to the node, and its task is not dispatched to
+    that node again (8.2). This holds at registration (8.6) as well as on
+    heartbeats. After a hive crash lost a dispatch, the restored task is
+    pending, and its next dispatch gets the lost one's attempt number again.
+    Given back to a node still tearing down that assignment, it would collide
+    with the old run's `<task_id>.<attempt>` workdir;
   * a task assigned to the node more than 20 s ago and not listed is
     requeued as `lost`.
 * **Cancel:** pending tasks become `canceled` immediately. Assigned and running
@@ -629,11 +646,19 @@ requirements together) gets `JobView.Warning`. It stays queued, since nodes may 
 ### 8.5 Logs, outputs, blobs
 
 * **Logs:** the node posts combined stdout+stderr chunks at most every 2 s
-  (`?lease&offset`). The hive keeps a 1 MiB in-memory ring per running task.
-  When the task finishes, the last 64 KiB goes to `<hive_data>/logs/<task_id>.log`.
+  (`?lease&offset`). The hive keeps an in-memory ring of up to 1 MiB per
+  running task. All rings share a budget of a quarter of the hive's soft
+  memory limit (4), 4-64 MiB. Each ring keeps budget/rings (at least
+  16 KiB), and once the rings together hold more than the budget, rings
+  above their share are trimmed to their latest bytes.
+  When the task finishes, the last 64 KiB the ring holds goes to
+  `<hive_data>/logs/<task_id>.log`. Tail files are written by a background
+  queue through a temp file and rename, without fsync (best effort).
   Logs are never stored in `state.json`. Offsets count every byte an attempt
   wrote; each dispatch starts a new stream at 0, and log reads name the
-  attempt (`X-Savior-Log-Attempt`).
+  attempt (`X-Savior-Log-Attempt`). On the node, an unsent log tail is
+  dropped once the task's final report is answered (the hive refuses chunks
+  for a finished lease anyway).
 * **Outputs:** collected only after the task's cgroup is empty. Patterns
   (`proto.ValidOutputPattern`) are matched via `os.Root` on the workdir.
   Every match must be a regular file (checked with `Lstat`). It is opened with
@@ -646,6 +671,9 @@ requirements together) gets `JobView.Warning`. It stays queued, since nodes may 
   node's display spec, every wall's content, and blobs touched in the last hour
   (monotonic time). GC removes only unreferenced, untouched blobs. `DELETE`
   of a referenced blob is 409. `BlobInfo.LastTouched` is updated on PUT/GET.
+  GC drops the metadata of collected blobs under the state lock and removes
+  their files outside it. A blob stored again before its file is removed is
+  kept.
 * **Retention:** at most 500 finished jobs and at most 200k task records.
   Finished jobs are deleted in the order they finished (`DoneSeq`, a
   persisted counter, then `Seq`). The job that just finished is never the
@@ -657,21 +685,44 @@ State persists assignments (node, lease, attempt). On startup, assigned and
 running tasks are restored as **unconfirmed** and not redispatched during the
 80 s recovery window. Nodes re-register with `RunningTasks`. The hive
 re-adopts entries whose lease matches (returned in `AdoptedTasks`) and
-cancels all others. When the window closes, unconfirmed tasks still unclaimed
+cancels all others, which stay charged to the node until it stops listing
+them (8.4). When the window closes, unconfirmed tasks still unclaimed
 are requeued as `lost`. Liveness timers are in-process monotonic: after a
 restart every node starts `offline` until its first heartbeat.
 
 ## 9. Hive internals
 
 * In-memory state behind one mutex. Structural changes (jobs, tasks, walls,
-  node records, blobs) mark the state dirty. Liveness fields (last_seen,
-  metrics, inventory) are persisted at most every 60 s. The snapshot is copied
-  under the lock and serialized and written outside it: `state.json.tmp` is
-  written, fsynced and renamed, and the previous file is kept as
-  `state.json.prev`. If `state.json` fails to parse, `.prev` is loaded. The
-  minimum interval between writes is max(2 s, 10× the last write duration),
-  and 30 s when hive_data is in RAM or on vfat. `POST /admin/jobs` and wall or
-  node patches are written synchronously before responding.
+  node records, blobs) mark the state dirty. A heartbeat that changes a
+  node's Total is a structural change.
+* **state.json** holds nodes, walls, the blob index and the jobs that may
+  still change. The snapshot copied under the lock covers only the jobs
+  without a file (below). It is sorted, serialized and written outside the
+  lock, one record at a time: `state.json.tmp` is written, fsynced and
+  renamed, and the previous file is kept as `state.json.prev`. If
+  `state.json` fails to parse, `.prev` is loaded. The minimum interval
+  between writes is max(2 s, 10× the last write duration), and 30 s when
+  hive_data is in RAM or on vfat. `POST /admin/jobs`, job cancel and delete,
+  and wall and node patches and deletes are written synchronously before
+  responding. An acknowledged cancel survives a power cut. If that write
+  fails, the change stays in memory and is retried, the request is still
+  answered, and `HiveInfo.Warnings` says so.
+* **Finished jobs:** a job that has finished for good (every task terminal,
+  including canceled tasks that have stopped) is written once to
+  `<hive_data>/jobs/<job id>.json`, fsynced with its directory before the
+  `state.json` that leaves it out. Its file is removed when the job is
+  deleted, after the `state.json` without it is on disk (before the answer
+  for `DELETE /admin/jobs/{id}`). On startup the job files are loaded first,
+  one at a time, and a job's file overrides any copy in `state.json`. A
+  damaged job file is kept as `jobs/<id>.json.corrupt-<unix time>` with a
+  `HiveInfo` warning.
+* **Liveness:** last_seen, metrics and address are saved at most every 60 s
+  to `<hive_data>/live.json`, a file of O(nodes) bytes; heartbeats never
+  rewrite `state.json`. On startup `live.json` values replace those from
+  `state.json` when they are newer. `BlobInfo.LastTouched` (display only; GC
+  uses monotonic time) is saved with the next structural write.
+* `Close` saves the state before it waits for queued file work (log tails,
+  blob removals).
 * Blobs: `<hive_data>/blobs/<2 hex>/<sha256>`. Max 8 GiB (4 GiB − 1 on vfat).
   Uploads stream to a temp file while hashing, and a hash mismatch is a 400.
   Derived images for the render endpoint are cached in `<hive_data>/cache/`
@@ -720,7 +771,8 @@ unicast and globally administered. QEMU's default `52:54:00` MACs are locally
 administered, so VMs need `-uuid` to get a stable ID.
 `node_id = "n" + first 12 hex of SHA-256(source string)`. HWIDs lists every
 candidate (`mac:`, `uuid:`, `serial:`). `BootID = /proc/sys/kernel/random/boot_id`
-+ ":" + a random agent-start nonce (a respawned agent is a new session).
++ ":" + a random agent-start nonce (a respawned agent is a new session; on
+the same boot it replaces the old one at once, 7.1).
 
 ### 10.2 Clock
 
@@ -781,6 +833,17 @@ task workers, the display controller, and the power monitor. Claim
 backoff grows exponentially from 1 s to 30 s. Actions: identify is acked
 when it starts, and reboot or poweroff are acked in a heartbeat before being
 executed. Each action ID runs at most once per agent process.
+
+Blob transfers for tasks (input downloads, output uploads) are retried
+after a broken connection, 5xx, 429, no hive session, or 401. After a 401
+the agent waits until the node has registered again and does not resend
+the stale token. Retries back off from 1 s, doubling to 15 s, for at most
+4 min, under the hive's 5 min transfer-stall deadline (7.4). An interrupted
+download resumes with a Range request. An upload starts over, which is
+harmless because blobs are content-addressed. Other answers, such as 400,
+403, 404 or 413, fail at once as `input` or `output` errors. URL inputs are
+not retried. A task's log shipping ends when the node stops holding it (final
+report answered or no longer wanted).
 
 At start, before registering, the agent kills and removes any leftover
 `<CgroupRoot>/task-*` cgroups (`cgroup.kill`), SIGKILLs every process whose
@@ -972,6 +1035,9 @@ func (r *Runner) Freeze(lease string, frozen bool) error
 func (r *Runner) Preempt(lease string) error                 // kill ⇒ report preempted
 func SandboxExecMain(args []string) int
 ```
+UploadBlob's reader is an `io.ReadSeeker` (the signature says `io.Reader`);
+the node's Transfer rewinds it to retry an upload (10.5).
+
 Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
 1. `WorkRoot` is root:root 0711. It is opened once as an `os.Root`, and the
    task dir is created with `Root.Mkdir` (it must not exist) and
@@ -998,7 +1064,8 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
    A task killed by a signal failed with exit code 128 + signal.
 7. Collect outputs (8.5) only from a task that ran to its end (not canceled,
    preempted or failed in setup), upload them (phase `uploading`), and record
-   `cpu.stat usage_usec` and `memory.peak`.
+   `cpu.stat usage_usec` and `memory.peak`. Transient transfer failures are
+   retried by the Transfer (10.5).
 8. Clean up: unmount and remove the workdir and remove the cgroup.
 
 ## 13. Boot and OS integration
@@ -1158,6 +1225,24 @@ On first start with the hive role and `hive_data=auto`, `savior storage init-dat
    partition it didn't create;
 4. mounts it at `/var/lib/savior/data`. The hive keeps its state in
    `/var/lib/savior/data/hive`.
+
+The hive data dir (`hive_data`, 5.3) holds:
+
+| Path | Contents |
+|---|---|
+| `state.json`, `state.json.prev` | nodes, walls, the blob index and the jobs that may still change (9) |
+| `live.json` | node liveness: last_seen, metrics, address (9) |
+| `jobs/<job id>.json` | one finished job each (9) |
+| `blobs/` | blob files (9) |
+| `cache/` | derived images for the render endpoint (9) |
+| `logs/` | task log tails (8.5) |
+| `tls/`, `hive_id` | the hive identity (6.1) |
+| `admin_token`, `swarm_key` | generated secrets, only when savior.conf sets none (5.3) |
+
+An older hive binary does not read `jobs/` or `live.json`, so the finished
+jobs saved there are not visible to it. `state.json` format 1 is unchanged
+and still loads, and a newer hive still loads an older `state.json` with its
+finished jobs inside.
 
 The FAT boot partition is never written at runtime. Without a data
 partition the hive runs from RAM with `Persistent=false`, and gets a new
@@ -1333,6 +1418,31 @@ entries on the host; the sandbox `/etc/passwd` lists `savior-job:x:<uid>:<uid>::
   re-joins (another server with the swarm key at the hive's address is
   refused), and a MITM (different cert between /hello and /register) that
   never gets a proof.
+* Chaos soak (`internal/node`, `TestChaos`, Linux): a real hive and real
+  agents (`sandbox=none`) in one process behind a fault-injecting proxy,
+  running jobs whose outputs can be verified. Faults include agent crashes
+  and restarts, hive restarts, lost, delayed and duplicated requests and
+  responses, partitions, power pause and preemption, drain, clock jumps,
+  replayed reports and cancels. The scheduler's invariants are checked
+  throughout and again once everything has settled. Every `go test` runs a
+  short fixed-seed round (about 75 s). `SAVIOR_CHAOS=<duration>` makes it a
+  soak, with `SAVIOR_CHAOS_SEED`, `_NODES`, `_FAULTS`, `_LOGDIR`, and
+  `SAVIOR_CHAOS_CRASH=1` to add a simulated hive power cut. Each fault the
+  soak found has its own short `TestChaosRepro*` test.
+* Hive load (`internal/hive`): `TestLoadSmall` runs in every `go test`. It
+  uses real HTTPS, 8 simulated nodes in a child process and 240 tasks with
+  logs and outputs while the dashboard polls. Every task must succeed on its
+  first attempt, no node may go offline, and no request may fail.
+  `SAVIOR_LOAD=1` runs `TestLoad`, the large runs. `SAVIOR_LOAD_SCENARIOS`
+  takes a list of `NODESxTASKS` values, for example `500x100000`, and
+  `SAVIOR_LOAD_PROCS`, `_HISTORY`, `_HIVE_RAM_MB` and the other
+  `SAVIOR_LOAD_*` knobs in `load_test.go` set the rest. `TestScale*` tests
+  guard the scaling fixes and run in seconds:
+  - a blob PUT's cost doesn't grow with retained records;
+  - a claim response doesn't wait on the state mutex;
+  - the liveness file stays O(nodes);
+  - persist memory stays bounded;
+  - log-ring memory stays bounded.
 * shellcheck on all scripts. All 15 QEMU tests of os/dev/qemu-test.sh run in
   CI: the 12 of `all` (dev-test), `swarm`, and `hive-pxe` and
   `hive-pxe-proxy` (netboot job). CI also runs the runner root tests with
