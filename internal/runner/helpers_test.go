@@ -14,7 +14,7 @@ import (
 // fakeTree implements treeLister over a map of path -> type.
 type fakeTree map[string]entryType
 
-func (f fakeTree) list(dir string) ([]dirEntry, error) {
+func (f fakeTree) list(dir string, _ int) ([]dirEntry, error) {
 	var out []dirEntry
 	for p, typ := range f {
 		parent, name := "", p
@@ -96,7 +96,7 @@ func TestMatchOutputs(t *testing.T) {
 // bigTree lists a huge directory to exercise the scan bound.
 type bigTree struct{}
 
-func (bigTree) list(string) ([]dirEntry, error) {
+func (bigTree) list(string, int) ([]dirEntry, error) {
 	return make([]dirEntry, maxScanEntries+1), nil
 }
 func (bigTree) lstat(string) (entryType, bool) { return entryDir, true }
