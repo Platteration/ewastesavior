@@ -27,7 +27,7 @@ type dirEntry struct {
 // treeLister reads a task workdir without following symlinks. Paths are
 // slash-separated and relative to the workdir; "" is the workdir itself.
 type treeLister interface {
-	list(dir string) ([]dirEntry, error)
+	list(dir string, limit int) ([]dirEntry, error)
 	lstat(p string) (entryType, bool)
 }
 
@@ -112,7 +112,7 @@ func expandSegment(l treeLister, dir, seg string, scanned *int) ([]dirEntry, err
 		}
 		return []dirEntry{{name: seg, typ: typ}}, nil
 	}
-	ents, err := l.list(dir)
+	ents, err := l.list(dir, maxScanEntries-*scanned)
 	if err != nil {
 		return nil, err
 	}

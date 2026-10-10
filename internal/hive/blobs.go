@@ -91,15 +91,16 @@ func (b *blobStore) receive(r io.Reader, want string, limit int64) (tmp, sum str
 	if err != nil {
 		return "", "", 0, err
 	}
-	tmp = f.Name()
+	createdPath := f.Name()
+	tmp = createdPath
 	defer func() {
 		if err != nil {
 			f.Close()
-			os.Remove(tmp)
+			os.Remove(createdPath)
 		}
 	}()
 	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, limit+1))
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r, limit))
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
@@ -107,8 +108,16 @@ func (b *blobStore) receive(r io.Reader, want string, limit int64) (tmp, sum str
 		}
 		return "", "", 0, fmt.Errorf("receive blob: %w", err)
 	}
-	if n > limit {
+	// Probe for an extra byte without ever writing it to disk.
+	var extra [1]byte
+	if nExtra, readErr := io.ReadFull(r, extra[:]); nExtra != 0 {
 		return "", "", 0, errBlobTooLarge
+	} else if readErr != nil && !errors.Is(readErr, io.EOF) {
+		var mbe *http.MaxBytesError
+		if errors.As(readErr, &mbe) {
+			return "", "", 0, errBlobTooLarge
+		}
+		return "", "", 0, fmt.Errorf("receive blob: %w", readErr)
 	}
 	sum = hex.EncodeToString(h.Sum(nil))
 	if want != "" && sum != want {
@@ -467,6 +476,10 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request, who reque
 		writeErr(w, http.StatusBadRequest, "invalid blob hash")
 		return
 	}
+	if r.ContentLength < 0 {
+		writeErr(w, http.StatusLengthRequired, "blob uploads require Content-Length")
+		return
+	}
 	if r.ContentLength > s.maxBlob {
 		writeErr(w, http.StatusRequestEntityTooLarge, "blob larger than %d bytes", s.maxBlob)
 		return
@@ -516,6 +529,9 @@ func (s *Server) handleBlobPut(w http.ResponseWriter, r *http.Request, who reque
 // and reserves budget from the lease with the most budget left, or the
 // lease named by ?lease= (DESIGN 6.4: 1 GiB per lease).
 func (s *Server) chargeUploadLocked(tok, lease string, contentLength int64) (*uploadCharge, int, string) {
+	if contentLength < 0 {
+		return nil, http.StatusLengthRequired, "blob uploads require Content-Length"
+	}
 	n := s.nodeByTokenLocked(tok)
 	if n == nil {
 		return nil, http.StatusUnauthorized, "unknown node token; register again"
@@ -538,9 +554,6 @@ func (s *Server) chargeUploadLocked(tok, lease string, contentLength int64) (*up
 	}
 	left := leaseUploadCap - best.uploaded
 	want := contentLength
-	if want < 0 {
-		want = left
-	}
 	if want > left || left <= 0 {
 		return nil, http.StatusRequestEntityTooLarge, "upload budget of this task (1 GiB) exhausted"
 	}
@@ -556,31 +569,56 @@ func (s *Server) settleChargeLocked(ch *uploadCharge, used int64) {
 	ch.task.uploaded -= ch.reserved - used
 }
 
-// receiveBlob stores a request body as a blob. want == "" hashes on the fly.
+// reserveBlobSpace accounts for all in-flight uploads under one mutex. A
+// reservation lasts through commit or temporary-file removal. Free-space
+// checks may double-count bytes already written by another reservation;
+// this conservatively protects the reserve rather than over-admitting.
+func (s *Server) reserveBlobSpace(need int64) (func(), error) {
+	s.blobSpaceMu.Lock()
+	defer s.blobSpaceMu.Unlock()
+	free, total, ok := s.cfg.tune.diskFree(s.blobs.dir)
+	if !ok {
+		return nil, errors.New("cannot determine free blob storage space")
+	}
+	available := free - minFreeDisk(total) - s.blobReserved
+	if need < 0 || need > available {
+		return nil, errDiskFull
+	}
+	s.blobReserved += need
+	return func() {
+		s.blobSpaceMu.Lock()
+		s.blobReserved -= need
+		s.blobSpaceMu.Unlock()
+	}, nil
+}
+
+// receiveBlob stores a length-bounded request body as a blob. want == ""
+// hashes on the fly. Unknown lengths are rejected before creating a file.
 func (s *Server) receiveBlob(w http.ResponseWriter, r *http.Request, want string, limit int64, byNode bool) (proto.BlobInfo, int, error) {
 	need := r.ContentLength
 	if need < 0 {
-		need = 0
+		return proto.BlobInfo{}, http.StatusLengthRequired, errors.New("blob uploads require Content-Length")
 	}
-	if free, total, ok := s.cfg.tune.diskFree(s.blobs.dir); ok && free-need < minFreeDisk(total) {
-		if free < minFreeDisk(total) {
-			s.mu.Lock()
-			s.setStorageLowLocked(true, free, total)
-			s.mu.Unlock()
+	if need > limit {
+		return proto.BlobInfo{}, http.StatusRequestEntityTooLarge, errBlobTooLarge
+	}
+	release, err := s.reserveBlobSpace(need)
+	if err != nil {
+		s.checkStorage()
+		if errors.Is(err, errDiskFull) {
+			return proto.BlobInfo{}, http.StatusInsufficientStorage, err
 		}
-		return proto.BlobInfo{}, http.StatusInsufficientStorage, errDiskFull
+		return proto.BlobInfo{}, http.StatusServiceUnavailable, err
 	}
+	defer release()
 	d := blobDeadline(r.ContentLength)
-	if r.ContentLength < 0 {
-		d = blobDeadline(limit)
-	}
 	setDeadlines(w, d)
-	body := http.MaxBytesReader(w, r.Body, limit)
-	tmp, sum, size, err := s.blobs.receive(body, want, limit)
+	body := http.MaxBytesReader(w, r.Body, need)
+	tmp, sum, size, err := s.blobs.receive(body, want, need)
 	if err != nil {
 		switch {
 		case errors.Is(err, errBlobTooLarge):
-			return proto.BlobInfo{}, http.StatusRequestEntityTooLarge, fmt.Errorf("blob larger than %d bytes", limit)
+			return proto.BlobInfo{}, http.StatusRequestEntityTooLarge, fmt.Errorf("blob body exceeds declared Content-Length of %d bytes", need)
 		case errors.Is(err, errBlobMismatch):
 			return proto.BlobInfo{}, http.StatusBadRequest, err
 		}
@@ -588,6 +626,10 @@ func (s *Server) receiveBlob(w http.ResponseWriter, r *http.Request, want string
 			return proto.BlobInfo{}, http.StatusInsufficientStorage, errDiskFull
 		}
 		return proto.BlobInfo{}, http.StatusInternalServerError, err
+	}
+	if size != need {
+		os.Remove(tmp)
+		return proto.BlobInfo{}, http.StatusBadRequest, errors.New("body size does not match Content-Length")
 	}
 	now := time.Now()
 	s.mu.Lock()
@@ -608,6 +650,10 @@ func (s *Server) receiveBlob(w http.ResponseWriter, r *http.Request, want string
 }
 
 func (s *Server) handleBlobPost(w http.ResponseWriter, r *http.Request, _ adminCtx) {
+	if r.ContentLength < 0 {
+		writeErr(w, http.StatusLengthRequired, "blob uploads require Content-Length")
+		return
+	}
 	if r.ContentLength > s.maxBlob {
 		writeErr(w, http.StatusRequestEntityTooLarge, "blob larger than %d bytes", s.maxBlob)
 		return

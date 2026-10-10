@@ -40,6 +40,9 @@ const leftoverKillWait = 5 * time.Second
 // init probes capabilities and prepares WorkRoot, CacheDir and the cgroup
 // parent, cleaning up whatever a previous agent left behind (DESIGN 10.5).
 func (r *Runner) init() error {
+	if err := validateScratch(r.mode, r.cfg.ScratchInRAM, os.Geteuid()); err != nil {
+		return err
+	}
 	if r.cfg.SelfExe == "" {
 		exe, err := os.Executable()
 		if err != nil {

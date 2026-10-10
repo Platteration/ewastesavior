@@ -269,6 +269,9 @@ type Server struct {
 	io      *ioQueue
 	handler http.Handler
 
+	blobSpaceMu  sync.Mutex // serializes disk admission and reservations
+	blobReserved int64      // declared bytes of in-flight receives
+
 	mu            sync.Mutex
 	nodes         map[string]*node
 	tokens        map[string]string // SHA-256(node token) -> node ID

@@ -78,7 +78,7 @@ function normalize(p,    n, parts, out, k, i) {
 	n = split(p, parts, "/"); k = 0
 	for (i = 1; i <= n; i++) {
 		if (parts[i] == "" || parts[i] == ".") continue
-		if (parts[i] == "..") { if (k > 0) k--; continue }
+		if (parts[i] == "..") { if (k == 0) return ""; k--; continue }
 		out[++k] = parts[i]
 	}
 	p = ""
@@ -92,6 +92,7 @@ function resolve(name,    t, depth) {
 		if (name in isfile) return name
 		if (!(name in linkto)) return ""
 		t = linkto[name]
+		if (substr(t, 1, 1) == "/") return ""
 		name = normalize((substr(t, 1, 1) == "/" ? "" : dirof(name) "/") t)
 	}
 	return ""
@@ -117,7 +118,16 @@ BEGIN {
 	close(workdir "/files")
 	while ((getline line < (workdir "/links")) > 0) {
 		t = index(line, "\t"); if (!t) continue
-		name = substr(line, 1, t - 1); linkto[name] = substr(line, t + 1)
+		name = substr(line, 1, t - 1)
+		if (name ~ /^\// || name ~ /(^|\/)\.\.?($|\/)/ || name == "") {
+			print "install-firmware: unsafe link name: " name > "/dev/stderr"
+			exit 1
+		}
+		linkto[name] = substr(line, t + 1)
+		if (substr(linkto[name], 1, 1) == "/" || normalize(dirof(name) "/" linkto[name]) == "") {
+			print "install-firmware: unsafe link target: " linkto[name] > "/dev/stderr"
+			exit 1
+		}
 	}
 	close(workdir "/links")
 
