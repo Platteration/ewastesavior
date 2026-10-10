@@ -15,7 +15,9 @@
 # The computed hash is printed so it can be pinned.
 #
 # The tarball is kept in --dl-dir (default build/br-cache/dl); DEST is replaced
-# atomically and marked with the verified hash, so re-runs are no-ops.
+# atomically and marked with the verified hash. Development re-runs may reuse
+# a matching tree after archive verification; required-pin releases always
+# unpack the verified archive again, refusing locally modified source caches.
 set -eu
 
 die() { echo "fetch-buildroot: error: $*" >&2; exit 1; }
@@ -81,13 +83,13 @@ if [ -f "$HASH_FILE" ]; then
 	pinned=$(awk -v f="$TARBALL" '$1 == "sha256" && $3 == f { print $2 }' "$HASH_FILE")
 fi
 
-# Already unpacked and verified against the same expectation?
-if [ -f "$DEST/Makefile" ] && [ -f "$DEST/.savior-verified" ]; then
-	have=$(cat "$DEST/.savior-verified")
-	if [ -z "$pinned" ] || [ "$have" = "$pinned" ]; then
-		log "Buildroot $VERSION already in $DEST"
-		exit 0
-	fi
+# Enforce release policy before looking at any cached source or archive.
+if [ "${BUILDROOT_REQUIRE_PIN:-0}" = 1 ] && [ -z "$pinned" ]; then
+	die "no pinned SHA-256 for $TARBALL in $HASH_FILE (BUILDROOT_REQUIRE_PIN=1)"
+fi
+if [ -n "$pinned" ]; then
+	[ "${#pinned}" -eq 64 ] || die "invalid or duplicate pinned SHA-256 for $TARBALL"
+	case "$pinned" in *[!0-9a-f]*) die "invalid pinned SHA-256 for $TARBALL" ;; esac
 fi
 
 if [ ! -f "$DL_DIR/$TARBALL" ]; then
@@ -120,6 +122,15 @@ else
 	fi
 	log "$TARBALL matches its .sign manifest (not pinned). To pin it, add to $HASH_FILE:"
 	log "  sha256  $actual  $TARBALL"
+fi
+
+# The archive and the current pin/GPG policy have now been reverified.
+# Never trust an unpacked release cache: even an unchanged marker cannot
+# attest to the source files, which another local build may have modified.
+if [ "${BUILDROOT_REQUIRE_PIN:-0}" != 1 ] && [ -f "$DEST/Makefile" ] &&
+	[ -f "$DEST/.savior-verified" ] && [ "$(cat "$DEST/.savior-verified")" = "$actual" ]; then
+	log "Buildroot $VERSION already in $DEST (archive reverified)"
+	exit 0
 fi
 
 parent=$(dirname "$DEST")

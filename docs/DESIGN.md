@@ -388,7 +388,8 @@ Normative for `runner` when the agent runs as root on Linux:
 3. Brings `lo` up in a new network namespace.
 4. Sets rlimits: `RLIMIT_CORE=0`, `RLIMIT_NOFILE=4096`, `RLIMIT_NPROC=512`,
    `RLIMIT_FSIZE = disk_mb` (a per-file cap; the real quota is the per-task
-   tmpfs or disk scratch accounting).
+   tmpfs with byte and inode limits). Disk-backed scratch is refused in
+   strict/auto mode until an OS-enforced aggregate quota backend exists.
 5. Drops privileges in order: `setgroups([])`, `setresgid(g,g,g)`,
    `setresuid(u,u,u)` with u = g = `10000 + slot` (a per-concurrency-slot uid),
    then verifies with `getresuid`. It clears ambient and bounding
@@ -1042,8 +1043,10 @@ Flow per task (keyed by lease; the workdir name is `<task_id>.<attempt>`):
 1. `WorkRoot` is root:root 0711. It is opened once as an `os.Root`, and the
    task dir is created with `Root.Mkdir` (it must not exist) and
    chowned/chmodded through the fd.
-2. With `ScratchInRAM`, mount a tmpfs `size=<disk_mb>m,mode=0700,uid,gid` on
-   the task dir, so the quota is enforced by ENOSPC.
+2. With `ScratchInRAM`, mount a tmpfs
+   `size=<disk_mb>m,nr_inodes=200000,mode=0700,uid,gid` on the task dir, so
+   aggregate byte and inode limits are enforced by ENOSPC. Strict and auto
+   mode require root and refuse disk-backed scratch before preparing WorkRoot.
 3. Fetch inputs into the blob cache (root 0700) and verify the hash. URL
    inputs stop at `Size`. Each input is written into the task dir with
    `O_CREATE|O_EXCL|O_NOFOLLOW`, and the exec bit is set via the fd. The

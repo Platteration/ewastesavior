@@ -23,6 +23,8 @@
 #                 into boot/savior-conf.cpio (/etc/savior/baked.conf, mode
 #                 0600), which every USB/ISO menu entry loads as a second
 #                 initrd. The netboot tree never gets it (TFTP is public).
+#                 IMG/ISO artifacts are written privately and renamed only
+#                 when complete; --out is made private when --conf is used.
 #                 The baked values stay in force when a line of the stick's
 #                 savior.conf is commented out or deleted; only another
 #                 value there overrides them (the stick copy says so on top).
@@ -85,6 +87,7 @@ done
 [ -n "$PAYLOADS" ] || die "at least one --payload ARCH=VMLINUZ,INITRD is required"
 case "$TIMEOUT" in ''|*[!0-9]*) die "--timeout must be a number" ;; esac
 case "$FAT_MB" in *[!0-9]*) die "--fat-mb must be a number" ;; esac
+case "$NAME" in ''|*[!A-Za-z0-9._+-]*|.|..) die "--name must be a plain filename" ;; esac
 case "$VERSION" in *[!A-Za-z0-9._+-]*) die "--version may only contain A-Z a-z 0-9 . _ + -" ;; esac
 case "$EXTRA_CMDLINE" in *[\"\$\\]*) die "--cmdline must not contain \", \$ or a backslash" ;; esac
 
@@ -113,10 +116,17 @@ none) IPXE="" ;;
 esac
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+if [ -n "$CONF" ]; then
+	# Apply this before creating directories or any secret-bearing bytes.
+	umask 077
+fi
 mkdir -p "$OUT"
 OUT=$(cd "$OUT" && pwd)
+[ -z "$CONF" ] || chmod 0700 "$OUT"
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/savior-mkimage.XXXXXX")
-trap 'rm -rf "$WORK"' EXIT INT TERM
+# Same filesystem as final artifacts, private even under a caller umask 022.
+ARTIFACTS=$(mktemp -d "$OUT/.savior-artifacts.XXXXXX")
+trap 'rm -rf "$WORK" "$ARTIFACTS"' EXIT INT TERM
 
 # A build-unique marker file lets GRUB find *this* boot medium even when other
 # SaviorOS disks are attached. Its first 8 hex digits are the FAT volume
@@ -389,7 +399,7 @@ le32() {
 }
 
 build_img() {
-	img="$OUT/$NAME.img"
+	img="$ARTIFACTS/$NAME.img"
 	write_grub_cfg usb >"$STAGE/boot/grub/grub.cfg"
 	check_grub_cfg "$STAGE/boot/grub/grub.cfg"
 	content_kb=$(du -sk "$STAGE" | cut -f1)
@@ -431,12 +441,15 @@ build_img() {
 	# The FAT32 partition.
 	dd if="$part" of="$img" bs=1M seek=1 conv=notrunc 2>/dev/null
 	rm -f "$part"
+	[ -z "$CONF" ] || chmod 0600 "$img"
+	mv -f "$img" "$OUT/$NAME.img"
+	img="$OUT/$NAME.img"
 	log "wrote $img ($(du -h "$img" | cut -f1))"
 }
 
 build_iso() {
 	need xorriso "xorriso"
-	iso="$OUT/$NAME.iso"
+	iso="$ARTIFACTS/$NAME.iso"
 	log "building $iso (volume UUID $ISO_UUID)"
 	isostage="$WORK/iso"
 	mkdir -p "$isostage/boot/grub/i386-pc"
@@ -471,6 +484,9 @@ build_iso() {
 	xorriso -indev "$iso" -report_system_area plain 2>/dev/null |
 		grep -q -E '^MBR partition +: +[0-9]+ +0x80 ' ||
 		die "$iso has no active MBR partition (strict BIOSes would not boot it from USB)"
+	[ -z "$CONF" ] || chmod 0600 "$iso"
+	mv -f "$iso" "$OUT/$NAME.iso"
+	iso="$OUT/$NAME.iso"
 	log "wrote $iso ($(du -h "$iso" | cut -f1))"
 }
 

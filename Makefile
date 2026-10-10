@@ -155,6 +155,7 @@ lint-sh:
 
 test-scripts:
 	sh scripts/test-scripts.sh
+	sh scripts/test-security.sh
 
 check: fmt-check vet lint-sh test-scripts test
 
@@ -189,9 +190,8 @@ release-e2e-dev:
 
 # --- Buildroot images (os/buildroot) -----------------------------------------------
 
-buildroot-src: $(BUILDROOT_SRC)/Makefile
-
-$(BUILDROOT_SRC)/Makefile:
+# Recheck the current verification policy even when an unpacked cache exists.
+buildroot-src:
 	sh scripts/fetch-buildroot.sh --version $(BUILDROOT_VERSION) --dest $(BUILDROOT_SRC) --dl-dir $(BR_DL_DIR)
 
 check-arch:

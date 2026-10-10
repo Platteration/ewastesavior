@@ -275,6 +275,19 @@ mkdir -p "$T/empty-fw"
 expect 0 "install-firmware: shipped firmware.list parses" \
 	sh "$BOARD/install-firmware.sh" --prune "$T/empty-fw" "$BOARD/firmware.list"
 
+# WHENCE links must not write outside the firmware destination.
+cp "$FW/WHENCE" "$T/whence-good"
+printf '\nLink: ../escape -> radeon/R100_cp.bin\n' >>"$FW/WHENCE"
+expect 1 "install-firmware: rejects link names with parent segments" \
+	sh "$BOARD/install-firmware.sh" "$FW" "$T/fwunsafe" "$T/fwlist"
+contains "unsafe link name" "install-firmware: reports traversal"
+[ ! -e "$T/escape" ] || bad "install-firmware: traversal created a sibling"
+cp "$T/whence-good" "$FW/WHENCE"
+printf '\nLink: escape -> ../outside\n' >>"$FW/WHENCE"
+expect 1 "install-firmware: rejects link targets escaping the source root" \
+	sh "$BOARD/install-firmware.sh" "$FW" "$T/fwunsafe" "$T/fwlist"
+cp "$T/whence-good" "$FW/WHENCE"
+
 # --- fetch-buildroot -------------------------------------------------------------------
 if command -v curl >/dev/null 2>&1 && command -v xz >/dev/null 2>&1; then
 	M="$T/mirror"
@@ -290,14 +303,22 @@ if command -v curl >/dev/null 2>&1 && command -v xz >/dev/null 2>&1; then
 	expect 0 "fetch-buildroot: re-run is a no-op" env BUILDROOT_MIRRORS="file://$M" \
 		sh "$HERE/fetch-buildroot.sh" --version 9999.01 --dest "$T/br" --dl-dir "$T/dl" --hash-file "$T/nohash"
 	contains "already in" "fetch-buildroot: reports the existing tree"
+	expect 1 "fetch-buildroot: a reused unpinned source cannot bypass require-pin" env BUILDROOT_MIRRORS="file://$M" BUILDROOT_REQUIRE_PIN=1 \
+		sh "$HERE/fetch-buildroot.sh" --version 9999.01 --dest "$T/br" --dl-dir "$T/dl" --hash-file "$T/nohash"
 	expect 1 "fetch-buildroot: BUILDROOT_REQUIRE_PIN refuses an unpinned tarball" env BUILDROOT_MIRRORS="file://$M" BUILDROOT_REQUIRE_PIN=1 \
 		sh "$HERE/fetch-buildroot.sh" --version 9999.01 --dest "$T/br2" --dl-dir "$T/dl" --hash-file "$T/nohash"
 	printf 'sha256  %s  buildroot-9999.01.tar.xz\n' "$sum" >"$T/pin"
 	expect 0 "fetch-buildroot: pinned hash" env BUILDROOT_MIRRORS="file://$M" BUILDROOT_REQUIRE_PIN=1 \
 		sh "$HERE/fetch-buildroot.sh" --version 9999.01 --dest "$T/br3" --dl-dir "$T/dl" --hash-file "$T/pin"
+	echo modified >"$T/br3/Makefile"
+	expect 0 "fetch-buildroot: required-pin releases discard modified unpacked caches" env BUILDROOT_MIRRORS="file://$M" BUILDROOT_REQUIRE_PIN=1 \
+		sh "$HERE/fetch-buildroot.sh" --version 9999.01 --dest "$T/br3" --dl-dir "$T/dl" --hash-file "$T/pin"
+	if [ "$(cat "$T/br3/Makefile")" = 'all:' ]; then ok "fetch-buildroot: released source comes from verified archive"; else bad "fetch-buildroot: reused modified source"; fi
 	printf 'sha256  %s  buildroot-9999.01.tar.xz\n' 0000000000000000000000000000000000000000000000000000000000000000 >"$T/pin"
 	expect 1 "fetch-buildroot: wrong pinned hash fails" env BUILDROOT_MIRRORS="file://$M" \
 		sh "$HERE/fetch-buildroot.sh" --version 9999.01 --dest "$T/br4" --dl-dir "$T/dl" --hash-file "$T/pin"
+	expect 1 "fetch-buildroot: changed pin rejects an existing verified source" env BUILDROOT_MIRRORS="file://$M" BUILDROOT_REQUIRE_PIN=1 \
+		sh "$HERE/fetch-buildroot.sh" --version 9999.01 --dest "$T/br3" --dl-dir "$T/dl" --hash-file "$T/pin"
 	if [ ! -e "$T/br4" ]; then ok "fetch-buildroot: nothing unpacked after a mismatch"; else bad "fetch-buildroot: nothing unpacked after a mismatch"; fi
 else
 	echo "skip fetch-buildroot tests (need curl and xz)"

@@ -64,8 +64,20 @@ On SaviorOS (`sandbox = strict`), every task:
   mounting, kernel keyrings, BPF, io_uring, module loading, ptrace and more.
   The filter checks the architecture, so 32-bit or x32 syscalls on 64-bit
   can't bypass it;
-* has cgroup limits on CPU, memory (swap disabled), process count and
-  scratch space, and is killed as a whole group.
+* has cgroup limits on CPU, memory (swap disabled) and process count, and
+  is killed as a whole group. Its task scratch is a tmpfs with kernel byte
+  and inode limits.
+
+The `strict` and `auto` runners currently require root and `scratch = ram`.
+Disk-backed scratch is disabled in these modes until a kernel-enforced
+aggregate byte and inode quota backend is available. Selecting `sandbox =
+none` explicitly opts into trusted command execution without those resource
+or isolation guarantees; a per-file size limit is not a disk quota.
+
+Hive blob uploads require `Content-Length`. The hive reserves capacity for
+all in-flight uploads before writing and refuses bodies longer or shorter
+than the declaration. Clients must send a fixed-length body, not chunked
+transfer encoding.
 
 Result files are collected only after every task process has exited. Only
 regular files owned by the task, with a single link, are collected, and

@@ -22,7 +22,7 @@ import (
 // followed out of the directory.
 type rootLister struct{ root *os.Root }
 
-func (l rootLister) list(dir string) ([]dirEntry, error) {
+func (l rootLister) list(dir string, limit int) ([]dirEntry, error) {
 	name := dir
 	if name == "" {
 		name = "."
@@ -32,13 +32,27 @@ func (l rootLister) list(dir string) ([]dirEntry, error) {
 		return nil, err
 	}
 	defer f.Close()
-	ents, err := f.ReadDir(-1)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]dirEntry, 0, len(ents))
-	for _, e := range ents {
-		out = append(out, dirEntry{name: e.Name(), typ: classifyDirEntry(e.Type())})
+	return boundedDirEntries(f, limit)
+}
+
+// ReadDir(-1) allocates the entire directory before the glob entry limit can
+// run. Read bounded batches and stop before retaining more than the limit.
+func boundedDirEntries(f *os.File, limit int) ([]dirEntry, error) {
+	var out []dirEntry
+	for {
+		ents, err := f.ReadDir(256)
+		if len(ents) > limit-len(out) {
+			return nil, fmt.Errorf("more than %d directory entries in the workdir", limit)
+		}
+		for _, e := range ents {
+			out = append(out, dirEntry{name: e.Name(), typ: classifyDirEntry(e.Type())})
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }
@@ -174,11 +188,16 @@ func removeAllIn(root *os.Root, name string) error {
 	if fi.IsDir() {
 		if sub, err := root.OpenRoot(name); err == nil {
 			if f, err := sub.Open("."); err == nil {
-				ents, _ := f.ReadDir(-1)
-				f.Close()
-				for _, e := range ents {
-					removeAllIn(sub, e.Name()) // relative to sub
+				for {
+					ents, err := f.ReadDir(256)
+					for _, e := range ents {
+						removeAllIn(sub, e.Name()) // relative to sub
+					}
+					if err != nil {
+						break
+					}
 				}
+				f.Close()
 			}
 			sub.Close()
 		}

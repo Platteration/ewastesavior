@@ -183,8 +183,11 @@ is left. post-image.sh checks the packed initrd again.
 ## Firmware
 
 `package/savior-firmware` uses the same linux-firmware tarball and download
-directory as Buildroot's `linux-firmware` package, so the firmware version
-follows the pinned Buildroot release. It installs only the files that match
+directory as Buildroot's `linux-firmware` package. Its own
+`savior-firmware.hash` pins the archive and WHENCE license; sharing the
+cache does not inherit another package's hash verification. A Buildroot
+upgrade that changes the archive fails until reviewed hash coverage is
+updated. The firmware version follows the pinned Buildroot release. It installs only the files that match
 `board/savior/firmware.list`:
 
 * Intel e100 and iwlwifi. For iwlwifi that means iwlegacy 3945/4965, the dvm
@@ -220,7 +223,16 @@ firmware cannot be redistributed; users put it in `/firmware/` on the stick.
 
 In the second case it prints the line to add to `buildroot.hash`. Tag builds
 in CI set `BUILDROOT_REQUIRE_PIN=1`, so pin the hash before tagging a
-release. The images workflow's job summary prints the hash.
+release. The images workflow's job summary prints the hash. Every
+`buildroot-src` invocation rechecks the current verification policy and
+archive. Required-pin releases unpack the verified archive again, so a
+modified or previously unpinned source cache cannot feed the release.
+
+When `mkimage.sh --conf` is used, the output directory is made private
+(0700), IMG/ISO output is staged in a private sibling directory and renamed
+only after completion, and completed images are 0600. These images contain
+raw configuration secrets and should be handled like the configuration
+file itself.
 
 ## Checks and tests
 

@@ -1,0 +1,7 @@
+# Copied from Buildroot 2025.02.5, commit
+# 745791cf6e117f7230f3e7d6bd759711f295358f:
+# package/linux-firmware/linux-firmware.hash.
+# Upstream archive source: https://mirrors.edge.kernel.org/pub/linux/kernel/firmware/sha256sums.asc
+sha256  2de1345897bf839d532c5de0fdb348770ca2a5f4edfb21971582597abb45297d  linux-firmware-20250211.tar.xz
+# Package license file.
+sha256  93d681cbd8ef106f2c9470aa835aa4176bfb7010ba168e6b467db6a5b4dee024  WHENCE

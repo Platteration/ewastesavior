@@ -29,10 +29,29 @@ type taskDir struct {
 	leaked  bool // task processes may outlive the task: retire the slot
 }
 
-// create makes the working directory, applies ownership and, when
-// ScratchInRAM is set on a root runner, mounts a size-bounded tmpfs on it.
+// validateScratch refuses isolated execution without a kernel-enforced byte
+// and inode quota. Disk-backed scratch needs a project-quota or bounded
+// filesystem backend; scheduler accounting and RLIMIT_FSIZE do not enforce it.
+func validateScratch(mode string, inRAM bool, euid int) error {
+	if mode == ModeNone {
+		return nil // explicitly trusted commands, without sandbox guarantees
+	}
+	if !inRAM {
+		return fmt.Errorf("runner: disk-backed scratch is disabled for %s sandbox until kernel-enforced byte and inode quotas are available; use scratch = ram", mode)
+	}
+	if euid != 0 {
+		return fmt.Errorf("runner: bounded RAM scratch requires root to mount the task tmpfs")
+	}
+	return nil
+}
+
+// create makes the working directory, applies ownership and mounts bounded
+// scratch before any task input or executable is written.
 func (d *taskDir) create() error {
 	r := d.runner
+	if err := validateScratch(r.mode, r.cfg.ScratchInRAM, os.Geteuid()); err != nil {
+		return err
+	}
 	if err := r.sys.workRoot.Mkdir(d.name, 0o700); err != nil {
 		return err
 	}
