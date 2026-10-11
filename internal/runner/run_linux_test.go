@@ -128,6 +128,12 @@ func sha256Hex(b []byte) string {
 
 func newTestRunner(t *testing.T, mode string, tr Transfer) *Runner {
 	t.Helper()
+	// Isolated modes require bounded tmpfs scratch and root to mount it.
+	// CI reruns these tests in its root sandbox step and rejects skips.
+	inRAM := mode != ModeNone
+	if inRAM && os.Geteuid() != 0 {
+		t.Skip("isolated runner needs root for bounded RAM scratch")
+	}
 	if tr == nil {
 		tr = newFakeTransfer()
 	}
@@ -144,14 +150,15 @@ func newTestRunner(t *testing.T, mode string, tr Transfer) *Runner {
 		t.Fatal(err)
 	}
 	r, err := New(Config{
-		WorkRoot:   filepath.Join(base, "work"),
-		CacheDir:   filepath.Join(base, "cache"),
-		CgroupRoot: filepath.Join(base, "cgroup"),
-		SelfExe:    self,
-		Sandbox:    mode,
-		UIDBase:    testUIDBase,
-		Slots:      4,
-		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		WorkRoot:     filepath.Join(base, "work"),
+		CacheDir:     filepath.Join(base, "cache"),
+		CgroupRoot:   filepath.Join(base, "cgroup"),
+		SelfExe:      self,
+		Sandbox:      mode,
+		ScratchInRAM: inRAM,
+		UIDBase:      testUIDBase,
+		Slots:        4,
+		Log:          slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}, tr)
 	if err != nil {
 		t.Fatalf("New: %v", err)

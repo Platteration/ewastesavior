@@ -29,6 +29,21 @@ jobs:
         run: make test-race
       - name: go test (386, sse2 and softfloat)
         run: make test-386
+      # Isolated runner initialization requires root for bounded RAM scratch.
+      # Keep the affected capability tests under the race detector as well.
+      - name: isolated runner race tests as root
+        shell: bash
+        run: |
+          set -euo pipefail
+          log="$RUNNER_TEMP/runner-root-race.log"
+          sudo env PATH="$PATH" HOME="$HOME" GOCACHE="$RUNNER_TEMP/gocache-root-race" \
+            GOMODCACHE="$(go env GOMODCACHE)" GOTOOLCHAIN=local CGO_ENABLED=1 \
+            go test -race -count=1 -v -run '^(TestRunStrictWithoutCapsRefused|TestCapsAndCPULimit|TestIsolatedScratchFailsClosed|TestScratchRefusalPrecedesWorkRootCleanup)$' \
+            ./internal/runner/ 2>&1 | tee "$log"
+          if grep -- '--- SKIP' "$log"; then
+            echo "::error::isolated runner race tests skipped instead of running as root"
+            exit 1
+          fi
       # The real task sandbox (internal/runner/sandbox_root_linux_test.go:
       # namespaces, pivot_root, dropped privileges, seccomp, cgroups) is only
       # tested as root, so the steps above skip it. Run it with sudo, as
@@ -39,7 +54,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tests='TestReal|TestExecFailureIsTheCommands|TestSandboxEtcReadableUnderUmask077'
+          tests='TestReal|TestExecFailureIsTheCommands|TestSandboxEtcReadableUnderUmask077|TestRunStrictWithoutCapsRefused|TestCapsAndCPULimit'
           for a in amd64 386; do
             log="$RUNNER_TEMP/sandbox-$a.log"
             echo "::group::GOARCH=$a"
