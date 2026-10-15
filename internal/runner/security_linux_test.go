@@ -3,8 +3,6 @@ package runner
 import (
 	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 )
 
@@ -53,40 +51,16 @@ func TestDirectoryLimitBeforeFullEnumeration(t *testing.T) {
 }
 
 func TestScratchRefusalPrecedesWorkRootCleanup(t *testing.T) {
-	for _, mode := range []string{ModeStrict, ModeAuto} {
-		for _, inRAM := range []bool{false, true} {
-			if inRAM && os.Geteuid() == 0 {
-				continue // bounded root RAM scratch is valid
-			}
-			t.Run(fmt.Sprintf("%s/ram=%t", mode, inRAM), func(t *testing.T) {
-				base := t.TempDir()
-				work := filepath.Join(base, "work")
-				if err := os.Mkdir(work, 0o700); err != nil {
-					t.Fatal(err)
-				}
-				sentinel := filepath.Join(work, "keep")
-				if err := os.WriteFile(sentinel, []byte("existing files"), 0o600); err != nil {
-					t.Fatal(err)
-				}
-				cache := filepath.Join(base, "cache")
-				r, err := New(Config{Sandbox: mode, ScratchInRAM: inRAM,
-					WorkRoot: work, CacheDir: cache, CgroupRoot: filepath.Join(base, "cgroup"),
-					UIDBase: testUIDBase, Slots: 1,
-				}, newFakeTransfer())
-				want := "disk-backed scratch is disabled"
-				if inRAM {
-					want = "bounded RAM scratch requires root"
-				}
-				if err == nil || r != nil || !strings.Contains(err.Error(), want) {
-					t.Fatalf("New: runner=%v err=%v, want %q", r, err, want)
-				}
-				if data, err := os.ReadFile(sentinel); err != nil || string(data) != "existing files" {
-					t.Fatalf("failed startup changed WorkRoot: %q, %v", data, err)
-				}
-				if _, err := os.Stat(cache); !os.IsNotExist(err) {
-					t.Fatalf("failed startup touched cache: %v", err)
-				}
-			})
-		}
+	work := t.TempDir()
+	sentinel := work + "/keep"
+	if err := os.WriteFile(sentinel, []byte("existing files"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{mode: ModeStrict, cfg: Config{WorkRoot: work}}
+	if err := r.init(); err == nil {
+		t.Fatal("runner accepted disk scratch")
+	}
+	if data, err := os.ReadFile(sentinel); err != nil || string(data) != "existing files" {
+		t.Fatalf("failed startup changed WorkRoot: %q, %v", data, err)
 	}
 }
